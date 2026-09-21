@@ -2,11 +2,9 @@
 
 [English](kda-replay-ssm-design.md) | 简体中文
 
-状态：供 cache/scheduler 维护者评审的设计。`kda-buffered-replay` 分支已有默认关闭的
-原型，但这不代表共享 cache 协议已经获得认可，也不代表性能验收已经完成。
-继续实现这些共享协议或将其接入上游之前，应先对齐第 3–5 节。
-
-本文与英文版对应，沿用其中记录的 PR 状态和验证结果，不代表新增了一轮验证。
+状态：供讨论的设计提案。希望先与维护者对齐 cache、scheduler 和 KDA 改动的理由、
+职责与范围，再确定实现计划。第 3–5 节说明拟议的共享协议；
+第 9 节列出需要共同决定的事项。
 
 ## 1. 问题与范围
 
@@ -21,31 +19,26 @@ Forward 重建当前 state，计算输出并生成候选 history；acceptance �
 但并不消除 state 重建，也不意味着永远不需要写出端点 state。
 
 普通 decode（`T=1`）和 speculative verify 使用同一套协议。Prefill 仍然读取和输出
-精确 state。首阶段支持 Blackwell 上的 Kimi-K3：BF16 activation、FP32 recurrent
+精确 state。首阶段拟聚焦 Blackwell 上的 Kimi-K3：BF16 activation、FP32 recurrent
 state、head dimension 128，最大 verify 宽度 `T_max=1` 或 `4`。
-验证使用真实 NVFP4 权重，但这不改变 state 的精度。
+计划使用真实 NVFP4 权重、TP8 进行验证；权重精度不改变 state 的精度。
 
 本阶段不包含 output-only attention、sampling/acceptance 规则修改、GDN/Qwen 模型的
 buffered replay，也不支持在 prefill/decode worker 之间迁移仍携带 buffered history
 的活跃请求。其他模型保持零滞后配置和现有行为。
 
-## 2. PR 状态与上游基线
+## 2. 上游前提与相关 PR
 
 | 工作 | 状态 | 范围 |
 | --- | --- | --- |
-| [上游 #1597](https://github.com/lightseekorg/tokenspeed/pull/1597) | **已合并**，merge commit `77eec209` | 修复基于精确 computed frontier 的 checkpoint 发布，并保留待发布的已物化边界。这个前置问题已经解决，不再重复实现。 |
-| [Fork #3](https://github.com/byshiue/tokenspeed/pull/3) | **评审中，尚未合并**，head `77fbdf93` | 通过 `max_state_lag_tokens`、统一回收规则和配套容量预算，支持有界滞后的 live-state 保留。**不包含** replay history、buffered kernel 或 serving 启用。 |
-| 后续 replay 接入 | 已有原型，尚未获上游认可 | 包括本文描述的请求私有 history、Kimi 布局、kernel、runtime commit 和实验性配置。 |
+| [上游 #1597](https://github.com/lightseekorg/tokenspeed/pull/1597) | 已合并 | 提供精确 computed frontier 和待发布物化边界的跟踪机制。沿用这项基础能力，不重复实现修复。 |
+| [Fork #3](https://github.com/byshiue/tokenspeed/pull/3) | 评审中，尚未合并 | 提议通过 `max_state_lag_tokens`、统一回收规则和容量预算，支持有界滞后的 live-state 保留。Replay history、kernel 和 serving 接入不在该 PR 范围内。 |
 
-英文版核对状态时，fork #3 的实际目标分支为 `cache-decode-checkpoint-publication`，
-而 PR 描述仍引用较早的评审基线。合并前应以包含 #1597 的上游 main 为基础，
-统一实际 base 与描述，并重新运行受影响的测试。下文的原型结果不属于 rebase 后的 #3。
+这两个 PR 是下文共享协议的背景，不代表其余 replay 重构的范围已经确定。
 
 以 #1597 的 `Request::NumComputedTokens()` 作为计算进度边界：decode 时为
 `TokenSize() - 1`，不包括最后一个刚采样、尚未作为输入计算的 token。
-所有已确认物化的边界都要保留到成功准入并发布为止。旧实验记录中的
-`TokenSize() - decode_width` 和单个 pending watermark 仅用于解释历史实现，
-不是本文提出的协议。
+所有已确认物化的边界都要保留到成功准入并发布为止。
 
 ## 3. State 表示与职责划分
 
@@ -57,8 +50,8 @@ buffered replay，也不支持在 prefill/decode worker 之间迁移仍携带 bu
                     候选 history [e, e+w) 尚未提交
 ```
 
-History 为每个 token 保存 FP32 normalized key `K`、correction vector `U` 和乘法
-decay `D`。KDA 的 decay 按 key channel 变化，不是一个标量。Query 只用于当前输出，
+拟议的 history 为每个 token 保存 FP32 normalized key `K`、correction vector `U`
+和乘法 decay `D`。KDA 的 decay 按 key channel 变化，不是一个标量。Query 只用于当前输出，
 不需要长期保留。被拒绝的候选即使仍有数据留在已分配的内存中，也不属于逻辑 state。
 
 较小的 convolution window 始终对应已接受端点 `e`，recurrent state 则可以停留在
@@ -92,20 +85,20 @@ Backend 不维护独立的、长期存活的 per-request ring。Backend 自有�
 预算替代。
 
 Python cache spec、桥接层、C++ 配置和序列化协议必须显式携带同一个值。
-现有 recipe 使用零。Runtime 与 scheduler binding 需要一起重新构建；
+不受影响的 recipe 保持零 lag。Runtime 与 scheduler binding 需要一起重新构建；
 协议缺少字段时不能静默猜测一个默认值。
 
 ### 请求私有 history——后续工作
 
 增加 sliding history group，通过 `replay_checkpoint_group` 指定它依赖的 state
-group。对于逻辑容量 `L`，原型声明 history window 为 `L`、state lag 为
-`d=L-T_max`，且要求 `L >= 2*T_max`。必须检查 group 依赖关系，并保证 history
+group。初步建议 history window 使用 `L`，state lag 使用 `d=L-T_max`，
+且要求 `L >= 2*T_max`。必须检查 group 依赖关系，并保证 history
 window 大于声明的 lag。
 
 History group 遵循以下规则：
 
-- Block table 使用绝对 token 位置，不使用对 `L` 取模的索引。物理 packing 是另一
-  个概念：原型当前每个 block 存放八行 history。
+- Block table 使用绝对 token 位置，不使用对 `L` 取模的索引。每个物理 block
+  放多少行 history，属于独立的布局选择。
 - History 只属于当前活跃请求，不参与 prefix 发布、canonicalization 或 host
   writeback。Prefix hit 从精确 state snapshot 和空 history 开始，不复用另一个
   请求的 live history。
@@ -116,15 +109,15 @@ History group 遵循以下规则：
   必须先写 payload/state，再更新 stamp。不能把丢失的 stamp 当作空 buffer 来
   “恢复”已经丢失的 history；初始化空 history 必须有精确 state 和新初始化的存储。
 - 物理预算必须包含保留的 history、候选窗口、overlap 保护和不足一个 block 时的
-  向上取整。Python 启动预算与 C++ 准入使用一致的容量上界。需要根据 #1597 的精确
-  frontier 重新检查这些上界，不能未经验证就沿用旧的 `decode_width-1` 保护量。
+  向上取整。Python 启动预算与 C++ 准入使用一致的容量上界，依据 #1597 的精确
+  frontier 和在途操作的预留范围推导。
 
 显存量级可以按每个 head、每个 token 的 FP32 history 计算：
 `4*(2*D_k+D_v)` 字节。TP8 下，每张 GPU 有 69 个本地 KDA layer、12 个本地 head，
 `D_k=D_v=128`；当 `L=8` 时，每个活跃请求在每张 GPU 上需要约 **9.7 MiB** 的
-逻辑 K/U/D payload。这不是全部显存增量：还要计入额外保留的 state block、stamp、
-page packing、overlap/candidate 保护和 runtime scratch。增大 `L` 也会增加重建
-工作量，并非容量越大越快。
+逻辑 K/U/D payload。这是理论估算，不是总显存的实测值：还要计入额外保留的
+state block、stamp、page packing、overlap/candidate 保护和 runtime scratch。
+增大 `L` 也会增加重建工作量，并非容量越大越快。
 
 ## 5. Scheduler 与生命周期改动
 
@@ -150,8 +143,8 @@ flush，都不能证明存在可复用的精确快照。准入失败时不能消
 - **完成/取消：** 除非需要发布快照，否则不必额外写回最终完整 state。
   所有在途读写完成前，都要维持存储的生命周期保护。
 - **直接移交活跃请求 / P-D 传输：** 必须在请求静止、无在途读写时，使用最新 table
-  物化端点，之后准入逻辑才能调整或回收相关存储。原型已有对应 kernel 原语，
-  但 scheduler 侧移交尚未接通；首阶段 serving 接入应拒绝这些配置。
+  物化端点，之后准入逻辑才能调整或回收相关存储。这些配置不在首阶段 serving
+  范围内。未来若支持移交，除了物化 kernel，还需要 scheduler 与生命周期管理的接入。
 
 GPU 有效性标志通过正常的 forward-result 路径返回。在向 scheduler 报告成功之前，
 CPU 侧检查及各 rank 对成功与否的一致性确认必须完成。无效存储或缺失的必要结果
@@ -189,16 +182,16 @@ sequenceDiagram
 
 ## 6. KDA kernel 与 runtime 接口
 
-原型的 recurrence 入口为 `triton_kda_buffered_recurrent`；runtime 通过
-`KDAReplayMetadata` 和 `KDAReplayWorkspace` 编排执行。即使未来替换 backend，
-以下接口约定也应保持不变：
+接口应区分 per-group metadata 准备、per-layer forward 和 accepted commit，
+kernel 统一通过 `tokenspeed-kernel` 暴露。下表定义职责和数据流；
+API 命名与物理布局属于实现选择，应在协议达成共识后再评审。
 
 | 阶段 | 输入 | 输出 / 写入行为 |
 | --- | --- | --- |
 | 准备与验证，每个 group 一次 | 当前原始 table、已接受端点、有效宽度、pool geometry、`L`、`T_max` | 将 checkpoint 位置、history 长度、flush mask 和存储有效性标志写入固定 buffer。 |
 | Forward，逐层执行 | Q/K/V 与 gate producer、显式 stride 的 checkpoint/history view、准备好的位置 | Verify 输出与候选 K/U/D；必要时写出候选计算前的精确 checkpoint。 |
 | Accepted commit，各层 forward 之后 | 实际接受的输入数量、候选 payload、endpoint mask 和当前 table | 已接受的 convolution window、选定的精确 recurrent endpoint，以及按顺序写入的 position stamp。 |
-| 静止状态下的端点物化 | 最新请求 table 和已接受端点 | 精确端点 state 与完成有效性；不消费候选，也不要求为下一轮窗口预留空间。 |
+| 静止状态下的端点物化，用于未来的活跃请求移交 | 最新请求 table 和已接受端点 | 精确端点 state 与完成有效性；不消费候选，也不要求为下一轮窗口预留空间。这属于后续扩展，活跃请求移交不在首阶段范围内。 |
 
 ### 一轮 decode 的执行流程
 
@@ -246,34 +239,37 @@ checkpoint 加已接受 history 表示当前状态。
 不能只覆盖 graph capture 的几种大小。Mixed prefill/decode batch 中，prefill
 仍使用精确 state，decode 后缀使用同一套 commit 协议。
 
-容量在启动时固定，通过 `--ssm-replay-buffer-capacity` 显式启用；省略该参数则保持
-现有执行方式。在已支持的硬件和布局范围内，原型接受 `2*T_max <= L <= 64`，
-对非法或不支持的配置直接报错。目前不指定默认容量。
+建议容量在启动时固定，通过 `--ssm-replay-buffer-capacity` 显式启用；省略该参数
+则保持现有执行方式。要求 `L >= 2*T_max`，并拒绝不支持的硬件/布局组合。
+最终参数名称、容量上限及是否设置默认容量，都留待评审决定。
 
 ## 7. 数值约定与优化方向
 
 State 重建必须保留有序的 FP32 KDA 更新。仅有代数等价并不足够：
 舍入变化可能改变 verify 输出、acceptance length 和端到端性能。
 
-当前原型区分 BF16 verify producer 与 FP32 accepted-history producer。
-两条保存在寄存器内的 recurrence 计算链共用一次 history 重建。Buffered 与
-unbuffered verify 共用显式规定的归约和更新顺序，不再依赖某次旧版编译恰好生成的
-指令顺序。但这**确实会改变相对于冻结原版的部分末位数值**。
-这项算术修改需要单独评审，不能把新版本两条路径之间的一致描述成与原版逐 bit 一致。
+初始数值目标是保留现有 verify 输出和 accepted-state 更新行为。
+在优化 kernel 之前，先与独立的 unbuffered reference 对比，
+其中也要覆盖 convolution 和 gate producer 的精度。
 
-原型已经实现的优化包括：在精度允许时合并 conv/gate producer launch、交错执行
-两条 recurrence 计算链、显式归约布局，以及跨层批量写出选定端点。
-对于较少行数的场景，如果融合会改变舍入，仍保留独立 producer。
-Capacity flush 仍在各层 forward 内执行，没有移动到单独的跨层 flush 阶段。
+一个候选方案是区分 BF16 verify producer 与 FP32 accepted-history producer，
+让两条保存在寄存器内的 recurrence 计算链共用一次 history 重建。
+另一个需要讨论的选择是让两条路径共用显式 verify 算术；这也可能改变 unbuffered
+路径的舍入。因此，任何此类改动都需要明确的范围批准和数值约定，
+不能为了得到一致结果而重新定义 baseline 或放宽容差。
 
-接下来应根据完整路径的 profile，检查 metadata/commit launch 开销、stream
-overlap、B1/B2/B4 执行及实际 history 长度分布。在不改变数值约定的前提下，调整
-容量、tiling 和 producer fusion。Output-only 代数变换、改变运算结合顺序的
-tensor-core 重建、跨层移动 flush，都需要独立的正确性和性能证据；
-不必等这些探索完成，才讨论 cache 所有权。未来的 CuteDSL backend 也应通过
-`tokenspeed-kernel` 使用相同协议，不能在 runtime 中引入直接的 vendor 依赖。
+在满足数值约定的前提下，可以考虑以下优化：
 
-## 8. 预期收益与现有证据
+- 融合兼容的 conv/gate producer，减少 launch，但不改变所需精度或舍入行为。
+- 复用重建的 state，交错执行独立工作并调整归约布局，降低 recurrence 开销。
+- 在依赖关系允许时，跨层批量处理共享 metadata 和选定端点的写回。
+
+基础方案将 capacity flush 留在逐层 forward 内。跨层移动 flush 会改变执行顺序，
+需要单独评审。Output-only 代数变换和改变运算结合顺序的 tensor-core 重建也属于
+独立提案，不是对齐 cache 所有权的前置条件。包括 CuteDSL 在内的 backend 选择
+都应封装在 `tokenspeed-kernel` 内，不能在 runtime 中增加直接的 vendor 依赖。
+
+## 8. 预期收益与代价
 
 预期收益是减少完整 state 写回流量，以及 acceptance 后的 replay。
 代价是持久 history、重建时的读取与计算、metadata/commit 工作，以及必要的精确端点
@@ -281,37 +277,17 @@ tensor-core 重建、跨层移动 flush，都需要独立的正确性和性能�
 `2*D_k+D_v` 个元素。维度为 128、使用 FP32 时，两者分别为 64 KiB 和 1.5 KiB。
 这是设计的出发点，不能直接换算成端到端加速比例。
 
-最近完成的对比基于原型 **`b60c8f0a`**，不包括后来的 `42caaa26` 布局修复，
-也不是仅针对 fork #3 或 rebase 到 #1597 之后的集成版本。冻结原版为
-`2e4b5407`；当前 unbuffered 对照与 buffered 使用同一个共享算术版本。
-下表的 `B` 表示实际执行 batch size，`C` 表示客户端 concurrency：
-
-| 测量 | 结果 | 如何解读 |
-| --- | --- | --- |
-| KDA-only，CUDA graph 下的双窗口周期，69 层，`L8/B4/T4` | 原版 2.095–2.108 ms；优化后的 buffered 2.094–2.102 ms | 基本持平。包含 producer 和 accepted commit，但不包含完整 runtime 的 stream overlap。 |
-| 完整模型的整批延迟，`L8/C4` | 原版 1611.950–1622.081 ms；当前 unbuffered 1631.551–1644.842 ms；buffered 1663.791–1673.887 ms | 对各次启动的延迟中位数等权平均后，buffered **比原版慢 3.205%**，**比同 commit 的 unbuffered 慢 1.871%**。 |
-| 当前 buffered 与当前 unbuffered | 全部 120 条计时 buffered 请求的输出 token 与经舍入的 acceptance 指标，其联合多重集合匹配 | 支持这一个固定工作负载的验证结论，不代表通用模型精度。 |
-| 原版与当前版本 | Acceptance rate 为 88.98% 与 88.12%；生成 token 不同 | 算术变化对模型质量的影响仍需单独评估。 |
-
-E2E 环境：真实 93 层 Kimi-K3 NVFP4，八张 GB300、TP8，BF16 activation、FP8 KV
-cache，CUDA 13、PyTorch 2.13、FlashInfer 0.6.18。EAGLE3 的窗口宽度为四；
-开启 decode CUDA graph、segmented prefill graph 和 runtime overlap。
-
-固定 continuation 来自 `SWE-bench/SWE-smith-trajectories`，revision 为
-`08e109b4a59eaeebf80e4675cd125d42e7ac99a4`，instance 为
-`pandas-dev__pandas.95280573.pr_59144`：51,936 个输入 token，其中 51,328 个命中
-cache，生成 256 个 token，temperature 为零、seed 为一。三组实现各做两次独立启动，
-每次启动测量 15 个 C4 batch，共计 360 条计时请求。表中范围是不同启动所得中位数的
-范围，不是置信区间。
-
-该源码快照也通过了 kernel/runtime 回归及已保存真实输入的对比；详见
-[进度记录中的 M70/M71](kda-buffered-replay-progress.md#m70-recover-shared-buffered-kda-performance)。
-**这个源码快照没有新的 AIME 结果**。E2E 性能不退步的目标尚未达成，
-目前不主张默认启用，也不宣称已经获得端到端性能收益。
+收益与代价取决于 acceptance length、flush 频率、history 长度和 concurrency。
+更大的 buffer 可能减少写回，也会增加重建工作和预留显存。
+额外的 metadata/commit launch 可能抵消 kernel 节省的时间。
+这些都是需要验证的假设，不是性能承诺。在约定的正确性和 E2E 性能标准通过之前，
+功能应保持显式启用，不默认开启。
 
 ## 9. 待对齐事项与交付验收
 
-继续推进前，cache/scheduler 维护者需要先对齐以下事项：
+继续推进前，cache、scheduler 和 KDA 维护者应先讨论：对于目标工作负载，
+减少完整 state 写回和 replay 的预期收益，是否值得增加这些存储与重建成本。
+之后再对齐以下事项：
 
 1. 有界 lag 的语义、统一的过期规则，以及 #1597 精确 frontier 下的准入/启动预算。
 2. 由 LCM 管理请求私有 history 的方案，包括 checkpoint 依赖、sparse prefill
@@ -320,26 +296,28 @@ cache，生成 256 个 token，temperature 为零、seed 为一。三组实现�
    以及 overlap 如何保护仍在使用的存储。
 4. 生命周期边界：基于精确 state 的恢复、取消时的在途保护，以及在所有权管理层
    完成接入前，继续禁止直接移交活跃请求和 P-D 传输。
+5. 数值范围：与 unbuffered 输出/state 的关系、共享算术是否属于本次重构，
+   以及在实现前先约定 acceptance 和模型质量标准。
+6. 首阶段范围：支持的 shape 和容量、公共 API 边界，以及哪些 kernel 优化应留作
+   独立的后续工作。
 
-之后按可独立测试的阶段评审：先完成 #3 的有界保留，再加入 history 所有权、布局和
+上述事项达成共识后，再按可独立测试的阶段评审：#3 的有界保留、history 所有权、布局和
 预算，随后评审 kernel 及数值约定，最后接入统一 runtime commit，以显式参数启用，
 默认关闭。Python/C++ 协议改动应一起提交，不能先合入互不匹配的接口。
 每项协议被接受时，同步更新相应的共享设计文档。
 
 验收至少包括：#1597 之后的零 lag/cache/SWA 回归；内存池容量受限、overlap、prefix hit
 和取消测试；独立的多窗口 recurrence 与 accepted-state 检查；eager/graph、padding
-和 mixed batch 覆盖；以及在最终集成 commit 上重新进行三组 E2E 对照。
-使用匹配的工作负载和独立启动，测量延迟、吞吐、显存与 acceptance。
-性能目标是相对于原版 E2E 不退步；同 commit 的 unbuffered 对照用于区分 buffering
-本身和算术修改的影响。宣称模型质量达标前，必须在同一 revision 上运行 AIME。
-Kernel 测试通过或 KDA-only 计时达标，都不能替代这些 serving 验收。
+和 mixed batch 覆盖；以及在最终集成 commit 上进行 E2E 对照。
+计划使用完整模型、真实 NVFP4 权重、TP8 的 agentic 工作负载，开启 CUDA graph 和
+runtime overlap，以匹配的工作负载和独立启动测量延迟、吞吐、显存与 acceptance。
+性能目标是相对于未修改的 baseline，E2E 不退步。
+
+如果获准的算术修改同时影响 unbuffered 路径，则保留三组对照：原始 baseline、
+更新后的 unbuffered，以及 buffered。宣称模型质量达标前，必须在集成 revision 上
+运行 AIME。Kernel 测试通过或 KDA-only 计时达标，都不能替代这些 serving 验收。
 
 ## 参考资料
 
 - [Cache 概念](cache-concepts.md)、[Scheduler](scheduler.md)、
   [统一执行路径](unified_path.md)、[Event loop](event-loop.md)。
-- [详细实现计划](kda-buffered-replay-plan.md) 与
-  [实验/进度记录](kda-buffered-replay-progress.md)。
-- 原型入口：
-  [Buffered KDA kernel](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/kda/_triton/buffered.py)、
-  [Runtime workspace](../../python/tokenspeed/runtime/layers/attention/backends/state/kda_buffered.py)。

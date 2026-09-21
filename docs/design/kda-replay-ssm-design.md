@@ -2,10 +2,10 @@
 
 English | [简体中文](kda-replay-ssm-design.zh-CN.md)
 
-Status: design for cache/scheduler review. A default-off prototype exists on
-`kda-buffered-replay`; its existence does not imply approval of the shared cache
-contract or completion of performance validation. Agree on Sections 3–5 before
-further implementation or upstream integration of those contracts.
+Status: proposal for design discussion. The goal is to agree on the rationale,
+ownership and scope of the cache, scheduler and KDA changes before deciding the
+implementation plan. Sections 3–5 describe the proposed shared contracts;
+Section 9 lists the decisions that need maintainer agreement.
 
 ## 1. Problem and scope
 
@@ -22,33 +22,28 @@ post-acceptance recurrent replay; it does not eliminate state reconstruction or
 every endpoint write.
 
 Ordinary decode (`T=1`) and speculative verification use the same protocol.
-Prefill continues to consume and produce exact states. Initial support is Kimi-K3
-on Blackwell with BF16 activations, FP32 recurrent state, head dimension 128 and
-maximum verification width `T_max=1` or `4`. Real NVFP4 weights are part of the
-validation setup, not a change to state precision.
+Prefill continues to consume and produce exact states. The proposed initial
+scope is Kimi-K3 on Blackwell with BF16 activations, FP32 recurrent state, head
+dimension 128 and maximum verification width `T_max=1` or `4`. Validation should
+use real NVFP4 weights with TP8; weight precision does not change state precision.
 
 Non-goals are output-only attention, changing sampling/acceptance rules, enabling
 buffered replay for GDN/Qwen models, and transferring a live buffered request
 between prefill/decode workers. Other models retain zero lag and existing behavior.
 
-## 2. PR status and upstream baseline
+## 2. Upstream prerequisites and related PRs
 
 | Work | Status | Scope |
 | --- | --- | --- |
-| [Upstream #1597](https://github.com/lightseekorg/tokenspeed/pull/1597) | **Merged**, merge commit `77eec209` | Fixes checkpoint publication against the exact computed frontier and preserves pending materialized boundaries. This prerequisite is already addressed; no duplicate fix is planned. |
-| [Fork #3](https://github.com/byshiue/tokenspeed/pull/3) | **Open, under review; not merged**, head `77fbdf93` | Adds bounded live-state retention through `max_state_lag_tokens`, shared reclaim rules and matching capacity budgets. It does **not** add replay history, buffered kernels or serving enablement. |
-| Remaining replay integration | Prototype, not yet accepted upstream | Request-local history, Kimi layout, kernels, runtime commit and experimental enablement described below. |
+| [Upstream #1597](https://github.com/lightseekorg/tokenspeed/pull/1597) | Merged | Provides the exact computed frontier and pending materialized-boundary tracking. Reuse this foundation rather than duplicate the fix. |
+| [Fork #3](https://github.com/byshiue/tokenspeed/pull/3) | Open, under review | Proposes bounded live-state retention through `max_state_lag_tokens`, shared reclaim rules and capacity budgets. Replay history, kernels and serving integration remain outside that PR. |
 
-At this status check, fork #3 targets `cache-decode-checkpoint-publication`, while
-its description names an older review base. Before merging, reconcile that base
-and description with upstream main containing #1597, then rerun the affected
-tests. The prototype results below are not results for a rebased #3.
+These PRs provide context for the shared contracts below; they do not settle
+the scope of the remaining replay refactor.
 
 Use #1597's `Request::NumComputedTokens()` as the frontier: during decode this is
 `TokenSize() - 1`, excluding the last sampled token. Retain all known materialized
-boundaries until successful admission publishes them. Older experimental notes
-using `TokenSize() - decode_width` or a single pending watermark are historical,
-not the contract proposed here.
+boundaries until successful admission publishes them.
 
 ## 3. State representation and ownership
 
@@ -61,10 +56,10 @@ exact recurrent S_c + accepted history [c, e) = logical recurrent S_e
                       candidate history [e, e+w) is not committed yet
 ```
 
-History stores FP32 normalized key `K`, correction vector `U`, and multiplicative
-decay `D` per token. KDA decay is per key channel, not a scalar. Queries are needed
-for current outputs but are not retained. Rejected candidates never become part
-of the logical state, even if their bytes remain allocated.
+The proposed history stores FP32 normalized key `K`, correction vector `U`, and
+multiplicative decay `D` per token. KDA decay is per key channel, not a scalar.
+Queries are needed for current outputs but are not retained. Rejected candidates
+never become part of the logical state, even if their bytes remain allocated.
 
 The small convolution window stays at accepted endpoint `e`; recurrent state may
 remain at `c`. That combination is valid only with the accepted history. It is
@@ -98,20 +93,20 @@ request to the existing working set, including prefill input/checkpoint/tail and
 overlap protection. Lag is not a replacement for those allowances.
 
 The Python cache spec, bridge, C++ config and serialized contract carry the same
-explicit value. Existing recipes use zero. Runtime and scheduler bindings must
-be rebuilt together; missing contract fields must not silently assume a value.
+explicit value. Unaffected recipes keep zero lag. Runtime and scheduler bindings
+must be rebuilt together; missing contract fields must not silently assume a value.
 
 ### Request-local history — subsequent work
 
 Add a sliding history group whose `replay_checkpoint_group` names its state
-group. For logical capacity `L`, the prototype declares history window `L` and
-state lag `d=L-T_max`, with `L >= 2*T_max`. Validate the dependency and require
+group. The proposed initial policy uses history window `L` and state lag
+`d=L-T_max`, with `L >= 2*T_max`. Validate the dependency and require
 the history window to exceed the declared lag.
 
 The history group follows these rules:
 
-- Block tables use absolute token positions, not modulo-`L` indices. Physical
-  packing is separate: the prototype uses eight history rows per block.
+- Block tables use absolute token positions, not modulo-`L` indices. The number
+  of history rows packed into a physical block is a separate layout decision.
 - History is private to the live request. It is excluded from prefix publication,
   canonicalization and host writeback. A prefix hit starts from an exact state
   snapshot with empty history, not another request's live history.
@@ -125,15 +120,15 @@ The history group follows these rules:
   state and freshly initialized storage.
 - Retained history, candidates, overlap and partial-block rounding all count
   toward physical allocation. Python startup sizing and C++ admission must use
-  matching bounds. Recheck those bounds against #1597's exact frontier rather
-  than carrying forward the old `decode_width-1` guard unexamined.
+  matching bounds derived from #1597's exact frontier and the in-flight
+  reservation horizon.
 
 For scale, FP32 history costs `4*(2*D_k+D_v)` bytes per head/token. With TP8,
 69 local KDA layers, 12 local heads and `D_k=D_v=128`, `L=8` needs about
-**9.7 MiB per live request per GPU** in logical K/U/D payload. This is not the
-total memory increase: add retained state blocks, stamps, page packing,
-overlap/candidate protection and runtime scratch. Larger `L` also increases
-reconstruction work; it is not automatically faster.
+**9.7 MiB per live request per GPU** in logical K/U/D payload. This is an
+analytical estimate, not a measurement of total memory use: add retained state
+blocks, stamps, page packing, overlap/candidate protection and runtime scratch.
+Larger `L` also increases reconstruction work; it is not automatically faster.
 
 ## 5. Scheduler and lifecycle changes
 
@@ -161,8 +156,9 @@ Lifecycle requirements are:
   being published. Preserve in-flight ownership until all readers/writers finish.
 - **Direct live handoff / P-D transfer:** require quiescent endpoint
   materialization using fresh tables before admission reshapes or reclaims them.
-  A kernel primitive exists, but scheduler handoff integration remains gated;
-  reject these configurations in the first serving integration.
+  Keep these configurations outside the first serving integration. A future
+  handoff requires scheduler/lifecycle integration as well as a materialization
+  kernel.
 
 GPU validation flags travel through the normal forward-result path. CPU/rank
 agreement must complete before successful scheduler feedback. An invalid backing
@@ -202,16 +198,17 @@ pending evidence for a later attempt.
 
 ## 6. KDA kernel and runtime interface
 
-The prototype's recurrence entry is `triton_kda_buffered_recurrent`; runtime
-orchestration uses `KDAReplayMetadata` and `KDAReplayWorkspace`. Keep the following
-contract even if the backend implementation changes:
+The interface should separate per-group metadata preparation, per-layer forward
+and accepted commit, with kernels exposed through `tokenspeed-kernel`. The table
+defines responsibilities and data flow; API names and physical layouts are
+implementation choices to review after agreeing on this contract.
 
 | Phase | Inputs | Outputs / side effects |
 | --- | --- | --- |
 | Prepare and validate, once per group | Current raw tables, accepted endpoints, valid widths, pool geometry, `L`, `T_max` | Checkpoint positions, history lengths, flush masks and backing-validity flags in fixed buffers. |
 | Forward, per layer | Q/K/V and gate producers, checkpoint/history views with explicit strides, prepared positions | Verification outputs and candidate K/U/D; optionally an exact pre-candidate checkpoint. |
 | Accepted commit, after layer forwards | Actual accepted input counts, candidate payload, endpoint masks and current tables | Accepted convolution window, selected exact recurrent endpoints and ordered position stamps. |
-| Quiescent materialization | Fresh request tables and accepted endpoints | Exact endpoint states and completion validity, without consuming candidates or requiring space for another window. |
+| Quiescent materialization, for a future live handoff | Fresh request tables and accepted endpoints | Exact endpoint states and completion validity, without consuming candidates or requiring space for another window. Future extension; live handoff is outside the initial scope. |
 
 ### One decode round
 
@@ -263,10 +260,11 @@ and scratch have stable addresses and cover the runtime batch bound, not just
 the graph capture sizes. Mixed prefill/decode batches keep exact-state prefill
 and use the same commit protocol for their decode suffix.
 
-Capacity is startup-fixed and explicitly selected through
-`--ssm-replay-buffer-capacity`; omission keeps existing execution. The prototype
-accepts `2*T_max <= L <= 64` within its supported hardware/layout range and
-rejects invalid or unsupported configurations. No default capacity is proposed.
+Propose a startup-fixed capacity selected through
+`--ssm-replay-buffer-capacity`; omission keeps existing execution. Require
+`L >= 2*T_max` and reject unsupported hardware/layout combinations. The final
+option name, supported upper limit and any default capacity remain review
+decisions.
 
 ## 7. Numerical contract and optimization approach
 
@@ -274,29 +272,34 @@ State reconstruction must preserve the ordered FP32 KDA updates. Algebraic
 equivalence alone is insufficient: changed rounding can alter verify outputs,
 acceptance length and end-to-end performance.
 
-The current prototype distinguishes BF16 verification producers from FP32
-accepted-history producers. Two register-local recurrence chains share one
-history reconstruction. Buffered and unbuffered verification use explicit shared
-reduction/update arithmetic. This avoids depending on one legacy compiler's
-incidental instruction ordering, but **does change some last bits relative to
-the frozen original**. Review that arithmetic change explicitly; do not present
-new-pair equality as bitwise equality with the original implementation.
+The initial numerical target is to preserve the existing verification outputs
+and accepted-state updates. Compare against an independent unbuffered reference,
+including convolution and gate producer precision, before tuning kernels.
 
-Implemented prototype optimizations include combined conv/gate producer
-launches where precision permits, interleaving the two recurrence chains,
-explicit reduction layouts, and batched selected-endpoint writes across layers.
-Small-row cases retain separate producer work when fusion changes rounding.
-Capacity flush remains inside per-layer forward, not a cross-layer flush phase.
+One candidate keeps BF16 verification producers and FP32 accepted-history
+producers separate, with two register-local recurrence chains sharing one
+history reconstruction. Sharing explicit verification arithmetic between paths
+is another choice to discuss: it could change rounding in the unbuffered path
+as well. Any such change needs explicit scope approval and a numerical contract;
+do not redefine the baseline or relax tolerances merely to obtain equality.
 
-Next optimize from full-path profiles: metadata/commit launch cost, stream
-overlap, B1/B2/B4 execution and observed history lengths. Tune capacity, tiling
-and producer fusion while preserving the numerical contract. Output-only
-algebra, reassociated tensor-core reconstruction or moving flush across layers
-need separate correctness/performance evidence; they are not prerequisites for
-agreeing on cache ownership. A future CuteDSL backend should consume the same
-contract through `tokenspeed-kernel`, without runtime-side vendor dependencies.
+Potential optimizations, subject to that contract, include:
 
-## 8. Expected benefit and current evidence
+- Fuse compatible conv/gate producers to reduce launches without changing the
+  required precision or rounding.
+- Reuse reconstructed state, interleave independent work and tune reduction
+  layouts to reduce recurrence overhead.
+- Batch shared metadata and selected-endpoint writes across layers where
+  dependencies allow it.
+
+The baseline proposal keeps capacity flush inside per-layer forward. Moving it
+across layers changes execution ordering and needs separate review. Output-only
+algebra and reassociated tensor-core reconstruction are also separate proposals,
+not prerequisites for agreeing on cache ownership. Backend selection, including
+CuteDSL, must stay behind `tokenspeed-kernel`; runtime should not gain direct
+vendor dependencies.
+
+## 8. Expected benefit and tradeoffs
 
 The intended benefit is less full-state write traffic and less post-acceptance
 replay. The cost is persistent history, reconstruction reads/arithmetic,
@@ -305,39 +308,17 @@ metadata/commit work and occasional exact-endpoint writes. A full state has
 the design: at dimension 128, these are 64 KiB and 1.5 KiB in FP32, respectively.
 It is not an end-to-end speedup estimate.
 
-The latest completed comparison uses prototype **`b60c8f0a`**, not the later
-`42caaa26` layout fix, fork #3 alone, or an integration rebased onto #1597.
-The frozen original is `2e4b5407`; the current unbuffered control uses the same
-shared-arithmetic commit as buffered execution. `B` denotes executing batch size
-and `C` client concurrency:
-
-| Measurement | Result | Interpretation |
-| --- | --- | --- |
-| KDA-only, CUDA-graph two-window cycle, 69 layers, `L8/B4/T4` | Original 2.095–2.108 ms; optimized buffered 2.094–2.102 ms | Approximately parity. Includes producers and accepted commit, but not full runtime stream overlap. |
-| Full-model whole-batch latency, `L8/C4` | Original 1611.950–1622.081 ms; current unbuffered 1631.551–1644.842 ms; buffered 1663.791–1673.887 ms | Buffered is **3.205% slower than original**, **1.871% slower than same-commit unbuffered**, using equally weighted startup medians. |
-| Current buffered vs current unbuffered | Matching token/rounded-acceptance multisets for all 120 measured buffered requests | Supports this fixed workload, not general model accuracy. |
-| Original vs current | Acceptance rate 88.98% vs 88.12%; generated tokens differ | The arithmetic change still needs a separate quality assessment. |
-
-E2E environment: real 93-layer Kimi-K3 NVFP4, TP8 on eight GB300 GPUs, BF16
-activations, FP8 KV cache, CUDA 13, PyTorch 2.13 and FlashInfer 0.6.18. EAGLE3
-uses width four; decode CUDA graphs, segmented prefill graphs and runtime
-overlap are enabled.
-
-The fixed continuation comes from `SWE-bench/SWE-smith-trajectories`, revision
-`08e109b4a59eaeebf80e4675cd125d42e7ac99a4`, instance
-`pandas-dev__pandas.95280573.pr_59144`: 51,936 input tokens, 51,328 cached,
-256 output tokens, temperature zero and seed one. Three arms each have two
-fresh startups and 15 measured C4 batches per startup: 360 measured requests
-total. Table ranges are startup-median ranges, not confidence intervals.
-
-Kernel/runtime regressions and saved real-input comparisons also pass for that
-snapshot; see [M70/M71 in the progress record](kda-buffered-replay-progress.md#m70-recover-shared-buffered-kda-performance).
-There is **no current-snapshot AIME result**. The E2E non-regression target remains
-unmet; neither default enablement nor an E2E performance gain is claimed.
+The tradeoff depends on acceptance length, flush frequency, history length and
+concurrency. Larger buffers may reduce writes but increase reconstruction work
+and reserved memory. Extra metadata/commit launches can offset kernel savings.
+These are hypotheses to evaluate, not promised performance gains. Keep the
+feature opt-in until the agreed correctness and E2E performance criteria pass.
 
 ## 9. Review decisions and delivery gates
 
-Before proceeding, cache/scheduler maintainers should agree on:
+Before proceeding, cache, scheduler and KDA maintainers should agree whether
+reduced full-state writes/replay justify the extra storage and reconstruction
+work for the target workload. Then settle:
 
 1. Bounded lag semantics, the shared expiry rule, and admission/startup budgets
    under #1597's exact frontier.
@@ -347,29 +328,32 @@ Before proceeding, cache/scheduler maintainers should agree on:
    how failed admissions retain evidence, and how overlap protects live storage.
 4. Lifecycle boundaries: exact-state recovery, cancellation fences and keeping
    direct live handoff/P-D transfer gated until owner-level integration exists.
+5. Numerical scope: the required relationship to unbuffered outputs/state,
+   whether shared arithmetic belongs in this refactor, and acceptance/quality
+   criteria agreed before implementation.
+6. Initial scope: supported shapes and capacities, public API boundaries, and
+   which kernel optimizations should remain separate follow-up work.
 
-Then review in independently testable stages: finish bounded retention in #3;
-add history ownership and layout/budgets; review kernels and their numerical
-contract; integrate unified runtime commit with explicit, default-off enablement.
+Once those decisions are agreed, review in independently testable stages:
+bounded retention in #3; history ownership and layout/budgets; kernels and their
+numerical contract; unified runtime commit with explicit, default-off enablement.
 Keep the Python/C++ contract changes together rather than merging mismatched
 interfaces. Shared design docs must be updated with each accepted contract.
 
 Required gates are zero-lag/cache/SWA regressions after #1597; tight-pool,
 overlap, prefix-hit and cancellation tests; independent multi-window recurrence
 and accepted-state checks; eager/graph, padding and mixed-batch coverage; and
-fresh three-arm E2E comparisons on the integration commit. Measure latency,
-throughput, memory and acceptance with matched workloads and independent
-startups. The performance target is no E2E regression against the original;
-the same-commit unbuffered arm isolates the cost of buffering from the arithmetic
-change. Run AIME on that same revision before a model-quality claim. Passing
-kernel tests or KDA-only timing does not substitute for these serving gates.
+E2E comparisons on the integration commit. Plan full-model, real-NVFP4 TP8
+agentic tests with CUDA graphs and runtime overlap, comparing matched workloads
+across independent startups. Measure latency, throughput, memory and acceptance;
+the target is no E2E regression against the unmodified baseline.
+
+If an approved arithmetic change also affects unbuffered execution, retain
+three controls: the original baseline, updated unbuffered execution, and
+buffered execution. Run AIME on the integration revision before a model-quality
+claim. Kernel tests or KDA-only timing do not substitute for these serving gates.
 
 ## References
 
 - [Cache concepts](cache-concepts.md), [scheduler](scheduler.md),
   [unified execution](unified_path.md), [event loop](event-loop.md).
-- [Detailed implementation plan](kda-buffered-replay-plan.md) and
-  [experiment/progress record](kda-buffered-replay-progress.md).
-- Prototype entry points:
-  [buffered KDA kernel](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/kda/_triton/buffered.py),
-  [runtime workspace](../../python/tokenspeed/runtime/layers/attention/backends/state/kda_buffered.py).
