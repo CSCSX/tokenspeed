@@ -1,0 +1,345 @@
+# Kimi-K3 Replay-SSM 重构设计
+
+[English](kda-replay-ssm-design.md) | 简体中文
+
+状态：供 cache/scheduler 维护者评审的设计。`kda-buffered-replay` 分支已有默认关闭的
+原型，但这不代表共享 cache 协议已经获得认可，也不代表性能验收已经完成。
+继续实现这些共享协议或将其接入上游之前，应先对齐第 3–5 节。
+
+本文与英文版对应，沿用其中记录的 PR 状态和验证结果，不代表新增了一轮验证。
+
+## 1. 问题与范围
+
+Kimi-K3 现有的 speculative 路径先验证一组候选 token，再重放被接受的输入，提交
+convolution state 和 recurrent state。普通 decode 则每一步都写回完整的 recurrent
+state。当每轮只接受少量 token 时，重复 replay 和完整 state 写回的开销较大。
+
+本方案保留一个精确的 recurrent checkpoint，以及 checkpoint 之后紧凑的已接受历史。
+Forward 重建当前 state，计算输出并生成候选 history；acceptance 确定后，只提交被接受
+的前缀。仅在容量不足或需要精确快照时，才将完整 recurrent state 写回 cache，
+下文称为“物化”。这替代了每轮 acceptance 后例行执行的 recurrent replay，
+但并不消除 state 重建，也不意味着永远不需要写出端点 state。
+
+普通 decode（`T=1`）和 speculative verify 使用同一套协议。Prefill 仍然读取和输出
+精确 state。首阶段支持 Blackwell 上的 Kimi-K3：BF16 activation、FP32 recurrent
+state、head dimension 128，最大 verify 宽度 `T_max=1` 或 `4`。
+验证使用真实 NVFP4 权重，但这不改变 state 的精度。
+
+本阶段不包含 output-only attention、sampling/acceptance 规则修改、GDN/Qwen 模型的
+buffered replay，也不支持在 prefill/decode worker 之间迁移仍携带 buffered history
+的活跃请求。其他模型保持零滞后配置和现有行为。
+
+## 2. PR 状态与上游基线
+
+| 工作 | 状态 | 范围 |
+| --- | --- | --- |
+| [上游 #1597](https://github.com/lightseekorg/tokenspeed/pull/1597) | **已合并**，merge commit `77eec209` | 修复基于精确 computed frontier 的 checkpoint 发布，并保留待发布的已物化边界。这个前置问题已经解决，不再重复实现。 |
+| [Fork #3](https://github.com/byshiue/tokenspeed/pull/3) | **评审中，尚未合并**，head `77fbdf93` | 通过 `max_state_lag_tokens`、统一回收规则和配套容量预算，支持有界滞后的 live-state 保留。**不包含** replay history、buffered kernel 或 serving 启用。 |
+| 后续 replay 接入 | 已有原型，尚未获上游认可 | 包括本文描述的请求私有 history、Kimi 布局、kernel、runtime commit 和实验性配置。 |
+
+英文版核对状态时，fork #3 的实际目标分支为 `cache-decode-checkpoint-publication`，
+而 PR 描述仍引用较早的评审基线。合并前应以包含 #1597 的上游 main 为基础，
+统一实际 base 与描述，并重新运行受影响的测试。下文的原型结果不属于 rebase 后的 #3。
+
+以 #1597 的 `Request::NumComputedTokens()` 作为计算进度边界：decode 时为
+`TokenSize() - 1`，不包括最后一个刚采样、尚未作为输入计算的 token。
+所有已确认物化的边界都要保留到成功准入并发布为止。旧实验记录中的
+`TokenSize() - decode_width` 和单个 pending watermark 仅用于解释历史实现，
+不是本文提出的协议。
+
+## 3. State 表示与职责划分
+
+对于每个请求的每个 KDA layer，令 `e` 表示已接受且已经完成计算的输入 token 数，
+`c` 为 recurrent checkpoint 的位置，`w <= T_max` 为当前候选窗口宽度：
+
+```text
+精确 recurrent S_c + 已接受 history [c, e) = 逻辑 recurrent S_e
+                    候选 history [e, e+w) 尚未提交
+```
+
+History 为每个 token 保存 FP32 normalized key `K`、correction vector `U` 和乘法
+decay `D`。KDA 的 decay 按 key channel 变化，不是一个标量。Query 只用于当前输出，
+不需要长期保留。被拒绝的候选即使仍有数据留在已分配的内存中，也不属于逻辑 state。
+
+较小的 convolution window 始终对应已接受端点 `e`，recurrent state 则可以停留在
+`c`。二者必须结合已接受 history 才能表示当前状态。只有 recurrent state 也物化到
+所声明的端点后，才是可用于 prefix reuse 或传输的精确快照。
+
+| 负责方 | 职责 |
+| --- | --- |
+| LCM cache | 管理持久的 state/history 字段、内存分配、独占写权限、不可变 prefix snapshot、在途访问的生命周期保护与回收。 |
+| C++ scheduler | 管理 token 级需求、保留范围与准入、精确 checkpoint 发布、请求生命周期和恢复；不执行 recurrence 计算。 |
+| Runtime | 刷新 graph 地址稳定的 metadata，安排 forward/acceptance/commit 顺序，检查完成状态，并报告成功的物化结果。 |
+| `tokenspeed-kernel` | 检查设备端存储是否有效、重建 state、计算输出/history，将选定的 state/window/stamp 写入调用方提供的存储；无权分配内存或发布快照。 |
+
+Backend 不维护独立的、长期存活的 per-request ring。Backend 自有存储仅限于
+固定地址的 batch metadata，以及每轮可复用的 scratch。
+
+## 4. Cache 管理协议
+
+### 有界的 checkpoint 保留范围——fork #3
+
+`max_state_lag_tokens=d` 告诉 allocator：活跃消费者最远还可能读取计算进度之前
+多少 token 的 state。它只改变保留范围，不改变 prefix identity 或 state block
+粒度。设 state block 跨度为 `G`、进度为 `p`，只有索引小于
+`max(0, floor((p-d-1)/G))` 的 block-table slot 才能过期，因为端点 `c` 的 state
+位于 `floor((c-1)/G)`。端点为零时使用初始零 state。
+
+准入时估算可回收容量、victim 规划、空间预留和实际回收必须共用这条规则。
+否则，准入逻辑可能把活跃 checkpoint 仍在使用的内存误算为可用空间。
+启动预算在现有工作集基础上，为每个活跃请求额外预留 `ceil(d/G)` 个 state block。
+原有的 prefill input/checkpoint/tail 和 overlap 保护预算仍需保留，不能用 lag
+预算替代。
+
+Python cache spec、桥接层、C++ 配置和序列化协议必须显式携带同一个值。
+现有 recipe 使用零。Runtime 与 scheduler binding 需要一起重新构建；
+协议缺少字段时不能静默猜测一个默认值。
+
+### 请求私有 history——后续工作
+
+增加 sliding history group，通过 `replay_checkpoint_group` 指定它依赖的 state
+group。对于逻辑容量 `L`，原型声明 history window 为 `L`、state lag 为
+`d=L-T_max`，且要求 `L >= 2*T_max`。必须检查 group 依赖关系，并保证 history
+window 大于声明的 lag。
+
+History group 遵循以下规则：
+
+- Block table 使用绝对 token 位置，不使用对 `L` 取模的索引。物理 packing 是另一
+  个概念：原型当前每个 block 存放八行 history。
+- History 只属于当前活跃请求，不参与 prefix 发布、canonicalization 或 host
+  writeback。Prefix hit 从精确 state snapshot 和空 history 开始，不复用另一个
+  请求的 live history。
+- 长 prefill 不为整个 prompt 分配 history。中间 chunk 通过空洞推进绝对位置表，
+  最后一个 chunk 只预留下一轮 decode 所需的后缀。即使某个 block 已分配，其端点
+  之前的行也不因此成为已初始化的 history。普通 sliding attention 的行为不变。
+- 由 cache 管理的 position stamp 记录已接受 history 对应哪个 checkpoint。
+  必须先写 payload/state，再更新 stamp。不能把丢失的 stamp 当作空 buffer 来
+  “恢复”已经丢失的 history；初始化空 history 必须有精确 state 和新初始化的存储。
+- 物理预算必须包含保留的 history、候选窗口、overlap 保护和不足一个 block 时的
+  向上取整。Python 启动预算与 C++ 准入使用一致的容量上界。需要根据 #1597 的精确
+  frontier 重新检查这些上界，不能未经验证就沿用旧的 `decode_width-1` 保护量。
+
+显存量级可以按每个 head、每个 token 的 FP32 history 计算：
+`4*(2*D_k+D_v)` 字节。TP8 下，每张 GPU 有 69 个本地 KDA layer、12 个本地 head，
+`D_k=D_v=128`；当 `L=8` 时，每个活跃请求在每张 GPU 上需要约 **9.7 MiB** 的
+逻辑 K/U/D payload。这不是全部显存增量：还要计入额外保留的 state block、stamp、
+page packing、overlap/candidate 保护和 runtime scratch。增大 `L` 也会增加重建
+工作量，并非容量越大越快。
+
+## 5. Scheduler 与生命周期改动
+
+Scheduler 仍然只有一条准入/forward 路径，负责逻辑 token 与 cache 需求，
+不检查逐层 history，也不为了适配 backend buffer 而缩短 verify 窗口。
+是否 flush 仍由设备端的 per-request 数据决定。
+
+除有界保留外，后续接入还需要 sparse prefill history demand，以及前述 history
+复用限制。发布机制基于 #1597：只有实际接受的端点已经精确物化，才记录对应的对齐
+边界。仅仅跨过边界、分配 block、提交 convolution window 或计划执行 capacity
+flush，都不能证明存在可复用的精确快照。准入失败时不能消耗待发布的物化证据；
+发布必须先于回收。
+
+生命周期要求如下：
+
+- **Prefill → decode / prefix hit：** 从精确 checkpoint 和空 history 开始。
+  当前 agentic continuation 是通过 prefix matching 进入的新请求，不是活跃请求
+  原地执行 `Decoding → Prefilling` 转换。
+- **接受端点落在对齐边界：** 先按需物化该实际端点，再报告它可复用；不能声称所有
+  被跨过的边界都有 state。
+- **Retraction：** 保持现有的精确 prefix checkpoint 恢复和后缀重算机制，
+  不将 live history 当作精确 state 导出。
+- **完成/取消：** 除非需要发布快照，否则不必额外写回最终完整 state。
+  所有在途读写完成前，都要维持存储的生命周期保护。
+- **直接移交活跃请求 / P-D 传输：** 必须在请求静止、无在途读写时，使用最新 table
+  物化端点，之后准入逻辑才能调整或回收相关存储。原型已有对应 kernel 原语，
+  但 scheduler 侧移交尚未接通；首阶段 serving 接入应拒绝这些配置。
+
+GPU 有效性标志通过正常的 forward-result 路径返回。在向 scheduler 报告成功之前，
+CPU 侧检查及各 rank 对成功与否的一致性确认必须完成。无效存储或缺失的必要结果
+属于 cache 不变量被破坏，不能静默 fallback。Event loop 不发起 GPU 工作，
+也不检查设备端 history。
+
+### 从分配存储到发布可复用 checkpoint
+
+下图跟踪一轮实际物化了对齐接受端点的执行，说明职责和依赖顺序，
+不表示每轮新增一个同步屏障。开启 overlap 时也必须遵守这些依赖。
+
+```mermaid
+sequenceDiagram
+    participant S as C++ scheduler
+    participant C as LCM cache
+    participant R as Runtime
+    participant K as KDA kernels
+    S->>C: 预留 token 需求并保留活跃 checkpoint/history
+    C-->>R: 已预留的 block table 和字段视图
+    R->>K: 准备和验证 metadata，再执行各层 forward
+    K-->>R: Verify 输出与候选 history
+    R->>K: 提交实际接受的输入，物化选定端点
+    Note over C,K: 存储归 cache 管理，先写 payload/state，再写 stamp
+    K-->>R: 完成状态与有效性结果
+    R->>R: 检查完成状态并确认各 rank 均成功
+    R-->>S: 成功反馈及精确边界的物化证据
+    Note over S,C: 物化不等于发布
+    S->>S: 保留待发布证据，直到准入成功
+    S->>C: 准入成功时发布符合条件的精确 checkpoint
+    C->>C: 仅回收已过期且不再被在途操作使用的存储
+```
+
+只有精确 checkpoint 可以复用，live history 始终属于当前请求。
+有效性检查失败时不能报告成功；准入失败时保留证据，供后续尝试使用。
+
+## 6. KDA kernel 与 runtime 接口
+
+原型的 recurrence 入口为 `triton_kda_buffered_recurrent`；runtime 通过
+`KDAReplayMetadata` 和 `KDAReplayWorkspace` 编排执行。即使未来替换 backend，
+以下接口约定也应保持不变：
+
+| 阶段 | 输入 | 输出 / 写入行为 |
+| --- | --- | --- |
+| 准备与验证，每个 group 一次 | 当前原始 table、已接受端点、有效宽度、pool geometry、`L`、`T_max` | 将 checkpoint 位置、history 长度、flush mask 和存储有效性标志写入固定 buffer。 |
+| Forward，逐层执行 | Q/K/V 与 gate producer、显式 stride 的 checkpoint/history view、准备好的位置 | Verify 输出与候选 K/U/D；必要时写出候选计算前的精确 checkpoint。 |
+| Accepted commit，各层 forward 之后 | 实际接受的输入数量、候选 payload、endpoint mask 和当前 table | 已接受的 convolution window、选定的精确 recurrent endpoint，以及按顺序写入的 position stamp。 |
+| 静止状态下的端点物化 | 最新请求 table 和已接受端点 | 精确端点 state 与完成有效性；不消费候选，也不要求为下一轮窗口预留空间。 |
+
+### 一轮 decode 的执行流程
+
+下图针对一个有效、活跃的请求。普通 decode 与 speculative decode 使用同一条
+流程，只是窗口宽度和接受数量不同。菱形判断对应 per-request 的设备端 mask，
+不是 CPU 分支，也不表示需要不同的 CUDA graph。
+
+```mermaid
+flowchart TD
+    A["刷新并验证 table/position<br/>h = e - c"]
+    B["由 S_c 和已接受 history [c, e)<br/>重建 S_e"]
+    C{"h + 2*T_max > L?"}
+    D["容量触发 flush：写出精确 S_e<br/>发生在候选计算之前"]
+    E["计算 verify 输出<br/>及候选 history [e, e+w)"]
+    F["Acceptance 确定接受 a 个输入<br/>新端点 E = e + a"]
+    G["提交已接受的 conv window<br/>排除被拒绝的 history [E, e+w)"]
+    H{"接受端点 E 是否需要<br/>精确 checkpoint？"}
+    I["由 checkpoint 和已接受 history<br/>物化 recurrent S_E"]
+    J["数据写入后提交 stamp<br/>检查完成状态以生成反馈"]
+
+    A --> B --> C
+    C -->|是| D --> E
+    C -->|否| E
+    E --> F --> G --> H
+    H -->|是| I --> J
+    H -->|否| J
+```
+
+Forward/重建逐层执行；所有层的 forward 完成后，再执行 acceptance 和选定端点的
+commit。`a` 包括 target input，不只是 draft match 数，不能再额外加一。
+普通 decode 的 `a=1`；padding 的 `a=0`，不修改状态。被拒绝的数据不必擦除，
+只要提交后的端点将其排除即可。
+
+Capacity flush 写出的是**旧的已接受端点 `e`**，绝不包含未接受的候选。
+Acceptance 后的 endpoint writer 则在需要精确对齐快照时，物化**新的端点 `E`**。
+该快照仍需经过上图的发布流程才能复用。如果不需要端点写回，就继续用
+checkpoint 加已接受 history 表示当前状态。
+
+预留两个最大窗口是首阶段的保守策略：当 `L=8,T_max=4` 时，只要 history 非空，
+下一轮就可能触发 flush。因此，容量为八并不意味着每接受八个 token 才写一次 state。
+
+所有写入目标都必须可写，并在写入前完成验证；对应数据就绪后才能提交 stamp。
+同一 batch 中混合 flush/no-flush、部分接受和 padding 时，eager 与 CUDA graph
+仍执行同一顺序。Metadata 和 scratch 地址保持稳定，容量覆盖 runtime 的最大 batch，
+不能只覆盖 graph capture 的几种大小。Mixed prefill/decode batch 中，prefill
+仍使用精确 state，decode 后缀使用同一套 commit 协议。
+
+容量在启动时固定，通过 `--ssm-replay-buffer-capacity` 显式启用；省略该参数则保持
+现有执行方式。在已支持的硬件和布局范围内，原型接受 `2*T_max <= L <= 64`，
+对非法或不支持的配置直接报错。目前不指定默认容量。
+
+## 7. 数值约定与优化方向
+
+State 重建必须保留有序的 FP32 KDA 更新。仅有代数等价并不足够：
+舍入变化可能改变 verify 输出、acceptance length 和端到端性能。
+
+当前原型区分 BF16 verify producer 与 FP32 accepted-history producer。
+两条保存在寄存器内的 recurrence 计算链共用一次 history 重建。Buffered 与
+unbuffered verify 共用显式规定的归约和更新顺序，不再依赖某次旧版编译恰好生成的
+指令顺序。但这**确实会改变相对于冻结原版的部分末位数值**。
+这项算术修改需要单独评审，不能把新版本两条路径之间的一致描述成与原版逐 bit 一致。
+
+原型已经实现的优化包括：在精度允许时合并 conv/gate producer launch、交错执行
+两条 recurrence 计算链、显式归约布局，以及跨层批量写出选定端点。
+对于较少行数的场景，如果融合会改变舍入，仍保留独立 producer。
+Capacity flush 仍在各层 forward 内执行，没有移动到单独的跨层 flush 阶段。
+
+接下来应根据完整路径的 profile，检查 metadata/commit launch 开销、stream
+overlap、B1/B2/B4 执行及实际 history 长度分布。在不改变数值约定的前提下，调整
+容量、tiling 和 producer fusion。Output-only 代数变换、改变运算结合顺序的
+tensor-core 重建、跨层移动 flush，都需要独立的正确性和性能证据；
+不必等这些探索完成，才讨论 cache 所有权。未来的 CuteDSL backend 也应通过
+`tokenspeed-kernel` 使用相同协议，不能在 runtime 中引入直接的 vendor 依赖。
+
+## 8. 预期收益与现有证据
+
+预期收益是减少完整 state 写回流量，以及 acceptance 后的 replay。
+代价是持久 history、重建时的读取与计算、metadata/commit 工作，以及必要的精确端点
+写回。每个 head 的完整 state 有 `D_k*D_v` 个元素，而一条 history 有
+`2*D_k+D_v` 个元素。维度为 128、使用 FP32 时，两者分别为 64 KiB 和 1.5 KiB。
+这是设计的出发点，不能直接换算成端到端加速比例。
+
+最近完成的对比基于原型 **`b60c8f0a`**，不包括后来的 `42caaa26` 布局修复，
+也不是仅针对 fork #3 或 rebase 到 #1597 之后的集成版本。冻结原版为
+`2e4b5407`；当前 unbuffered 对照与 buffered 使用同一个共享算术版本。
+下表的 `B` 表示实际执行 batch size，`C` 表示客户端 concurrency：
+
+| 测量 | 结果 | 如何解读 |
+| --- | --- | --- |
+| KDA-only，CUDA graph 下的双窗口周期，69 层，`L8/B4/T4` | 原版 2.095–2.108 ms；优化后的 buffered 2.094–2.102 ms | 基本持平。包含 producer 和 accepted commit，但不包含完整 runtime 的 stream overlap。 |
+| 完整模型的整批延迟，`L8/C4` | 原版 1611.950–1622.081 ms；当前 unbuffered 1631.551–1644.842 ms；buffered 1663.791–1673.887 ms | 对各次启动的延迟中位数等权平均后，buffered **比原版慢 3.205%**，**比同 commit 的 unbuffered 慢 1.871%**。 |
+| 当前 buffered 与当前 unbuffered | 全部 120 条计时 buffered 请求的输出 token 与经舍入的 acceptance 指标，其联合多重集合匹配 | 支持这一个固定工作负载的验证结论，不代表通用模型精度。 |
+| 原版与当前版本 | Acceptance rate 为 88.98% 与 88.12%；生成 token 不同 | 算术变化对模型质量的影响仍需单独评估。 |
+
+E2E 环境：真实 93 层 Kimi-K3 NVFP4，八张 GB300、TP8，BF16 activation、FP8 KV
+cache，CUDA 13、PyTorch 2.13、FlashInfer 0.6.18。EAGLE3 的窗口宽度为四；
+开启 decode CUDA graph、segmented prefill graph 和 runtime overlap。
+
+固定 continuation 来自 `SWE-bench/SWE-smith-trajectories`，revision 为
+`08e109b4a59eaeebf80e4675cd125d42e7ac99a4`，instance 为
+`pandas-dev__pandas.95280573.pr_59144`：51,936 个输入 token，其中 51,328 个命中
+cache，生成 256 个 token，temperature 为零、seed 为一。三组实现各做两次独立启动，
+每次启动测量 15 个 C4 batch，共计 360 条计时请求。表中范围是不同启动所得中位数的
+范围，不是置信区间。
+
+该源码快照也通过了 kernel/runtime 回归及已保存真实输入的对比；详见
+[进度记录中的 M70/M71](kda-buffered-replay-progress.md#m70-recover-shared-buffered-kda-performance)。
+**这个源码快照没有新的 AIME 结果**。E2E 性能不退步的目标尚未达成，
+目前不主张默认启用，也不宣称已经获得端到端性能收益。
+
+## 9. 待对齐事项与交付验收
+
+继续推进前，cache/scheduler 维护者需要先对齐以下事项：
+
+1. 有界 lag 的语义、统一的过期规则，以及 #1597 精确 frontier 下的准入/启动预算。
+2. 由 LCM 管理请求私有 history 的方案，包括 checkpoint 依赖、sparse prefill
+   demand，以及不参与 prefix reuse/host writeback 的限制。
+3. 发布证据和完成顺序：什么能证明存在精确 state、准入失败时如何保留证据，
+   以及 overlap 如何保护仍在使用的存储。
+4. 生命周期边界：基于精确 state 的恢复、取消时的在途保护，以及在所有权管理层
+   完成接入前，继续禁止直接移交活跃请求和 P-D 传输。
+
+之后按可独立测试的阶段评审：先完成 #3 的有界保留，再加入 history 所有权、布局和
+预算，随后评审 kernel 及数值约定，最后接入统一 runtime commit，以显式参数启用，
+默认关闭。Python/C++ 协议改动应一起提交，不能先合入互不匹配的接口。
+每项协议被接受时，同步更新相应的共享设计文档。
+
+验收至少包括：#1597 之后的零 lag/cache/SWA 回归；内存池容量受限、overlap、prefix hit
+和取消测试；独立的多窗口 recurrence 与 accepted-state 检查；eager/graph、padding
+和 mixed batch 覆盖；以及在最终集成 commit 上重新进行三组 E2E 对照。
+使用匹配的工作负载和独立启动，测量延迟、吞吐、显存与 acceptance。
+性能目标是相对于原版 E2E 不退步；同 commit 的 unbuffered 对照用于区分 buffering
+本身和算术修改的影响。宣称模型质量达标前，必须在同一 revision 上运行 AIME。
+Kernel 测试通过或 KDA-only 计时达标，都不能替代这些 serving 验收。
+
+## 参考资料
+
+- [Cache 概念](cache-concepts.md)、[Scheduler](scheduler.md)、
+  [统一执行路径](unified_path.md)、[Event loop](event-loop.md)。
+- [详细实现计划](kda-buffered-replay-plan.md) 与
+  [实验/进度记录](kda-buffered-replay-progress.md)。
+- 原型入口：
+  [Buffered KDA kernel](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/kda/_triton/buffered.py)、
+  [Runtime workspace](../../python/tokenspeed/runtime/layers/attention/backends/state/kda_buffered.py)。

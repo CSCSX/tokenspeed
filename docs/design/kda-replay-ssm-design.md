@@ -1,5 +1,7 @@
 # Kimi-K3 Replay-SSM refactor
 
+English | [简体中文](kda-replay-ssm-design.zh-CN.md)
+
 Status: design for cache/scheduler review. A default-off prototype exists on
 `kda-buffered-replay`; its existence does not imply approval of the shared cache
 contract or completion of performance validation. Agree on Sections 3–5 before
