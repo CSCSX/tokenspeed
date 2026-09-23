@@ -230,9 +230,6 @@ Acceptance 后的 endpoint writer 则在需要精确对齐快照时，物化**�
 该快照仍需经过上图的发布流程才能复用。如果不需要端点写回，就继续用
 checkpoint 加已接受 history 表示当前状态。
 
-预留两个最大窗口是首阶段的保守策略：当 `L=8,T_max=4` 时，只要 history 非空，
-下一轮就可能触发 flush。因此，容量为八并不意味着每接受八个 token 才写一次 state。
-
 所有写入目标都必须可写，并在写入前完成验证；对应数据就绪后才能提交 stamp。
 同一 batch 中混合 flush/no-flush、部分接受和 padding 时，eager 与 CUDA graph
 仍执行同一顺序。Metadata 和 scratch 地址保持稳定，容量覆盖 runtime 的最大 batch，
@@ -242,6 +239,53 @@ checkpoint 加已接受 history 表示当前状态。
 建议容量在启动时固定，通过 `--ssm-replay-buffer-capacity` 显式启用；省略该参数
 则保持现有执行方式。要求 `L >= 2*T_max`，并拒绝不支持的硬件/布局组合。
 最终参数名称、容量上限及是否设置默认容量，都留待评审决定。
+
+### 为什么提前一个窗口 flush？
+
+首阶段策略沿用 [ReplaySSM 第 5.3 节](https://dao-lab.ai/blog/2026/replayssm/#53-speculative-decoding)：
+当 `h + 2*T_max > L` 时 flush。其[公开 GDN 实现](https://github.com/Johnny-Liou/ReplaySSM/blob/a84849410ab56cc2b23432969eb2ecfc42a13d9c/vllm/model_executor/layers/fla/ops/gdn_replayssm_spec_decode.py#L382)
+也用相同条件准备下一轮的 flush 标志。这里，`h=e-c` 是本轮开始时的已接受 history
+长度，`L` 同时容纳 history 和候选；`T_max` 是配置的最大输入窗口，不是实际接受数。
+
+Flush 属于逐层 forward，不是先释放 history 存储、再准入候选窗口的独立阶段。
+因此，即使本轮要 flush，进入 forward 时也必须有空间容纳完整窗口：
+`h + T_max <= L`。写出 `S_e` 并不代表其他在途操作仍在读取的 history 可以立即复用。
+
+如果本轮不 flush，最多可能接受 `T_max` 个输入。下一轮即使需要 flush，
+也必须先有空间容纳自己的候选：
+
+```text
+下一轮 history 长度： h_next = h + a，其中 a <= T_max
+下一轮容量要求：      h_next + T_max <= L
+本轮可不 flush 的条件：h + 2*T_max <= L
+```
+
+两个窗口分别预算“本轮可能新增的已接受输入”和“下一轮候选”，不表示两轮同时执行。
+这也维持了声明的 state-lag 上界 `d=L-T_max`。如果本轮执行 capacity flush，
+checkpoint 前进到 `e`，新 history 只包含本轮接受的输入，因此
+`h_next=a <= T_max <= L-T_max`。另行物化精确接受端点时，lag 还可以进一步缩小。
+
+对于 `L=8,T_max=4`，flush 条件简化为 `h>0`。假设从空 history 开始，
+且不考虑额外的精确端点写回：
+
+| 轮次 | 开始时的 history 长度 `h` | 是否 capacity flush | 接受数 `a` | Commit 后的 history 长度 |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | 否 | 2 | 2 |
+| 2 | 2 | 是 | 1 | 1 |
+| 3 | 1 | 是 | 3 | 3 |
+| 4 | 3 | 是 | 3 | 3 |
+
+这里从第二轮开始每轮 flush，符合规则，但失去了跨多轮摊薄完整 state 写回成本的收益。
+`L=8` 是 `T_max=4` 时的合法下限，不是推荐的性能配置。若使用 `L=16,T_max=4`，
+capacity flush 的条件变成 `h>8`，history 就可以跨多轮累积。
+更大的 buffer 也会增加显存和重建工作，容量仍需实测选择，不能认为越大越快。
+
+预留两个窗口是 buffer 生命周期策略，不是 SSM 的数学要求，也不是并行 verify
+必然带来的限制；仅改成串行 recurrence 并不能放宽该条件。如果希望采用 `h+w>L`
+这样的单窗口条件，需要先完成 flush，并确保旧 history 可以安全释放，再将其空间
+用于候选。这涉及执行顺序、在途读者、入口验证，以及 LCM 的保留和准入边界，
+必须一起评审；只把 `2*T_max` 改成 `T_max` 会破坏当前的 `h<=L-T_max` 入口约定。
+该替代方案应作为独立设计选择讨论。
 
 ## 7. 数值约定与优化方向
 
@@ -301,10 +345,52 @@ State 重建必须保留有序的 FP32 KDA 更新。仅有代数等价并不足�
 6. 首阶段范围：支持的 shape 和容量、公共 API 边界，以及哪些 kernel 优化应留作
    独立的后续工作。
 
-上述事项达成共识后，再按可独立测试的阶段评审：#3 的有界保留、history 所有权、布局和
-预算，随后评审 kernel 及数值约定，最后接入统一 runtime commit，以显式参数启用，
-默认关闭。Python/C++ 协议改动应一起提交，不能先合入互不匹配的接口。
-每项协议被接受时，同步更新相应的共享设计文档。
+### 9.1 分阶段交付计划
+
+以下阶段按“每个 PR 都能独立 review、测试和回退”的原则划分。阶段编号表示该能力
+**相较 main 首次完整可用**的阶段，而不是开发分支中代码出现的先后。Main 已有的 LCM
+基础设施、Kimi-K3 state cache、精确 prefill checkpoint、统一 scheduler 路径、CUDA
+graph 基础以及 #1597 的精确 frontier 修复不再列入表中。
+
+| 阶段 | PR 边界 | 完成条件 |
+| --- | --- | --- |
+| 0 | 设计对齐 | Cache、scheduler 和 KDA 维护者确认所有权、不变量、数值契约、初始 shape/容量与非目标；不合入 serving 行为。 |
+| 1 | 有界 state retention | Python/C++ 一起引入非零 `max_state_lag_tokens`，并完成过期、准入、回收、启动预算和零 lag 回归。 |
+| 2 | LCM replay-history 契约 | 加入 checkpoint 依赖、K/U/D history 布局、绝对位置、sparse prefill demand、页数预算，以及 prefix/host-transfer 排除规则；不切换 KDA forward。 |
+| 3 | KDA kernel 原语 | 提供 paged history 重建、候选计算、capacity flush、accepted conv/history commit、position stamp 与精确 endpoint 物化，并以独立 reference 测试验证。 |
+| 4 | Graph-safe metadata 与 workspace | 组合固定地址 metadata、跨层 descriptor、共享 scratch 和 prepare/forward/commit 协议；直接测试 eager/graph、T1/T4、padding、slot reuse 和 rebind。 |
+| 5 | 统一 runtime 接入与数值契约 | 接入 pure/mixed decode、统一 accepted commit、跨 rank validity 和发布顺序；数值变更独立说明，并保留原始、更新后 unbuffered、buffered 三组对照。默认仍关闭。 |
+| 6 | 实验性 serving 入口与验收 | 开放显式、默认关闭的配置；补齐限制与部署文档，并通过完整模型正确性、AIME、容量/并发、生命周期和 E2E 无退步验收。 |
+| 7 | 活跃请求移交与 P-D | 在独立后续 PR 中定义 quiescent materialization、在途同步、精确 state/conv 传输与目标端空 history 恢复；不阻塞首轮 buffered replay。 |
+
+下表只列 main 尚未提供的能力，并把每项工作映射到唯一的首个完成阶段。这样 reviewer
+不需要从“当前状态”推断合入顺序；即使开发分支已有原型，正式合入仍以该阶段的完整
+契约和验收为准。
+
+| 工作项 | 合入 main 的完成定义 | 计划完成阶段 |
+| --- | --- | --- |
+| 非零 checkpoint lag | Retention、expiry、admission、reclaim 与内存预算使用同一 token 单位；零值不改变现有模型行为。 | 阶段 1 |
+| Request-local replay history 所有权 | History 由 LCM cache group 管理，并明确依赖哪个精确 recurrent checkpoint。 | 阶段 2 |
+| K/U/D/stamp 的 paged 布局 | Recipe、物理 packing、block 粒度、TP/PP 预算和 pool view 使用同一布局契约。具体常数在阶段 0 确认。 | 阶段 2 |
+| 绝对位置与 sparse prefill demand | 长 prefill 不为所有历史 token 分配 replay pages；decode 从精确 checkpoint 后的绝对位置开始。 | 阶段 2 |
+| Prefix、传输与回收规则 | Request-local history 不参与 prefix reuse 或未经设计的 host/P-D 传输，并随 request 生命周期安全回收。 | 阶段 2 |
+| Buffered recurrent reconstruction | 从 `S_c` 与 `[c,e)` history 重建 verify 起点，并处理 paged strides、padding 和多请求 batch。 | 阶段 3 |
+| Capacity flush | 在 `h + 2T_max > L` 时物化精确 `S_e`，清空旧 history，再为下一轮保留完整窗口容量。 | 阶段 3 |
+| Accepted-only commit | 只提交已接受的 K/U/D 和 convolution window，拒绝的 suffix 不进入持久状态。 | 阶段 3 |
+| Exact endpoint materialization | 对齐边界和 flush 路径能写出可发布的精确 recurrent/conv state，并以 stamp 防止陈旧页误用。 | 阶段 3 |
+| 固定地址 metadata/workspace | Capture 后只刷新内容，不更换 graph 所引用的地址；支持 pure/mixed decode、padding 和 slot reuse。 | 阶段 4 |
+| Runtime commit 与完成反馈 | Backend、executor、event loop 和 scheduler 通过一条 commit 路径传递 accepted endpoint 与跨 rank validity。 | 阶段 5 |
+| Verify 数值契约 | 明确 buffered 与 unbuffered 的输出/state/acceptance 关系；若改变共享算术，作为可见的独立变更评审。 | 阶段 5（阶段 0 决策） |
+| Kernel 性能优化 | 在已确定的数值契约上优化 producer fusion、tile/layout 和 launch 数，不以近似算术换取结果。 | 阶段 5 |
+| 用户配置与能力检查 | 提供显式 opt-in，启动时拒绝不支持的硬件、shape、窗口、容量或 P-D 组合。 | 阶段 6 |
+| 完整正确性与性能验收 | 覆盖真实 NVFP4、TP8、完整模型、agentic、CUDA graph/overlap、AIME，以及容量和 concurrency sweep。 | 阶段 6 |
+| 活跃请求 handoff / P-D | 在安全点物化并传输精确 state；目标端从空 request-local history 恢复。 | 阶段 7 |
+| Output-only / window-parallel KDA | 需要单独的 kernel 和数值设计，不纳入本轮交付。 | 本轮不计划；另立设计 |
+| 动态 `L` 与其他 linear-attention 模型共用协议 | 需先验证收益、缓存几何和模型状态语义，不能直接沿用 Kimi-K3 常数。 | 本轮不计划；另立设计 |
+
+Python/C++ 协议改动必须在所属阶段一起提交，不能合入互不匹配的接口。每项协议被接受
+时，同步更新相应的共享设计文档。阶段 1–4 可以在不开放 serving 配置的情况下独立合入；
+阶段 5 必须把 forward 与完整 commit/失败处理作为一个原子变化；阶段 6 才提供用户入口。
 
 验收至少包括：#1597 之后的零 lag/cache/SWA 回归；内存池容量受限、overlap、prefix hit
 和取消测试；独立的多窗口 recurrence 与 accepted-state 检查；eager/graph、padding

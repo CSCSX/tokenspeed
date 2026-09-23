@@ -249,10 +249,6 @@ for an exact aligned snapshot. That snapshot still requires the publication
 sequence above. If no endpoint write is needed, checkpoint plus accepted history
 continues to represent the current state.
 
-The conservative two-window rule is an initial policy: for `L=8,T_max=4`,
-nonempty history can trigger a flush on the next round, so capacity eight does
-not imply one state write per eight accepted tokens.
-
 All destinations must be writable and validated before stores. Commit stamps
 only after the corresponding data are ready. Mixed flush/no-flush requests,
 partial acceptance and padding use the same eager/CUDA-graph sequence. Metadata
@@ -265,6 +261,61 @@ Propose a startup-fixed capacity selected through
 `L >= 2*T_max` and reject unsupported hardware/layout combinations. The final
 option name, supported upper limit and any default capacity remain review
 decisions.
+
+### Why flush one window early?
+
+The initial policy follows [ReplaySSM Section 5.3](https://dao-lab.ai/blog/2026/replayssm/#53-speculative-decoding):
+flush when `h + 2*T_max > L`. Its [public GDN implementation](https://github.com/Johnny-Liou/ReplaySSM/blob/a84849410ab56cc2b23432969eb2ecfc42a13d9c/vllm/model_executor/layers/fla/ops/gdn_replayssm_spec_decode.py#L382)
+uses the same test to prepare the next round's flush flag. Here `h=e-c` is
+accepted history at round entry, `L` covers history and candidates, and `T_max`
+is the configured maximum input width, not the actual accepted count.
+
+Flush is part of the layer forward, not a separate stage that releases history
+storage before admitting the candidate window. Even a flush round must enter
+with room for a full window: `h + T_max <= L`. Writing `S_e` alone does not
+authorize reuse of history that other in-flight readers still need.
+
+If this round does not flush, it can accept up to `T_max` inputs. The next round
+must still have room for its candidates, including when that round flushes:
+
+```text
+Next history length:          h_next = h + a, where a <= T_max
+Required next-round capacity: h_next + T_max <= L
+Safe not to flush this round: h + 2*T_max <= L
+```
+
+The two windows budget this round's possible accepted inputs and the next
+round's candidates; they do not mean two rounds execute concurrently. This
+also preserves the declared state-lag bound `d=L-T_max`. After a capacity
+flush, the checkpoint advances to `e` and the new history contains only this
+round's accepted inputs, so `h_next=a <= T_max <= L-T_max`. A separate exact
+endpoint write can reduce the lag further.
+
+For `L=8,T_max=4`, the flush test reduces to `h>0`. Starting with empty history,
+and ignoring additional exact-endpoint writes:
+
+| Round | History at entry `h` | Capacity flush? | Accepted inputs `a` | History after commit |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | No | 2 | 2 |
+| 2 | 2 | Yes | 1 | 1 |
+| 3 | 1 | Yes | 3 | 3 |
+| 4 | 3 | Yes | 3 | 3 |
+
+Flushing every round after the first is expected here, but it loses the benefit
+of amortizing full-state writes across rounds. `L=8` is the legal minimum for
+`T_max=4`, not a recommended performance setting. With `L=16,T_max=4`, capacity
+flush instead triggers at `h>8`, allowing history to span multiple rounds.
+Larger buffers also cost memory and reconstruction work, so capacity needs
+measurement rather than a larger-is-better assumption.
+
+The two-window rule is a buffer-lifetime policy, not an SSM mathematical
+requirement or a consequence of parallel verification. Serial recurrence alone
+does not relax it. A one-window condition such as `h+w>L` would need a protocol
+that finishes flush and safely releases old history before reusing its space
+for candidates. That requires reviewing execution ordering, in-flight readers,
+entry validation and LCM retention/admission bounds together; changing only
+`2*T_max` to `T_max` would violate the current `h<=L-T_max` entry contract.
+Keep that alternative a separate design decision.
 
 ## 7. Numerical contract and optimization approach
 
@@ -334,11 +385,55 @@ work for the target workload. Then settle:
 6. Initial scope: supported shapes and capacities, public API boundaries, and
    which kernel optimizations should remain separate follow-up work.
 
-Once those decisions are agreed, review in independently testable stages:
-bounded retention in #3; history ownership and layout/budgets; kernels and their
-numerical contract; unified runtime commit with explicit, default-off enablement.
-Keep the Python/C++ contract changes together rather than merging mismatched
-interfaces. Shared design docs must be updated with each accepted contract.
+### 9.1 Staged delivery plan
+
+The stages below follow one rule: every PR must be independently reviewable,
+testable and revertible. A stage is where a capability first becomes complete
+relative to main, not where prototype code first appeared. Existing main
+capabilities—LCM infrastructure, Kimi-K3 state caching, exact prefill
+checkpoints, the unified scheduler path, CUDA-graph foundations and #1597's
+exact-frontier fix—are intentionally omitted.
+
+| Stage | PR boundary | Exit criteria |
+| --- | --- | --- |
+| 0 | Design alignment | Cache, scheduler and KDA maintainers agree on ownership, invariants, the numerical contract, initial shapes/capacities and non-goals; no serving behavior lands. |
+| 1 | Bounded state retention | Add nonzero `max_state_lag_tokens` across Python/C++, including expiry, admission, reclaim, startup budgets and zero-lag regressions. |
+| 2 | LCM replay-history contract | Add checkpoint dependency, K/U/D history layout, absolute positions, sparse prefill demand, page budgets and prefix/host-transfer exclusions without switching KDA forward. |
+| 3 | KDA kernel primitives | Provide paged reconstruction, candidate computation, capacity flush, accepted conv/history commit, position stamps and exact-endpoint materialization with independent reference tests. |
+| 4 | Graph-safe metadata and workspace | Compose fixed-address metadata, cross-layer descriptors, shared scratch and prepare/forward/commit; directly test eager/graph, T1/T4, padding, slot reuse and rebind. |
+| 5 | Unified runtime integration and numerical contract | Integrate pure/mixed decode, unified accepted commit, cross-rank validity and publication ordering. Document numerical changes separately and retain original, updated-unbuffered and buffered controls. Keep the feature disabled. |
+| 6 | Experimental serving entry and acceptance | Expose an explicit default-off configuration, document limits, and pass full-model correctness, AIME, capacity/concurrency, lifecycle and E2E no-regression gates. |
+| 7 | Live handoff and P-D | In a separate follow-up, define quiescent materialization, in-flight synchronization, exact state/conv transfer and empty-history recovery at the destination. |
+
+The table lists only capabilities missing from main and assigns each one to the
+first stage that completes it. Prototype availability does not alter the merge
+stage: the complete contract and its acceptance gates do.
+
+| Work item | Definition of complete in main | Planned stage |
+| --- | --- | --- |
+| Nonzero checkpoint lag | Retention, expiry, admission, reclaim and memory budgets use one token unit; zero leaves existing models unchanged. | Stage 1 |
+| Request-local replay-history ownership | LCM manages history as a cache group with an explicit dependency on an exact recurrent checkpoint. | Stage 2 |
+| Paged K/U/D/stamp layout | Recipe, physical packing, block granularity, TP/PP budget and pool views share one layout contract. Constants are approved in Stage 0. | Stage 2 |
+| Absolute positions and sparse prefill demand | Long prefill does not allocate replay pages for all prior tokens; decode starts after an exact checkpoint. | Stage 2 |
+| Prefix, transfer and reclaim rules | Request-local history is excluded from prefix reuse and undesigned host/P-D transfer, and is safely reclaimed with its request. | Stage 2 |
+| Buffered recurrent reconstruction | Reconstruct the verify start from `S_c` and `[c,e)` history across paged strides, padding and batched requests. | Stage 3 |
+| Capacity flush | When `h + 2T_max > L`, materialize exact `S_e`, discard old history and preserve room for a full next window. | Stage 3 |
+| Accepted-only commit | Persist only accepted K/U/D and convolution windows; rejected suffixes never become durable state. | Stage 3 |
+| Exact endpoint materialization | Aligned-boundary and flush paths write publishable recurrent/conv state, with stamps preventing stale-page use. | Stage 3 |
+| Fixed-address metadata/workspace | Refresh contents without changing captured addresses; support pure/mixed decode, padding and slot reuse. | Stage 4 |
+| Runtime commit and completion feedback | Backend, executor, event loop and scheduler carry accepted endpoints and cross-rank validity through one commit path. | Stage 5 |
+| Verify numerical contract | Define the buffered/unbuffered output, state and acceptance relationship; review shared-arithmetic changes explicitly. | Stage 5 (decision in Stage 0) |
+| Kernel performance optimization | Optimize producer fusion, tiles/layout and launch count under the approved arithmetic contract. | Stage 5 |
+| User configuration and capability checks | Provide explicit opt-in and reject unsupported hardware, shapes, windows, capacities or P-D combinations at startup. | Stage 6 |
+| Full correctness and performance acceptance | Cover real NVFP4, TP8, full model, agentic, CUDA graph/overlap, AIME and capacity/concurrency sweeps. | Stage 6 |
+| Live-request handoff / P-D | Materialize and transfer exact state at a safe point; resume with empty request-local history at the destination. | Stage 7 |
+| Output-only / window-parallel KDA | Requires a separate kernel and numerical design and is not part of this delivery. | Not planned here; separate design |
+| Dynamic `L` and reuse by other linear-attention models | Requires separate benefit, cache-geometry and model-state validation; Kimi-K3 constants cannot be assumed. | Not planned here; separate design |
+
+Keep Python/C++ contract changes together in their assigned stage rather than
+merging mismatched interfaces. Update shared design docs with each accepted
+contract. Stages 1–4 may land without a serving entry. Stage 5 must keep forward
+and complete commit/failure handling atomic; only Stage 6 exposes user control.
 
 Required gates are zero-lag/cache/SWA regressions after #1597; tight-pool,
 overlap, prefix-hit and cancellation tests; independent multi-window recurrence
