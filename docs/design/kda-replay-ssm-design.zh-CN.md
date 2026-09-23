@@ -19,11 +19,11 @@ Forward 重建当前 state，计算输出并生成候选 history；acceptance �
 但并不消除 state 重建，也不意味着永远不需要写出端点 state。
 
 普通 decode（`T=1`）和 speculative verify 使用同一套协议。Prefill 仍然读取和输出
-精确 state。首阶段拟聚焦 Blackwell 上的 Kimi-K3：BF16 activation、FP32 recurrent
+精确 state。正式替换的范围聚焦 Blackwell 上的 Kimi-K3：BF16 activation、FP32 recurrent
 state、head dimension 128，最大 verify 宽度 `T_max=1` 或 `4`。
 计划使用真实 NVFP4 权重、TP8 进行验证；权重精度不改变 state 的精度。
 
-本阶段不包含 output-only attention、sampling/acceptance 规则修改、GDN/Qwen 模型的
+本次替换不包含 output-only attention、sampling/acceptance 规则修改、GDN/Qwen 模型的
 buffered replay，也不支持在 prefill/decode worker 之间迁移仍携带 buffered history
 的活跃请求。其他模型保持零滞后配置和现有行为。
 
@@ -88,7 +88,7 @@ Python cache spec、桥接层、C++ 配置和序列化协议必须显式携带�
 不受影响的 recipe 保持零 lag。Runtime 与 scheduler binding 需要一起重新构建；
 协议缺少字段时不能静默猜测一个默认值。
 
-### 请求私有 history——后续工作
+### 请求私有 history——通用 LCM 扩展与正式替换
 
 增加 sliding history group，通过 `replay_checkpoint_group` 指定它依赖的 state
 group。初步建议 history window 使用 `L`，state lag 使用 `d=L-T_max`，
@@ -143,7 +143,7 @@ flush，都不能证明存在可复用的精确快照。准入失败时不能消
 - **完成/取消：** 除非需要发布快照，否则不必额外写回最终完整 state。
   所有在途读写完成前，都要维持存储的生命周期保护。
 - **直接移交活跃请求 / P-D 传输：** 必须在请求静止、无在途读写时，使用最新 table
-  物化端点，之后准入逻辑才能调整或回收相关存储。这些配置不在首阶段 serving
+  物化端点，之后准入逻辑才能调整或回收相关存储。这些配置不在本次 replacement PR
   范围内。未来若支持移交，除了物化 kernel，还需要 scheduler 与生命周期管理的接入。
 
 GPU 有效性标志通过正常的 forward-result 路径返回。在向 scheduler 报告成功之前，
@@ -191,7 +191,7 @@ API 命名与物理布局属于实现选择，应在协议达成共识后再评�
 | 准备与验证，每个 group 一次 | 当前原始 table、已接受端点、有效宽度、pool geometry、`L`、`T_max` | 将 checkpoint 位置、history 长度、flush mask 和存储有效性标志写入固定 buffer。 |
 | Forward，逐层执行 | Q/K/V 与 gate producer、显式 stride 的 checkpoint/history view、准备好的位置 | Verify 输出与候选 K/U/D；必要时写出候选计算前的精确 checkpoint。 |
 | Accepted commit，各层 forward 之后 | 实际接受的输入数量、候选 payload、endpoint mask 和当前 table | 已接受的 convolution window、选定的精确 recurrent endpoint，以及按顺序写入的 position stamp。 |
-| 静止状态下的端点物化，用于未来的活跃请求移交 | 最新请求 table 和已接受端点 | 精确端点 state 与完成有效性；不消费候选，也不要求为下一轮窗口预留空间。这属于后续扩展，活跃请求移交不在首阶段范围内。 |
+| 静止状态下的端点物化，用于未来的活跃请求移交 | 最新请求 table 和已接受端点 | 精确端点 state 与完成有效性；不消费候选，也不要求为下一轮窗口预留空间。这属于后续扩展，活跃请求移交不在本次 replacement PR 范围内。 |
 
 ### 一轮 decode 的执行流程
 
@@ -236,13 +236,13 @@ checkpoint 加已接受 history 表示当前状态。
 不能只覆盖 graph capture 的几种大小。Mixed prefill/decode batch 中，prefill
 仍使用精确 state，decode 后缀使用同一套 commit 协议。
 
-建议容量在启动时固定，通过 `--ssm-replay-buffer-capacity` 显式启用；省略该参数
-则保持现有执行方式。要求 `L >= 2*T_max`，并拒绝不支持的硬件/布局组合。
-最终参数名称、容量上限及是否设置默认容量，都留待评审决定。
+容量在启动时固定，并要求 `L >= 2*T_max`。最终参数名称、容量上限和 recipe 默认值
+留待评审决定。容量配置只调整 Replay-SSM 的资源与性能取舍，不能作为切回旧 KDA
+实现的模式开关；正式替换后，不支持的硬件、布局或容量组合应在启动时拒绝。
 
 ### 为什么提前一个窗口 flush？
 
-首阶段策略沿用 [ReplaySSM 第 5.3 节](https://dao-lab.ai/blog/2026/replayssm/#53-speculative-decoding)：
+正式替换采用的初始策略沿用 [ReplaySSM 第 5.3 节](https://dao-lab.ai/blog/2026/replayssm/#53-speculative-decoding)：
 当 `h + 2*T_max > L` 时 flush。其[公开 GDN 实现](https://github.com/Johnny-Liou/ReplaySSM/blob/a84849410ab56cc2b23432969eb2ecfc42a13d9c/vllm/model_executor/layers/fla/ops/gdn_replayssm_spec_decode.py#L382)
 也用相同条件准备下一轮的 flush 标志。这里，`h=e-c` 是本轮开始时的已接受 history
 长度，`L` 同时容纳 history 和候选；`T_max` 是配置的最大输入窗口，不是实际接受数。
@@ -293,14 +293,15 @@ State 重建必须保留有序的 FP32 KDA 更新。仅有代数等价并不足�
 舍入变化可能改变 verify 输出、acceptance length 和端到端性能。
 
 初始数值目标是保留现有 verify 输出和 accepted-state 更新行为。
-在优化 kernel 之前，先与独立的 unbuffered reference 对比，
+在优化 kernel 之前，先与独立的现有实现 reference 对比，
 其中也要覆盖 convolution 和 gate producer 的精度。
 
 一个候选方案是区分 BF16 verify producer 与 FP32 accepted-history producer，
 让两条保存在寄存器内的 recurrence 计算链共用一次 history 重建。
-另一个需要讨论的选择是让两条路径共用显式 verify 算术；这也可能改变 unbuffered
-路径的舍入。因此，任何此类改动都需要明确的范围批准和数值约定，
-不能为了得到一致结果而重新定义 baseline 或放宽容差。
+另一个需要讨论的选择是让 Replay-SSM 使用显式 verify 算术；这可能相对现有路径改变
+舍入。该方案可以在 replacement 分支实验，但不能作为准备 PR 合入，因为准备阶段要求
+现有数值行为不变。正式替换必须按约定完成数值、acceptance、AIME 和性能验证，不能
+为了得到一致结果而重新定义 baseline 或放宽容差。
 
 在满足数值约定的前提下，可以考虑以下优化：
 
@@ -324,8 +325,8 @@ State 重建必须保留有序的 FP32 KDA 更新。仅有代数等价并不足�
 收益与代价取决于 acceptance length、flush 频率、history 长度和 concurrency。
 更大的 buffer 可能减少写回，也会增加重建工作和预留显存。
 额外的 metadata/commit launch 可能抵消 kernel 节省的时间。
-这些都是需要验证的假设，不是性能承诺。在约定的正确性和 E2E 性能标准通过之前，
-功能应保持显式启用，不默认开启。
+这些都是需要验证的假设，不是性能承诺。正式替换 PR 只有在约定的正确性和 E2E
+性能标准通过后才能合入；不能用长期保留新旧两套实现和运行时开关代替验收。
 
 ## 9. 待对齐事项与交付验收
 
@@ -340,57 +341,61 @@ State 重建必须保留有序的 FP32 KDA 更新。仅有代数等价并不足�
    以及 overlap 如何保护仍在使用的存储。
 4. 生命周期边界：基于精确 state 的恢复、取消时的在途保护，以及在所有权管理层
    完成接入前，继续禁止直接移交活跃请求和 P-D 传输。
-5. 数值范围：与 unbuffered 输出/state 的关系、共享算术是否属于本次重构，
+5. 数值范围：与现有实现输出/state 的关系、共享算术是否属于本次重构，
    以及在实现前先约定 acceptance 和模型质量标准。
-6. 首阶段范围：支持的 shape 和容量、公共 API 边界，以及哪些 kernel 优化应留作
+6. 正式替换范围：支持的 shape 和容量、公共 API 边界，以及哪些 kernel 优化应留作
    独立的后续工作。
 
-### 9.1 分阶段交付计划
+### 9.1 两阶段交付计划
 
-以下阶段按“每个 PR 都能独立 review、测试和回退”的原则划分。阶段编号表示该能力
-**相较 main 首次完整可用**的阶段，而不是开发分支中代码出现的先后。Main 已有的 LCM
-基础设施、Kimi-K3 state cache、精确 prefill checkpoint、统一 scheduler 路径、CUDA
-graph 基础以及 #1597 的精确 frontier 修复不再列入表中。
+交付只分为两个阶段：前期准备可以包含多个小 PR；正式改动只有一个 replacement PR。
+划分依据不是文件或组件数量，而是 main 中是否会同时存在两种 KDA decode 语义。
 
-| 阶段 | PR 边界 | 完成条件 |
-| --- | --- | --- |
-| 0 | 设计对齐 | Cache、scheduler 和 KDA 维护者确认所有权、不变量、数值契约、初始 shape/容量与非目标；不合入 serving 行为。 |
-| 1 | 有界 state retention | Python/C++ 一起引入非零 `max_state_lag_tokens`，并完成过期、准入、回收、启动预算和零 lag 回归。 |
-| 2 | LCM replay-history 契约 | 加入 checkpoint 依赖、K/U/D history 布局、绝对位置、sparse prefill demand、页数预算，以及 prefix/host-transfer 排除规则；不切换 KDA forward。 |
-| 3 | KDA kernel 原语 | 提供 paged history 重建、候选计算、capacity flush、accepted conv/history commit、position stamp 与精确 endpoint 物化，并以独立 reference 测试验证。 |
-| 4 | Graph-safe metadata 与 workspace | 组合固定地址 metadata、跨层 descriptor、共享 scratch 和 prepare/forward/commit 协议；直接测试 eager/graph、T1/T4、padding、slot reuse 和 rebind。 |
-| 5 | 统一 runtime 接入与数值契约 | 接入 pure/mixed decode、统一 accepted commit、跨 rank validity 和发布顺序；数值变更独立说明，并保留原始、更新后 unbuffered、buffered 三组对照。默认仍关闭。 |
-| 6 | 实验性 serving 入口与验收 | 开放显式、默认关闭的配置；补齐限制与部署文档，并通过完整模型正确性、AIME、容量/并发、生命周期和 E2E 无退步验收。 |
-| 7 | 活跃请求移交与 P-D | 在独立后续 PR 中定义 quiescent materialization、在途同步、精确 state/conv 传输与目标端空 history 恢复；不阻塞首轮 buffered replay。 |
+#### 阶段一：前期准备——扩展现有模块，不改变现有功能
 
-下表只列 main 尚未提供的能力，并把每项工作映射到唯一的首个完成阶段。这样 reviewer
-不需要从“当前状态”推断合入顺序；即使开发分支已有原型，正式合入仍以该阶段的完整
-契约和验收为准。
+准备 PR 必须将现有实现迁移到新的通用接口，而不是只加入尚未使用的 Replay-SSM
+旁路。每个 PR 合入后，standard decode 和 speculative decode 仍执行当前 KDA 算法；
+cache geometry、显存占用、scheduler 决策、kernel dispatch、数值与性能应保持不变。
+新的通用接口以显式参数描述现有行为，不能依赖缺省值静默回退。
 
-| 工作项 | 合入 main 的完成定义 | 计划完成阶段 |
-| --- | --- | --- |
-| 非零 checkpoint lag | Retention、expiry、admission、reclaim 与内存预算使用同一 token 单位；零值不改变现有模型行为。 | 阶段 1 |
-| Request-local replay history 所有权 | History 由 LCM cache group 管理，并明确依赖哪个精确 recurrent checkpoint。 | 阶段 2 |
-| K/U/D/stamp 的 paged 布局 | Recipe、物理 packing、block 粒度、TP/PP 预算和 pool view 使用同一布局契约。具体常数在阶段 0 确认。 | 阶段 2 |
-| 绝对位置与 sparse prefill demand | 长 prefill 不为所有历史 token 分配 replay pages；decode 从精确 checkpoint 后的绝对位置开始。 | 阶段 2 |
-| Prefix、传输与回收规则 | Request-local history 不参与 prefix reuse 或未经设计的 host/P-D 传输，并随 request 生命周期安全回收。 | 阶段 2 |
-| Buffered recurrent reconstruction | 从 `S_c` 与 `[c,e)` history 重建 verify 起点，并处理 paged strides、padding 和多请求 batch。 | 阶段 3 |
-| Capacity flush | 在 `h + 2T_max > L` 时物化精确 `S_e`，清空旧 history，再为下一轮保留完整窗口容量。 | 阶段 3 |
-| Accepted-only commit | 只提交已接受的 K/U/D 和 convolution window，拒绝的 suffix 不进入持久状态。 | 阶段 3 |
-| Exact endpoint materialization | 对齐边界和 flush 路径能写出可发布的精确 recurrent/conv state，并以 stamp 防止陈旧页误用。 | 阶段 3 |
-| 固定地址 metadata/workspace | Capture 后只刷新内容，不更换 graph 所引用的地址；支持 pure/mixed decode、padding 和 slot reuse。 | 阶段 4 |
-| Runtime commit 与完成反馈 | Backend、executor、event loop 和 scheduler 通过一条 commit 路径传递 accepted endpoint 与跨 rank validity。 | 阶段 5 |
-| Verify 数值契约 | 明确 buffered 与 unbuffered 的输出/state/acceptance 关系；若改变共享算术，作为可见的独立变更评审。 | 阶段 5（阶段 0 决策） |
-| Kernel 性能优化 | 在已确定的数值契约上优化 producer fusion、tile/layout 和 launch 数，不以近似算术换取结果。 | 阶段 5 |
-| 用户配置与能力检查 | 提供显式 opt-in，启动时拒绝不支持的硬件、shape、窗口、容量或 P-D 组合。 | 阶段 6 |
-| 完整正确性与性能验收 | 覆盖真实 NVFP4、TP8、完整模型、agentic、CUDA graph/overlap、AIME，以及容量和 concurrency sweep。 | 阶段 6 |
-| 活跃请求 handoff / P-D | 在安全点物化并传输精确 state；目标端从空 request-local history 恢复。 | 阶段 7 |
-| Output-only / window-parallel KDA | 需要单独的 kernel 和数值设计，不纳入本轮交付。 | 本轮不计划；另立设计 |
-| 动态 `L` 与其他 linear-attention 模型共用协议 | 需先验证收益、缓存几何和模型状态语义，不能直接沿用 Kimi-K3 常数。 | 本轮不计划；另立设计 |
+建议拆为以下 PR；实际评审时可以合并相邻项，但不能拆开 Python/C++ 的同一协议：
 
-Python/C++ 协议改动必须在所属阶段一起提交，不能合入互不匹配的接口。每项协议被接受
-时，同步更新相应的共享设计文档。阶段 1–4 可以在不开放 serving 配置的情况下独立合入；
-阶段 5 必须把 forward 与完整 commit/失败处理作为一个原子变化；阶段 6 才提供用户入口。
+| 准备 PR | 通用化内容 | 现有实现如何使用 | 独立验证 |
+| --- | --- | --- | --- |
+| P1：有界 state retention | 将 checkpoint lag、过期、准入、回收和启动预算统一为 cache-group 属性。 | 现有 recipe 显式传入零 lag，继续使用当前 checkpoint 生命周期。 | 零 lag 与 main 的 block table、admission、reclaim 和内存预算等价；单独测试非零 lag 的边界。 |
+| P2：LCM request-local dependent group | 推广 cache-group 描述，显式表达 ownership、checkpoint dependency、prefix/host-transfer policy、dense/sparse demand 和绝对位置。 | 现有 KV/state group 用新描述重述当前策略；不创建 K/U/D history group，不增加 page。 | 对现有 recipe 做 geometry/demand 差分测试；测试通用 request-local group 的分配、保护和回收，但不接入 KDA。 |
+| P3：统一 decode descriptor、state commit 与完成协议 | 推广 runtime/backend 的固定地址 decode descriptor、prepare、commit、validity、materialized endpoint 和跨 rank 完成反馈。 | 现有 standard/speculative KDA 读取同一类 batch 描述，并通过新协议报告每轮生成的精确 state；kernel dispatch 和 scheduler 发布结果不变。 | 对 current standard/speculative decode 比较输入描述、state、发布边界、取消、retraction、mixed batch、eager/graph 和 overlap。 |
+
+阶段一不加入 Replay-SSM kernel、不实例化 replay history、不加入新旧实现选择开关，
+也不改变 standard/speculative decode 的算法。这样每个准备 PR 都能长期独立存在；
+即使正式替换延期或取消，也是在推广现有 module、LCM 与 lifecycle，而不是留下半套功能。
+
+#### 阶段二：正式改动——一个 PR 原子替换 KDA core
+
+正式 PR 在阶段一的通用接口上，一次完成 Replay-SSM 接入并删除旧的 post-acceptance
+replay 实现。合入后的 KDA 只有一套 decode state-management 语义：standard decode
+是窗口宽度和接受数为 1 的同一协议，speculative decode 使用更大的窗口；两者共用
+checkpoint/history、reconstruction、flush、accepted commit、metadata、workspace 与
+完成反馈。允许底层 kernel 针对 `T=1`、`T>1` 使用专门化模板，但不能形成两条 runtime
+生命周期。
+
+| 正式 PR 必须原子完成的内容 | 完成定义 |
+| --- | --- |
+| Kimi-K3 history recipe | 实例化 LCM 管理的 K/U/D/stamp group，确定 block layout、预算、checkpoint dependency、sparse prefill demand 和不参与 prefix/host transfer 的规则。 |
+| Replay-SSM kernels | 完成 paged reconstruction、candidate history、`h + 2*T_max > L` capacity flush、accepted-only recurrent/conv commit、stamp 和 exact endpoint materialization。 |
+| Unified decode runtime | Standard 与 speculative decode 使用同一 prepare → forward → acceptance → commit 流程；pure/mixed、eager/CUDA graph 和 overlap 使用同一 metadata/workspace 契约。 |
+| Scheduler 与 publication 闭环 | 使用阶段一的统一 demand、retention 和 commit feedback；只有已成功物化的精确 endpoint 可以发布，失败不能静默 fallback。 |
+| 移除旧实现 | 删除旧 post-acceptance recurrent replay、旧的独立 standard-decode state 路径，以及选择 legacy/Replay-SSM 的环境变量、CLI 或 runtime branch。容量参数只能调节新实现，不能切回旧实现。 |
+| 正确性与性能验收 | 在最终 replacement revision 上完成 kernel/reference、生命周期、真实 NVFP4 TP8 agentic、CUDA graph/overlap、AIME、容量/并发 sweep 和 E2E 无退步验证。 |
+
+正式 PR 可以在开发分支中由多个 commit 组成，也可以在实验时保留 baseline 二进制或
+独立 worktree 做对照；但提交评审的最终 diff 不能同时保留 legacy 和 Replay-SSM serving
+实现。若 correctness 或性能尚未达标，PR 保持 draft，不把双路径开关作为过渡方案合入。
+
+活跃请求 handoff/P-D、output-only 或 window-parallel KDA、动态 `L`，以及将该协议推广到
+GDN/Qwen 等其他 linear-attention 模型，不属于这个 replacement PR；它们需要在核心替换
+完成后各自提出设计。通用 LCM 接口应允许这些后续工作复用，但不能为尚未批准的行为
+预埋无法由现有功能验证的分支。
 
 验收至少包括：#1597 之后的零 lag/cache/SWA 回归；内存池容量受限、overlap、prefix hit
 和取消测试；独立的多窗口 recurrence 与 accepted-state 检查；eager/graph、padding
@@ -399,9 +404,11 @@ Python/C++ 协议改动必须在所属阶段一起提交，不能合入互不匹
 runtime overlap，以匹配的工作负载和独立启动测量延迟、吞吐、显存与 acceptance。
 性能目标是相对于未修改的 baseline，E2E 不退步。
 
-如果获准的算术修改同时影响 unbuffered 路径，则保留三组对照：原始 baseline、
-更新后的 unbuffered，以及 buffered。宣称模型质量达标前，必须在集成 revision 上
-运行 AIME。Kernel 测试通过或 KDA-only 计时达标，都不能替代这些 serving 验收。
+如果 replacement 分支实验了不同算术，验证时可以保留原始 main、算术实验 revision
+和最终 Replay-SSM replacement 三组离线对照；算术实验不能作为准备 PR 单独合入，
+这些 revision 也不表示运行时保留三条路径。宣称模型质量达标前，必须在最终
+replacement revision 上运行 AIME。Kernel 测试通过或 KDA-only 计时达标，都不能
+替代这些 serving 验收。
 
 ## 参考资料
 

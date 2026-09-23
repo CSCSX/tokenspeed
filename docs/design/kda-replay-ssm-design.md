@@ -96,7 +96,7 @@ The Python cache spec, bridge, C++ config and serialized contract carry the same
 explicit value. Unaffected recipes keep zero lag. Runtime and scheduler bindings
 must be rebuilt together; missing contract fields must not silently assume a value.
 
-### Request-local history — subsequent work
+### Request-local history — generic LCM extension and final replacement
 
 Add a sliding history group whose `replay_checkpoint_group` names its state
 group. The proposed initial policy uses history window `L` and state lag
@@ -156,7 +156,7 @@ Lifecycle requirements are:
   being published. Preserve in-flight ownership until all readers/writers finish.
 - **Direct live handoff / P-D transfer:** require quiescent endpoint
   materialization using fresh tables before admission reshapes or reclaims them.
-  Keep these configurations outside the first serving integration. A future
+  Keep these configurations outside the replacement PR. A future
   handoff requires scheduler/lifecycle integration as well as a materialization
   kernel.
 
@@ -208,7 +208,7 @@ implementation choices to review after agreeing on this contract.
 | Prepare and validate, once per group | Current raw tables, accepted endpoints, valid widths, pool geometry, `L`, `T_max` | Checkpoint positions, history lengths, flush masks and backing-validity flags in fixed buffers. |
 | Forward, per layer | Q/K/V and gate producers, checkpoint/history views with explicit strides, prepared positions | Verification outputs and candidate K/U/D; optionally an exact pre-candidate checkpoint. |
 | Accepted commit, after layer forwards | Actual accepted input counts, candidate payload, endpoint masks and current tables | Accepted convolution window, selected exact recurrent endpoints and ordered position stamps. |
-| Quiescent materialization, for a future live handoff | Fresh request tables and accepted endpoints | Exact endpoint states and completion validity, without consuming candidates or requiring space for another window. Future extension; live handoff is outside the initial scope. |
+| Quiescent materialization, for a future live handoff | Fresh request tables and accepted endpoints | Exact endpoint states and completion validity, without consuming candidates or requiring space for another window. Future extension; live handoff is outside the replacement PR. |
 
 ### One decode round
 
@@ -256,11 +256,11 @@ and scratch have stable addresses and cover the runtime batch bound, not just
 the graph capture sizes. Mixed prefill/decode batches keep exact-state prefill
 and use the same commit protocol for their decode suffix.
 
-Propose a startup-fixed capacity selected through
-`--ssm-replay-buffer-capacity`; omission keeps existing execution. Require
-`L >= 2*T_max` and reject unsupported hardware/layout combinations. The final
-option name, supported upper limit and any default capacity remain review
-decisions.
+Keep capacity fixed at startup and require `L >= 2*T_max`. The final option
+name, supported upper limit and recipe default remain review decisions.
+Capacity tunes Replay-SSM's resource/performance tradeoff; it must not select a
+legacy KDA implementation. After replacement, reject unsupported hardware,
+layout or capacity combinations at startup.
 
 ### Why flush one window early?
 
@@ -324,15 +324,18 @@ equivalence alone is insufficient: changed rounding can alter verify outputs,
 acceptance length and end-to-end performance.
 
 The initial numerical target is to preserve the existing verification outputs
-and accepted-state updates. Compare against an independent unbuffered reference,
-including convolution and gate producer precision, before tuning kernels.
+and accepted-state updates. Compare against an independent reference for the
+current implementation, including convolution and gate producer precision,
+before tuning kernels.
 
 One candidate keeps BF16 verification producers and FP32 accepted-history
 producers separate, with two register-local recurrence chains sharing one
-history reconstruction. Sharing explicit verification arithmetic between paths
-is another choice to discuss: it could change rounding in the unbuffered path
-as well. Any such change needs explicit scope approval and a numerical contract;
-do not redefine the baseline or relax tolerances merely to obtain equality.
+history reconstruction. Another choice is explicit verification arithmetic for
+Replay-SSM. It may round differently from the current path. It may be explored
+on the replacement branch, but cannot merge as a preparation PR because
+preparation must preserve current numerics. The replacement must pass the
+agreed numerical, acceptance, AIME and performance gates; do not redefine the
+baseline or relax tolerances merely to obtain equality.
 
 Potential optimizations, subject to that contract, include:
 
@@ -362,8 +365,10 @@ It is not an end-to-end speedup estimate.
 The tradeoff depends on acceptance length, flush frequency, history length and
 concurrency. Larger buffers may reduce writes but increase reconstruction work
 and reserved memory. Extra metadata/commit launches can offset kernel savings.
-These are hypotheses to evaluate, not promised performance gains. Keep the
-feature opt-in until the agreed correctness and E2E performance criteria pass.
+These are hypotheses to evaluate, not promised performance gains. Merge the
+replacement only after the agreed correctness and E2E performance criteria
+pass; a permanent legacy/new implementation switch is not a substitute for
+acceptance.
 
 ## 9. Review decisions and delivery gates
 
@@ -379,61 +384,73 @@ work for the target workload. Then settle:
    how failed admissions retain evidence, and how overlap protects live storage.
 4. Lifecycle boundaries: exact-state recovery, cancellation fences and keeping
    direct live handoff/P-D transfer gated until owner-level integration exists.
-5. Numerical scope: the required relationship to unbuffered outputs/state,
+5. Numerical scope: the required relationship to current outputs/state,
    whether shared arithmetic belongs in this refactor, and acceptance/quality
    criteria agreed before implementation.
 6. Initial scope: supported shapes and capacities, public API boundaries, and
    which kernel optimizations should remain separate follow-up work.
 
-### 9.1 Staged delivery plan
+### 9.1 Two-stage delivery plan
 
-The stages below follow one rule: every PR must be independently reviewable,
-testable and revertible. A stage is where a capability first becomes complete
-relative to main, not where prototype code first appeared. Existing main
-capabilities—LCM infrastructure, Kimi-K3 state caching, exact prefill
-checkpoints, the unified scheduler path, CUDA-graph foundations and #1597's
-exact-frontier fix—are intentionally omitted.
+Delivery has two phases: preparation may contain several small PRs; the final
+change is one replacement PR. The boundary is not the number of files or
+components, but whether main would contain two KDA decode semantics at once.
 
-| Stage | PR boundary | Exit criteria |
-| --- | --- | --- |
-| 0 | Design alignment | Cache, scheduler and KDA maintainers agree on ownership, invariants, the numerical contract, initial shapes/capacities and non-goals; no serving behavior lands. |
-| 1 | Bounded state retention | Add nonzero `max_state_lag_tokens` across Python/C++, including expiry, admission, reclaim, startup budgets and zero-lag regressions. |
-| 2 | LCM replay-history contract | Add checkpoint dependency, K/U/D history layout, absolute positions, sparse prefill demand, page budgets and prefix/host-transfer exclusions without switching KDA forward. |
-| 3 | KDA kernel primitives | Provide paged reconstruction, candidate computation, capacity flush, accepted conv/history commit, position stamps and exact-endpoint materialization with independent reference tests. |
-| 4 | Graph-safe metadata and workspace | Compose fixed-address metadata, cross-layer descriptors, shared scratch and prepare/forward/commit; directly test eager/graph, T1/T4, padding, slot reuse and rebind. |
-| 5 | Unified runtime integration and numerical contract | Integrate pure/mixed decode, unified accepted commit, cross-rank validity and publication ordering. Document numerical changes separately and retain original, updated-unbuffered and buffered controls. Keep the feature disabled. |
-| 6 | Experimental serving entry and acceptance | Expose an explicit default-off configuration, document limits, and pass full-model correctness, AIME, capacity/concurrency, lifecycle and E2E no-regression gates. |
-| 7 | Live handoff and P-D | In a separate follow-up, define quiescent materialization, in-flight synchronization, exact state/conv transfer and empty-history recovery at the destination. |
+#### Phase one: preparation—extend existing modules without changing behavior
 
-The table lists only capabilities missing from main and assigns each one to the
-first stage that completes it. Prototype availability does not alter the merge
-stage: the complete contract and its acceptance gates do.
+Each preparation PR must migrate the current implementation onto the generalized
+interface; it must not merely add an unused Replay-SSM side path. After every PR,
+standard and speculative decode still run the current KDA algorithm. Cache
+geometry, memory use, scheduler decisions, kernel dispatch, numerics and
+performance should remain unchanged. General interfaces describe current
+behavior with explicit arguments rather than silent defaults.
 
-| Work item | Definition of complete in main | Planned stage |
-| --- | --- | --- |
-| Nonzero checkpoint lag | Retention, expiry, admission, reclaim and memory budgets use one token unit; zero leaves existing models unchanged. | Stage 1 |
-| Request-local replay-history ownership | LCM manages history as a cache group with an explicit dependency on an exact recurrent checkpoint. | Stage 2 |
-| Paged K/U/D/stamp layout | Recipe, physical packing, block granularity, TP/PP budget and pool views share one layout contract. Constants are approved in Stage 0. | Stage 2 |
-| Absolute positions and sparse prefill demand | Long prefill does not allocate replay pages for all prior tokens; decode starts after an exact checkpoint. | Stage 2 |
-| Prefix, transfer and reclaim rules | Request-local history is excluded from prefix reuse and undesigned host/P-D transfer, and is safely reclaimed with its request. | Stage 2 |
-| Buffered recurrent reconstruction | Reconstruct the verify start from `S_c` and `[c,e)` history across paged strides, padding and batched requests. | Stage 3 |
-| Capacity flush | When `h + 2T_max > L`, materialize exact `S_e`, discard old history and preserve room for a full next window. | Stage 3 |
-| Accepted-only commit | Persist only accepted K/U/D and convolution windows; rejected suffixes never become durable state. | Stage 3 |
-| Exact endpoint materialization | Aligned-boundary and flush paths write publishable recurrent/conv state, with stamps preventing stale-page use. | Stage 3 |
-| Fixed-address metadata/workspace | Refresh contents without changing captured addresses; support pure/mixed decode, padding and slot reuse. | Stage 4 |
-| Runtime commit and completion feedback | Backend, executor, event loop and scheduler carry accepted endpoints and cross-rank validity through one commit path. | Stage 5 |
-| Verify numerical contract | Define the buffered/unbuffered output, state and acceptance relationship; review shared-arithmetic changes explicitly. | Stage 5 (decision in Stage 0) |
-| Kernel performance optimization | Optimize producer fusion, tiles/layout and launch count under the approved arithmetic contract. | Stage 5 |
-| User configuration and capability checks | Provide explicit opt-in and reject unsupported hardware, shapes, windows, capacities or P-D combinations at startup. | Stage 6 |
-| Full correctness and performance acceptance | Cover real NVFP4, TP8, full model, agentic, CUDA graph/overlap, AIME and capacity/concurrency sweeps. | Stage 6 |
-| Live-request handoff / P-D | Materialize and transfer exact state at a safe point; resume with empty request-local history at the destination. | Stage 7 |
-| Output-only / window-parallel KDA | Requires a separate kernel and numerical design and is not part of this delivery. | Not planned here; separate design |
-| Dynamic `L` and reuse by other linear-attention models | Requires separate benefit, cache-geometry and model-state validation; Kimi-K3 constants cannot be assumed. | Not planned here; separate design |
+The proposed PRs are below. Adjacent items may be combined during review, but a
+single Python/C++ protocol must not be split into mismatched changes.
 
-Keep Python/C++ contract changes together in their assigned stage rather than
-merging mismatched interfaces. Update shared design docs with each accepted
-contract. Stages 1–4 may land without a serving entry. Stage 5 must keep forward
-and complete commit/failure handling atomic; only Stage 6 exposes user control.
+| Preparation PR | Generalization | How the current implementation uses it | Independent validation |
+| --- | --- | --- | --- |
+| P1: bounded state retention | Make checkpoint lag, expiry, admission, reclaim and startup budgets cache-group properties. | Existing recipes explicitly pass zero lag and keep the current checkpoint lifecycle. | Prove zero-lag block tables, admission, reclaim and budgets match main; separately test nonzero-lag boundaries. |
+| P2: LCM request-local dependent groups | Generalize cache-group descriptions to express ownership, checkpoint dependency, prefix/host-transfer policy, dense/sparse demand and absolute positions. | Existing KV/state groups restate their current policies; no K/U/D history group is created and no page is added. | Differential-test existing recipe geometry/demand; test generic request-local allocation, protection and reclaim without KDA integration. |
+| P3: unified decode descriptor, state-commit and completion protocol | Generalize fixed-address runtime/backend decode descriptors, prepare, commit, validity, materialized-endpoint and cross-rank completion feedback. | Current standard/speculative KDA consume the same class of batch description and report exact per-round state through the new protocol; kernel dispatch and scheduler publication are unchanged. | Compare current standard/speculative input descriptions, state, publication boundaries, cancellation, retraction, mixed batch, eager/graph and overlap. |
+
+Phase one adds no Replay-SSM kernel, instantiates no replay history and adds no
+legacy/Replay-SSM selector. It does not change the standard or speculative
+decode algorithm. Every preparation PR therefore remains useful even if the
+final replacement is delayed or cancelled: it generalizes existing modules,
+LCM and lifecycle instead of leaving half of a feature in main.
+
+#### Phase two: final change—replace the KDA core atomically in one PR
+
+The final PR builds on the phase-one interfaces, integrates Replay-SSM and
+removes the old post-acceptance replay implementation in the same change. After
+merge, KDA has one decode state-management semantic: standard decode is the
+same protocol with window width and accepted count equal to one, while
+speculative decode uses a wider window. Both share checkpoint/history,
+reconstruction, flush, accepted commit, metadata, workspace and completion
+feedback. Kernels may specialize for `T=1` and `T>1`, but these specializations
+must not create separate runtime lifecycles.
+
+| Atomic content of the final PR | Definition of complete |
+| --- | --- |
+| Kimi-K3 history recipe | Instantiate LCM-managed K/U/D/stamp groups and define block layout, budget, checkpoint dependency, sparse prefill demand and prefix/host-transfer exclusions. |
+| Replay-SSM kernels | Implement paged reconstruction, candidate history, `h + 2*T_max > L` capacity flush, accepted-only recurrent/conv commit, stamps and exact-endpoint materialization. |
+| Unified decode runtime | Standard and speculative decode use one prepare → forward → acceptance → commit flow; pure/mixed, eager/CUDA graph and overlap share one metadata/workspace contract. |
+| Scheduler and publication closure | Use phase one's common demand, retention and commit feedback; publish only successfully materialized exact endpoints and never silently fall back after failure. |
+| Removal of the old implementation | Delete post-acceptance recurrent replay, the separate standard-decode state path, and environment, CLI or runtime branches that select legacy versus Replay-SSM. Capacity may tune only the new implementation. |
+| Correctness and performance acceptance | On the final replacement revision, pass kernel/reference, lifecycle, real-NVFP4 TP8 agentic, CUDA graph/overlap, AIME, capacity/concurrency sweep and E2E no-regression validation. |
+
+The final PR may contain multiple development commits, and experiments may keep
+a baseline binary or separate worktree for comparison. Its review diff must not
+retain both legacy and Replay-SSM serving implementations. If correctness or
+performance is not ready, keep the PR in draft rather than merging a dual-path
+switch as a transition.
+
+Live-request handoff/P-D, output-only or window-parallel KDA, dynamic `L`, and
+generalization to GDN/Qwen or other linear-attention models are outside this
+replacement PR and require their own later designs. The common LCM interfaces
+should permit reuse, but must not pre-install branches for unapproved behavior
+that current functionality cannot validate.
 
 Required gates are zero-lag/cache/SWA regressions after #1597; tight-pool,
 overlap, prefix-hit and cancellation tests; independent multi-window recurrence
@@ -443,10 +460,12 @@ agentic tests with CUDA graphs and runtime overlap, comparing matched workloads
 across independent startups. Measure latency, throughput, memory and acceptance;
 the target is no E2E regression against the unmodified baseline.
 
-If an approved arithmetic change also affects unbuffered execution, retain
-three controls: the original baseline, updated unbuffered execution, and
-buffered execution. Run AIME on the integration revision before a model-quality
-claim. Kernel tests or KDA-only timing do not substitute for these serving gates.
+If the replacement branch explores different arithmetic, retain three offline
+controls as needed: original main, an arithmetic experiment revision and the
+final Replay-SSM replacement. The experiment must not merge as a preparation
+PR, and these revisions do not imply three runtime paths. Run AIME on the final
+replacement revision before a model-quality claim. Kernel tests or KDA-only
+timing do not substitute for these serving gates.
 
 ## References
 
