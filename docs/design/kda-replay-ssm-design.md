@@ -7,12 +7,28 @@ ownership and scope of the cache, scheduler and KDA changes before deciding the
 implementation plan. Sections 3–5 describe the proposed shared contracts;
 Section 9 lists the decisions that need maintainer agreement.
 
+The English document is normative and the Chinese document is its synchronized
+translation. Update both in the same PR; resolve translation ambiguity in favor
+of the English text.
+
 ## 1. Problem and scope
 
 Kimi-K3's current speculative path verifies a candidate window, then replays the
 accepted inputs to commit convolution and recurrent state. Ordinary decode also
 writes the full recurrent state every step. Repeated replay and full-state
 writes are expensive relative to the small number of accepted tokens.
+
+This differs from the baseline behind ReplaySSM's published concurrency gains:
+TokenSpeed's current Kimi-K3 path does not retain a full state snapshot for each
+draft token. The blog's concurrency recovery from eliminating per-draft
+snapshots therefore does not transfer directly. This proposal targets
+post-acceptance replay and amortized full-state **writes**, purchased with
+per-live-request history and lagging-checkpoint capacity.
+
+The current speculative accepted-state commit also runs eagerly after decode
+graph replay. The replacement brings commit into the unified graph-stable
+lifecycle. That is a TokenSpeed-specific potential benefit, but measure it
+separately from replay/write reduction rather than treating it as guaranteed.
 
 The proposal keeps an exact recurrent checkpoint plus compact accepted history.
 Forward reconstructs the current state, produces outputs and candidate history,
@@ -21,15 +37,40 @@ when capacity requires it or an exact snapshot is needed. This replaces routine
 post-acceptance recurrent replay; it does not eliminate state reconstruction or
 every endpoint write.
 
+The key change is the lifetime of cached decode inputs. The current path does
+have cached recurrent/conv state and per-round speculative workspace; it does
+not retain accepted K/U/D history across decode rounds. The replacement makes
+that accepted history persistent and LCM-owned:
+
+| Concern | Current implementation | Replay-SSM replacement |
+| --- | --- | --- |
+| Logical state at round entry | Exact recurrent `S_e` from the preceding round. | Exact checkpoint `S_c` plus accepted history `[c,e)` represents logical `S_e`. |
+| Standard decode | Update and write the full exact recurrent state for every token. | Use the same protocol with `T=1`; append one accepted history entry and materialize only when required. |
+| Speculative verify | Keep the current candidate window's projections/intermediates in per-round workspace. | Produce candidate K/U/D history `[e,e+w)` against the reconstructed state. |
+| After acceptance | Replay the accepted prefix from the per-round workspace and write exact `S_e`. | Promote `[e,e+a)` into persistent accepted history; exclude rejected `[e+a,e+w)` without post-acceptance recurrent replay. |
+| History lifetime and owner | Candidate intermediates are valid only for the current verify/commit round and are backend workspace. | Accepted history survives across rounds for the live request and is owned, admitted and reclaimed by LCM. |
+| Full-state materialization | Standard decode writes every step; speculative decode writes after every accepted replay. | Write on capacity flush, an aligned reusable checkpoint, or another explicit snapshot boundary. |
+| Reuse scope | Candidate intermediates are reused only within the current round. | Later rounds of the same live request reuse accepted history; another request never inherits it. Prefix reuse still starts from an exact checkpoint and empty history. |
+| Standard/speculative relationship | Different state-maintenance behavior. | One prepare → reconstruct → forward → acceptance → commit protocol; only `T` and accepted count differ. |
+
+In this document, **history reuse** means promoting the accepted part of the
+current candidate window into request-local storage and consuming it in later
+rounds of that same request. It never means cross-request prefix reuse or reuse
+of a rejected suffix.
+
 Ordinary decode (`T=1`) and speculative verification use the same protocol.
 Prefill continues to consume and produce exact states. The proposed initial
 scope is Kimi-K3 on Blackwell with BF16 activations, FP32 recurrent state, head
 dimension 128 and maximum verification width `T_max=1` or `4`. Validation should
 use real NVFP4 weights with TP8; weight precision does not change state precision.
 
-Non-goals are output-only attention, changing sampling/acceptance rules, enabling
-buffered replay for GDN/Qwen models, and transferring a live buffered request
-between prefill/decode workers. Other models retain zero lag and existing behavior.
+Non-goals are output-only attention, changing sampling/acceptance rules, and
+transferring a live buffered request between prefill/decode workers. The repo
+already has an opt-in `--enable-replay-ssm` path for selected Qwen GDN models;
+this design neither changes nor removes it, and it is not precedent for keeping
+a legacy/new selector for KDA. Any later convergence of their cache or kernel
+protocols needs a separate design. Other models retain zero lag and existing
+behavior.
 
 ## 2. Upstream prerequisites and related PRs
 
@@ -76,6 +117,12 @@ also been materialized at the advertised endpoint.
 There is no backend-private persistent request ring. Backend-owned storage is
 limited to fixed-address batch metadata and reusable per-round scratch.
 
+Do not model this after a pool-private tail such as GLM-5.3-Flash KPool. Such
+storage is outside scheduler admission and cache-reclaim accounting and has no
+general prefix/transfer lifecycle. Replay history determines whether a
+checkpoint can reconstruct the live state, so LCM must own it as a
+request-local cache group.
+
 ## 4. Cache management contract
 
 ### Bounded checkpoint retention — fork #3
@@ -98,9 +145,15 @@ must be rebuilt together; missing contract fields must not silently assume a val
 
 ### Request-local history — generic LCM extension and final replacement
 
-Add a sliding history group whose `replay_checkpoint_group` names its state
-group. The proposed initial policy uses history window `L` and state lag
-`d=L-T_max`, with `L >= 2*T_max`. Validate the dependency and require
+Main currently rejects sliding retention on a state-family group; preserve that
+snapshot-state invariant. Preparation adds a distinct row-backed `history`
+family whose sliding groups may name a state group through
+`replay_checkpoint_group`; it does not turn a state group into a sliding group.
+P2 must update `cache-concepts.md`, `scheduler.md`, the Python spec and the C++
+bridge together for this new family, dependency and scheduling contract.
+
+The proposed initial policy uses history window `L` and state lag `d=L-T_max`,
+with `L >= 2*T_max`. Validate the dependency and require
 the history window to exceed the declared lag.
 
 The history group follows these rules:
@@ -249,6 +302,11 @@ for an exact aligned snapshot. That snapshot still requires the publication
 sequence above. If no endpoint write is needed, checkpoint plus accepted history
 continues to represent the current state.
 
+Capacity flush does not require another recurrence: forward has already
+reconstructed `S_e` from `S_c` and `[c,e)`, so flush stores that result. This
+mitigates the extra compute of frequent flushes at small `L`, but does not
+remove their full-state write traffic.
+
 All destinations must be writable and validated before stores. Commit stamps
 only after the corresponding data are ready. Mixed flush/no-flush requests,
 partial acceptance and padding use the same eager/CUDA-graph sequence. Metadata
@@ -323,6 +381,20 @@ State reconstruction must preserve the ordered FP32 KDA updates. Algebraic
 equivalence alone is insufficient: changed rounding can alter verify outputs,
 acceptance length and end-to-end performance.
 
+Before phase two begins, maintainers must select and fill in one of these
+contracts in this document. Do not wait for kernel results and relax the gate
+afterward.
+
+| Numerical contract | Acceptance criteria that must be fixed in advance |
+| --- | --- |
+| Bitwise contract | Verification outputs, accepted recurrent/conv state and deterministic acceptance sequences match the current implementation bit for bit over the reference matrix. |
+| Tolerance contract | Record dtype-specific output/state `atol`/`rtol`, acceptance criteria for a deterministic corpus and the full agentic workload, and permitted AIME and E2E deltas. |
+
+If the selected contract cannot be met, return the final PR to design review
+and revise this section; do not lower the standard inside the same implementation
+review. This gives rounding failures a resolution path instead of leaving the
+replacement in draft indefinitely.
+
 The initial numerical target is to preserve the existing verification outputs
 and accepted-state updates. Compare against an independent reference for the
 current implementation, including convolution and gate producer precision,
@@ -355,20 +427,40 @@ vendor dependencies.
 
 ## 8. Expected benefit and tradeoffs
 
-The intended benefit is less full-state write traffic and less post-acceptance
-replay. The cost is persistent history, reconstruction reads/arithmetic,
-metadata/commit work and occasional exact-endpoint writes. A full state has
-`D_k*D_v` elements per head; one history entry has `2*D_k+D_v`. This motivates
-the design: at dimension 128, these are 64 KiB and 1.5 KiB in FP32, respectively.
-It is not an end-to-end speedup estimate.
+The intended benefits are eliminating post-acceptance replay, amortizing full
+state writes, and bringing accepted commit into the unified graph-stable decode
+lifecycle. This is not the blog's concurrency optimization from removing
+per-draft state snapshots: the current Kimi-K3 baseline does not have those
+snapshots.
 
-The tradeoff depends on acceptance length, flush frequency, history length and
-concurrency. Larger buffers may reduce writes but increase reconstruction work
-and reserved memory. Extra metadata/commit launches can offset kernel savings.
-These are hypotheses to evaluate, not promised performance gains. Merge the
-replacement only after the agreed correctness and E2E performance criteria
-pass; a permanent legacy/new implementation switch is not a substitute for
-acceptance.
+A full state has `D_k*D_v` elements per head; one history entry has
+`2*D_k+D_v`. At dimension 128 in FP32 these are 64 KiB and 1.5 KiB,
+respectively, about a 43× size gap. That motivates exchanging small per-token
+storage for fewer full-state writes; it is not an end-to-end speedup estimate.
+
+Account for all of the following costs:
+
+- Output-only attention is out of scope, so every round still reads full `S_c`
+  and reconstructs `S_e`. Full-state read traffic does not shrink, while
+  reconstruction reads and arithmetic grow with `h`. The blog's near-halving
+  of state traffic with output-only attention does not apply directly.
+- At TP8, the K/U/D payload is about 9.7 MiB/request/GPU for `L=8`, hence about
+  19.4 MiB/request/GPU for `L=16`. At 256 live requests, history alone is about
+  4.85 GiB/GPU, before lagging checkpoints, stamps, page rounding,
+  candidate/overlap protection and runtime scratch.
+- State lag `d=L-T_max` also raises retraction cost. The newest publishable
+  checkpoint may trail by up to `d` tokens, so recovery may recompute up to `d`
+  extra tokens per retracted request.
+- Larger `L` may reduce flushes and full-state writes, but increases memory,
+  history reads and reconstruction work. Extra metadata/commit launches can
+  offset kernel gains.
+
+The final PR must therefore sweep `L ∈ {8,16,32}` against target concurrency
+and report latency, throughput, GPU memory, flush frequency, retraction recovery
+cost and acceptance. Select a recipe default only from those results. These are
+hypotheses to evaluate, not promised performance gains. Merge the replacement
+only after the agreed correctness and E2E performance criteria pass; a permanent
+legacy/new implementation switch is not a substitute for acceptance.
 
 ## 9. Review decisions and delivery gates
 
@@ -384,11 +476,12 @@ work for the target workload. Then settle:
    how failed admissions retain evidence, and how overlap protects live storage.
 4. Lifecycle boundaries: exact-state recovery, cancellation fences and keeping
    direct live handoff/P-D transfer gated until owner-level integration exists.
-5. Numerical scope: the required relationship to current outputs/state,
-   whether shared arithmetic belongs in this refactor, and acceptance/quality
-   criteria agreed before implementation.
-6. Initial scope: supported shapes and capacities, public API boundaries, and
-   which kernel optimizations should remain separate follow-up work.
+5. Numerical scope: choose bitwise or a pre-quantified tolerance contract and
+   fill in output/state, acceptance, AIME and E2E criteria. Phase two cannot
+   begin before this blocking decision is complete.
+6. Replacement scope: supported shapes and capacities, public API boundaries,
+   the `L ∈ {8,16,32}` × target-concurrency sweep, and which kernel
+   optimizations should remain separate follow-up work.
 
 ### 9.1 Two-stage delivery plan
 
@@ -411,7 +504,7 @@ single Python/C++ protocol must not be split into mismatched changes.
 | Preparation PR | Generalization | How the current implementation uses it | Independent validation |
 | --- | --- | --- | --- |
 | P1: bounded state retention | Make checkpoint lag, expiry, admission, reclaim and startup budgets cache-group properties. | Existing recipes explicitly pass zero lag and keep the current checkpoint lifecycle. | Prove zero-lag block tables, admission, reclaim and budgets match main; separately test nonzero-lag boundaries. |
-| P2: LCM request-local dependent groups | Generalize cache-group descriptions to express ownership, checkpoint dependency, prefix/host-transfer policy, dense/sparse demand and absolute positions. | Existing KV/state groups restate their current policies; no K/U/D history group is created and no page is added. | Differential-test existing recipe geometry/demand; test generic request-local allocation, protection and reclaim without KDA integration. |
+| P2: LCM request-local dependent groups | Preserve the state+sliding prohibition and add a row-backed `history` family; express ownership, checkpoint dependency, prefix/host-transfer policy, dense/sparse demand and absolute positions, updating cache/scheduler design docs and the Python/C++ contract together. | Existing KV/state groups restate their current policies; no K/U/D history group is created and no page is added. | Differential-test existing recipe geometry/demand; test generic request-local allocation, protection and reclaim, including an adversarial “allocated hole is not an empty exact-state seed” case, without KDA integration. |
 | P3: unified decode descriptor, state-commit and completion protocol | Generalize fixed-address runtime/backend decode descriptors, prepare, commit, validity, materialized-endpoint and cross-rank completion feedback. | Current standard/speculative KDA consume the same class of batch description and report exact per-round state through the new protocol; kernel dispatch and scheduler publication are unchanged. | Compare current standard/speculative input descriptions, state, publication boundaries, cancellation, retraction, mixed batch, eager/graph and overlap. |
 
 Phase one adds no Replay-SSM kernel, instantiates no replay history and adds no
@@ -438,7 +531,7 @@ must not create separate runtime lifecycles.
 | Unified decode runtime | Standard and speculative decode use one prepare → forward → acceptance → commit flow; pure/mixed, eager/CUDA graph and overlap share one metadata/workspace contract. |
 | Scheduler and publication closure | Use phase one's common demand, retention and commit feedback; publish only successfully materialized exact endpoints and never silently fall back after failure. |
 | Removal of the old implementation | Delete post-acceptance recurrent replay, the separate standard-decode state path, and environment, CLI or runtime branches that select legacy versus Replay-SSM. Capacity may tune only the new implementation. |
-| Correctness and performance acceptance | On the final replacement revision, pass kernel/reference, lifecycle, real-NVFP4 TP8 agentic, CUDA graph/overlap, AIME, capacity/concurrency sweep and E2E no-regression validation. |
+| Correctness and performance acceptance | On the final replacement revision, pass kernel/reference, lifecycle, real-NVFP4 TP8 agentic, CUDA graph/overlap, AIME, `L ∈ {8,16,32}` × target-concurrency sweep and E2E no-regression validation. |
 
 The final PR may contain multiple development commits, and experiments may keep
 a baseline binary or separate worktree for comparison. Its review diff must not
