@@ -303,6 +303,52 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_commit_ctx = None
         self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
 
+    def _causal_conv_decode(
+        self,
+        projected: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Short-convolution seam for a model's recurrent-state backend."""
+        return causal_conv1d_update(
+            projected,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices=read_indices,
+            output_state_indices=write_indices.view(-1, 1),
+            parent_indices=None,
+        )
+
+    def _causal_conv_prefill(
+        self,
+        projected: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        has_initial_state: torch.Tensor,
+        write_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Consume the metadata-owned convolution schedule once per layer."""
+        return causal_conv1d_fn(
+            projected,
+            weight,
+            bias,
+            activation=activation,
+            conv_states=conv_state,
+            has_initial_state=has_initial_state,
+            cache_indices=write_indices,
+            query_start_loc=query_start_loc,
+            prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+        )
+
     @property
     def kv_pool(self) -> CachePool | None:
         return self.cache_pool
@@ -1453,15 +1499,14 @@ class MambaAttnBackend(AttentionBackend):
         # Preserve the shared fallback's established compact input layout.
         if not self._decode_packed_qkv_views:
             mixed_qkv = mixed_qkv.contiguous()
-        mixed_qkv = causal_conv1d_update(
+        mixed_qkv = self._causal_conv_decode(
             mixed_qkv,
             conv_states,
             conv_weights,
             bias,
             activation,
-            conv_state_indices=read_indices,
-            output_state_indices=state_out_blocks.view(-1, 1),
-            parent_indices=None,
+            read_indices,
+            state_out_blocks,
         )
 
         query, key, value = torch.split(
@@ -1771,16 +1816,15 @@ class MambaAttnBackend(AttentionBackend):
                 )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv = self._causal_conv_prefill(
                 mixed_qkv_t,
+                conv_states,
                 conv_weights,
                 bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=conv_cache_indices,
-                query_start_loc=query_start_loc,
-                prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                activation,
+                has_initial_states,
+                conv_cache_indices,
+                query_start_loc,
             ).transpose(0, 1)[:seq_len]
             if extend_seq_lens_cpu is not None:
                 # The convolution allocates its output uninitialized and gives

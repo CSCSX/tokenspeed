@@ -250,6 +250,15 @@ class AttnConfig:
                     raise ValueError("FlashMLA DCP decode requires CUDA")
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
+            elif softmax.is_dsa and softmax.backend_name == "longcat_dsa":
+                if torch.device(self.device).type != "npu":
+                    raise ValueError("LongCat DSA DCP requires Ascend NPU")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("LongCat DSA DCP does not support speculation")
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 if torch.device(self.device).type != "cuda":
                     raise ValueError("GPU DSA DCP decode requires CUDA")

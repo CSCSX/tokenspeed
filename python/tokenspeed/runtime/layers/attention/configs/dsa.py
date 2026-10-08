@@ -146,12 +146,22 @@ class DSAConfig(MLAConfig):
     # Storage of the index-key plane, one of INDEX_K_FORMATS.
     index_k_format: str
     index_kpool: int | None = None
+    index_init_tokens: int = 0
+    index_local_tokens: int = 0
+
+    @property
+    def uses_separate_bf16_index_cache(self) -> bool:
+        return self.index_k_format == "bf16"
 
     def __post_init__(self) -> None:
         # None is a DSA configure-attention hook that named no plane.
         index_k_plane_dtype(self.index_k_format)
         if self.index_topk < 0:
             raise ValueError(f"index_topk must be nonnegative, got {self.index_topk}")
+        if self.index_init_tokens < 0 or self.index_local_tokens < 0:
+            raise ValueError("DSA initial/local token counts must be nonnegative")
+        if self.index_init_tokens + self.index_local_tokens > self.index_topk:
+            raise ValueError("DSA initial/local tokens exceed index_topk")
 
     @classmethod
     def _spec_kwargs(
@@ -167,6 +177,8 @@ class DSAConfig(MLAConfig):
             # plugin that scores the checkpoint's bf16 keys names "bf16".
             index_k_format=model_config.index_k_format,
             index_kpool=getattr(model_config, "index_kpool", None),
+            index_init_tokens=getattr(model_config, "index_init_tokens", 0) or 0,
+            index_local_tokens=getattr(model_config, "index_local_tokens", 0) or 0,
         )
 
     @classmethod

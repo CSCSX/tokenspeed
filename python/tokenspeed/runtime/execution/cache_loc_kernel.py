@@ -185,6 +185,20 @@ def fused_decode_input_prep(
     per-iter indexSelect + add are gone too.
     """
     batch_size = req_pool_indices.shape[0]
+    if req_pool_indices.device.type == "npu":
+        cache_start = valid_cache_lengths.index_select(
+            0, req_pool_indices.to(torch.int64)
+        )
+        seq_lens_out_ptr.copy_(cache_start + uniform_input_length)
+        offsets = torch.arange(
+            uniform_input_length,
+            dtype=positions_ptr.dtype,
+            device=positions_ptr.device,
+        )
+        positions_ptr.view(batch_size, uniform_input_length).copy_(
+            cache_start.to(positions_ptr.dtype).unsqueeze(1) + offsets
+        )
+        return
     BLOCK_SIZE = 128
     grid = (batch_size,)
     fused_decode_input_prep_kernel[grid](

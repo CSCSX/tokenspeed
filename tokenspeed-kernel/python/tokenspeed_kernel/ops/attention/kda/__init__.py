@@ -856,6 +856,9 @@ import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.kda.ascend  # noqa: E402,F401
+
 # isort: on
 
 __all__ = [

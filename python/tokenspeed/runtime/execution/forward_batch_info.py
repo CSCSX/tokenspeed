@@ -107,6 +107,29 @@ def compute_position_triton(
         batch_size, dtype=torch.int32, device=extend_seq_lens.device
     )
     has_prefix = extend_prefix_lens.shape[0] == batch_size
+    if extend_seq_lens.device.type == "npu":
+        lengths = extend_seq_lens.to(torch.int64)
+        starts = torch.cumsum(lengths, dim=0) - lengths
+        extend_start_loc.copy_(starts.to(torch.int32))
+        prefix_lens = (
+            extend_prefix_lens.to(torch.int64)
+            if has_prefix
+            else torch.zeros_like(lengths)
+        )
+        repeated_offsets = torch.repeat_interleave(
+            prefix_lens - starts,
+            lengths,
+            output_size=extend_seq_lens_sum,
+        )
+        positions[:extend_seq_lens_sum].copy_(
+            torch.arange(
+                extend_seq_lens_sum,
+                dtype=torch.int64,
+                device=extend_seq_lens.device,
+            )
+            + repeated_offsets
+        )
+        return positions, extend_start_loc
     # Launch kernel
     compute_position_kernel[(batch_size,)](
         positions, extend_start_loc, extend_prefix_lens, extend_seq_lens, has_prefix

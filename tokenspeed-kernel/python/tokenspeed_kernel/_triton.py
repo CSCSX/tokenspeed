@@ -28,20 +28,28 @@ import importlib.abc
 import importlib.util
 import sys
 
-import tokenspeed_triton.experimental.gluon.language as gl
 import torch
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 _IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _IS_NPU:
     from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
+
+    # Gluon and tensor descriptors belong to the CUDA/ROCm vendor package.
+    # Their kernels are not registered on Ascend; importing them here would
+    # make an otherwise independent NPU installation require that package.
+    aggregate = None
+    TensorDescriptor = None
+    gl = None
+    gluon = None
 else:
     import tokenspeed_triton as triton
+    import tokenspeed_triton.experimental.gluon.language as gl
     from tokenspeed_triton import language as tl
+    from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.language.core import _aggregate as aggregate
     from tokenspeed_triton.language.extra import libdevice
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
     try:
         import tokenspeed_triton.profiler as proton
@@ -49,8 +57,8 @@ else:
         proton = None
 
 __all__ = [
-    "aggregate",
     "TensorDescriptor",
+    "aggregate",
     "gl",
     "gluon",
     "libdevice",

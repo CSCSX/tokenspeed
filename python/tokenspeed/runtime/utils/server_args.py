@@ -30,8 +30,14 @@ import socket
 from collections.abc import Sequence
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_npu:
+    # GDN/FLA is CUDA-only; importing its Triton implementation on Ascend
+    # probes a CUDA/HIP driver before any model has been constructed.
+    FLA_CHUNK_SIZE = 64
+else:
+    from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 from tokenspeed.runtime.configs.numerics import (
     DSA_SLOT_ORDERS,
@@ -854,11 +860,12 @@ class ServerArgs:
             # decoding but silently wrong for any serving deployment where
             # requests carry sampling params, since the model collapses into
             # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA where flashinfer is
-            # available, fall back to greedy elsewhere; users can still opt
-            # into greedy explicitly via ``--sampling-backend greedy``.
+            # sampling-respecting backend on NVIDIA and Ascend; users can
+            # still opt into greedy explicitly via ``--sampling-backend greedy``.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
+            elif current_platform().is_npu:
+                self.sampling_backend = "ascend_full"
             else:
                 self.sampling_backend = "greedy"
 
@@ -2950,6 +2957,7 @@ class ServerArgs:
                 "flashinfer_full",
                 "triton",
                 "triton_full",
+                "ascend_full",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -2962,6 +2970,7 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "with Triton Gumbel-Max for single-step sampling. "
+            "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
         )
