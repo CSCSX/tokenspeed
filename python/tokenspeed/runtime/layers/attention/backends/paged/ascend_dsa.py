@@ -312,9 +312,6 @@ class _AscendDSAContextParallel:
 class AscendDSABackend(DSABackend):
     """LongCat DSA execution backed by Ascend indexer and sparse-attention ops."""
 
-    # The LongCat DSA indexer writes its latent cache inside the sparse leaf.
-    supports_direct_cache_write = True
-
     # The decode path owns its DCP page placement and query exchange; the
     # generic MLA gate must accept this backend when attn_tp == dcp_size.
     supports_mla_dcp = True
@@ -538,25 +535,20 @@ class AscendDSABackend(DSABackend):
         table,
         kwargs,
         *,
-        save_kv_cache=True,
         context_parallel=False,
         context_parallel_row_start=0,
     ):
-        """Write BF16 cache planes and select request-local sparse indices.
+        """Write the index cache and select request-local sparse indices.
 
         Query ends delimit the TND request spans; page identities and write
-        slots belong to the router. Sparse attention remains in the existing
-        forward_sparse_prefill / forward_sparse_decode entry points.
+        slots belong to the router. The MLA prologue already wrote KV.
         """
+        del k
         spec = self._indexer_spec
         kernels = self._indexer_kernels
-        kv_cache = pool.get_key_buffer(layer.layer_id)
         index_cache = pool.get_component(layer.layer_id, "dsa_index_k")
         page = self.kernel_page_size
-        kv_cache = kv_cache.view(-1, page, 1, spec.kv_cache_dim)
         index_cache = index_cache.view(-1, page, 1, spec.index_head_dim)
-        if save_kv_cache:
-            kernels.scatter(k.contiguous(), kv_cache, out_cache_loc)
         kernels.scatter(kwargs["index_key"].contiguous(), index_cache, out_cache_loc)
         if self.step_counter is not None:
             self.step_counter.record_cache()
@@ -858,12 +850,9 @@ class AscendDSABackend(DSABackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
-        if not save_kv_cache:
-            raise ValueError("LongCat DSA prefill requires cache writes")
         metadata = self.forward_prefill_metadata
         head_major_output = kwargs.pop("head_major_output", False)
         selection = self._select_indexed(
@@ -911,7 +900,6 @@ class AscendDSABackend(DSABackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
         **kwargs,
@@ -925,8 +913,6 @@ class AscendDSABackend(DSABackend):
                 "LongCat DSA decode requires one token or a complete verify "
                 "window per request"
             )
-        if save_kv_cache and k is None:
-            raise ValueError("LongCat DSA decode cache write requires k")
         if topk_indices is not None or topk_lens is not None:
             raise ValueError(
                 "LongCat DSA expects indexer projections, not global-slot TopK"
@@ -970,7 +956,6 @@ class AscendDSABackend(DSABackend):
             query_lengths,
             query_table,
             kwargs,
-            save_kv_cache=save_kv_cache,
             context_parallel=True,
             context_parallel_row_start=query_start,
         )
