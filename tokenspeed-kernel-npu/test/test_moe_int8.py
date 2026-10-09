@@ -171,14 +171,13 @@ def test_w8a8_moe_uses_nz_weights_and_runs(smooth_quant: str) -> None:
 def test_routed_w8a8_optional_smooth_matches_composed_graph(
     smooth_quant: str, smooth_layout: str, solution: str
 ) -> None:
-    library = os.environ.get("TOKENSPEED_LITE_GMM13_LIBRARY")
-    if not library:
-        pytest.skip("set TOKENSPEED_LITE_GMM13_LIBRARY for routed fusion tests")
-    if solution == "flash_npu_routed_full" and not os.environ.get(
-        "TOKENSPEED_FUSED_MM2_LIBRARY"
-    ):
-        pytest.skip("set TOKENSPEED_FUSED_MM2_LIBRARY for full routed fusion tests")
-    torch.ops.load_library(library)
+    if solution == "flash_npu_routed_full":
+        pytest.importorskip("flash_ops")
+    else:
+        library = os.environ.get("TOKENSPEED_LITE_GMM13_LIBRARY")
+        if not library:
+            pytest.skip("set TOKENSPEED_LITE_GMM13_LIBRARY for routed fusion tests")
+        torch.ops.load_library(library)
     device = torch.device("npu:0")
     torch.manual_seed(981)
     experts, tokens, hidden, intermediate = 4, 17, 512, 1024

@@ -480,7 +480,7 @@ def ascend_routed_int8_precomputed_moe_apply(
     if not getattr(w, "_ascend_int8_moe_weights_processed", False):
         raise RuntimeError("Lite routed fusion weights were not prepared")
     ids = topk_ids.to(torch.int32)
-    if "routed_mm13_with_plan" in plan:
+    if "routed_mm13" in plan:
         return _ascend_routed_full_moe_apply(plan, x, ids, topk_weights, w, True)
     hidden, scales, counts, rows = torch.ops.custom.fused_init_routing_mm13_swiglu(
         x,
@@ -497,20 +497,21 @@ def ascend_routed_int8_precomputed_moe_apply(
 
 
 def _ascend_routed_full_moe_apply(plan, x, ids, weights, w, quantized):
-    hidden, scales, counts, rows, experts, boundaries, bases = plan[
-        "routed_mm13_with_plan"
-    ](
-        x,
-        ids,
-        w.w13_weight,
-        w.w13_weight_scale if quantized else None,
-        int(w.ep_rank) * int(w.num_local_experts),
-        plan["routed_cube_cores"],
-        getattr(w, "w13_smooth_scale", None) if quantized else None,
-        getattr(w, "w2_smooth_scale", None) if quantized else None,
-    )
-    # Preserve the composed/previous fused finalizer's BF16 routing fence.
-    # Boundaries are regenerated on device, including every graph replay.
+    start = int(w.ep_rank) * int(w.num_local_experts)
+    if quantized:
+        hidden, scales, counts, rows = plan["routed_mm13"](
+            x,
+            ids,
+            w.w13_weight,
+            w.w13_weight_scale,
+            start,
+            getattr(w, "w13_smooth_scale", None),
+            getattr(w, "w2_smooth_scale", None),
+        )
+    else:
+        hidden, counts, rows = plan["routed_mm13_bf16"](x, ids, w.w13_weight, start)
+        scales = None
+    boundary = plan["routed_boundary"]
     return plan["routed_mm2"](
         hidden,
         w.w2_weight,
@@ -518,37 +519,26 @@ def _ascend_routed_full_moe_apply(plan, x, ids, weights, w, quantized):
         scales if quantized else None,
         counts,
         rows,
-        weights.bfloat16(),
-        experts,
-        boundaries,
-        bases,
+        weights.contiguous(),
+        boundary,
+        boundary,
+        boundary,
     )
 
 
 def _prepare_routed_full_moe(plan: dict, w: torch.nn.Module) -> None:
-    """Validate and bind the matched MM13/MM2 ABI before any graph capture."""
-    import os
+    """Bind the standard two-kernel MM13/MM2 path before graph capture."""
+    import flash_ops  # noqa: F401  # registers the packaged custom ops
 
-    if os.environ.get("TOKENSPEED_NPU_MM13_AICPU_BALANCE", "").startswith("1"):
-        raise RuntimeError("Full routed MoE requires the AIV plan, not AICPU balance")
     if not hasattr(torch.ops.custom, "fused_mm2_fin_routing"):
-        library = os.environ.get("TOKENSPEED_FUSED_MM2_LIBRARY")
-        if not library:
-            raise RuntimeError(
-                "Set TOKENSPEED_FUSED_MM2_LIBRARY to the MM2 fusion binding"
-            )
-        torch.ops.load_library(library)
-    if not hasattr(torch.ops.custom, "fused_mm2_fin_routing"):
-        raise RuntimeError("Loaded library does not provide fused_mm2_fin_routing")
+        raise RuntimeError("flash_ops is missing the standard fused MM2 op")
     packet = torch.ops.custom.fused_init_routing_mm13_swiglu
-    if not hasattr(packet, "with_plan"):
-        raise RuntimeError("Rebuild MM13 with the device-generated with_plan ABI")
-    mm13 = packet.with_plan
+    mm13 = packet.default
     mm2 = torch.ops.custom.fused_mm2_fin_routing.default
     expected = (
         (
             mm13,
-            "custom::fused_init_routing_mm13_swiglu.with_plan(Tensor x, Tensor ids, Tensor weight, Tensor? weight_scale, int expert_start, int cube_cores, Tensor? smooth13, Tensor? smooth2) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+            "custom::fused_init_routing_mm13_swiglu(Tensor x, Tensor ids, Tensor weight, Tensor weight_scale, int expert_start, Tensor? smooth13=None, Tensor? smooth2=None) -> (Tensor, Tensor, Tensor, Tensor)",
         ),
         (
             mm2,
@@ -560,21 +550,88 @@ def _prepare_routed_full_moe(plan: dict, w: torch.nn.Module) -> None:
             raise RuntimeError(
                 f"Incompatible routed MoE ABI: {op._schema}; expected {schema}"
             )
-    limits = torch.npu.get_device_limit(w.w13_weight.device)
-    cores = min(limits["cube_core_num"], limits["vector_core_num"] // 2)
-    if not 1 <= cores <= 24:
-        raise RuntimeError("Full routed MoE requires 1..24 paired Cube cores")
-    # The native entry also checks the execution stream's quota. Restricted
-    # streams must not silently use a plan sized for the full device.
-    plan.update(routed_mm13_with_plan=mm13, routed_mm2=mm2, routed_cube_cores=cores)
+    if hasattr(packet, "bf16"):
+        plan["routed_mm13_bf16"] = packet.bf16
+    plan.update(
+        routed_mm13=mm13,
+        routed_mm2=mm2,
+        routed_boundary=torch.zeros(25, dtype=torch.int32, device=w.w13_weight.device),
+    )
 
 
 def ascend_routed_full_int8_process_moe_weights(
     *, plan: dict, w: torch.nn.Module
 ) -> None:
     """Prepare both fused segments; preserve the input-only solution."""
-    ascend_routed_int8_process_moe_weights(plan=plan, w=w)
     _prepare_routed_full_moe(plan, w)
+    ascend_routed_int8_process_moe_weights(plan=plan, w=w)
+    w.w2_weight_scale.data = w.w2_weight_scale.data.bfloat16().contiguous()
+
+
+def ascend_routed_chain_int8_process_moe_weights(
+    *, plan: dict, w: torch.nn.Module
+) -> None:
+    """Prepare the standard W8A8 MM13/SwiGLU/MM2 single-kernel path."""
+    import flash_ops  # noqa: F401  # registers the packaged custom ops
+
+    if not hasattr(torch.ops.custom, "fused_mm13_mm2"):
+        raise RuntimeError("flash_ops is missing the standard fused MM13/MM2 op")
+
+    op = torch.ops.custom.fused_mm13_mm2.default
+    expected = (
+        "custom::fused_mm13_mm2(Tensor x, Tensor ids, Tensor w13, Tensor ws13, "
+        "Tensor w2, Tensor ws2, Tensor route_weights, Tensor expert_boundaries, "
+        "Tensor row_boundaries, Tensor expert_base_boundaries, int expert_start=0, "
+        "int quant_bits=8, Tensor? smooth13=None, Tensor? smooth2=None) -> Tensor"
+    )
+    if str(op._schema) != expected:
+        raise RuntimeError(f"Incompatible standard fused MM13/MM2 ABI: {op._schema}")
+    ascend_int8_process_moe_weights(plan=plan, w=w)
+    # The packaged W8 kernel requires BF16 MM2 scales. These boundary tensors
+    # are ABI placeholders: its device route-table builder ignores their values.
+    w.w2_weight_scale.data = w.w2_weight_scale.data.bfloat16().contiguous()
+    boundary = torch.zeros(25, dtype=torch.int32, device=w.w13_weight.device)
+    plan.update(routed_chain_op=op, routed_chain_boundary=boundary)
+
+
+def ascend_routed_chain_int8_precomputed_moe_apply(
+    *,
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Return local weighted routes; the outer GMoE still owns communication."""
+    del router_logits, num_tokens_global, max_num_tokens_per_gpu, enable_pdl
+    if not do_finalize or plan.get("activation") not in {"silu", "swiglu"}:
+        raise ValueError("Fused MM13/MM2 requires finalized SwiGLU experts")
+    if topk_ids is None or topk_weights is None or topk_ids.shape != topk_weights.shape:
+        raise ValueError("Fused MM13/MM2 requires matching route IDs and weights")
+    if not getattr(w, "_ascend_int8_moe_weights_processed", False):
+        raise RuntimeError("Fused MM13/MM2 weights were not prepared")
+    boundary = plan["routed_chain_boundary"]
+    return plan["routed_chain_op"](
+        x.contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
+        topk_weights.contiguous(),
+        boundary,
+        boundary,
+        boundary,
+        int(w.ep_rank) * int(w.num_local_experts),
+        8,
+        getattr(w, "w13_smooth_scale", None),
+        getattr(w, "w2_smooth_scale", None),
+    )
 
 
 def ascend_routed_bf16_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
@@ -632,8 +689,10 @@ def ascend_routed_full_bf16_process_moe_weights(
     *, plan: dict, w: torch.nn.Module
 ) -> None:
     """Prepare both true BF16 fused segments; the composed control is unchanged."""
-    ascend_routed_bf16_process_moe_weights(plan=plan, w=w)
     _prepare_routed_full_moe(plan, w)
+    if "routed_mm13_bf16" not in plan:
+        raise RuntimeError("flash_ops is missing the standard BF16 MM13 overload")
+    ascend_routed_bf16_process_moe_weights(plan=plan, w=w)
 
 
 def ascend_routed_bf16_precomputed_moe_apply(
@@ -658,7 +717,7 @@ def ascend_routed_bf16_precomputed_moe_apply(
     if not getattr(w, "_ascend_bf16_moe_weights_processed", False):
         raise RuntimeError("BF16 routed fusion weights were not prepared")
     ids = topk_ids.to(torch.int32)
-    if "routed_mm13_with_plan" in plan:
+    if "routed_mm13" in plan:
         return _ascend_routed_full_moe_apply(plan, x, ids, topk_weights, w, False)
     hidden, counts, rows = torch.ops.custom.fused_init_routing_mm13_swiglu.bf16(
         x, ids, w.w13_weight, int(w.ep_rank) * int(w.num_local_experts)
@@ -828,5 +887,7 @@ __all__ = [
     "ascend_bf16_process_moe_weights",
     "ascend_int8_precomputed_moe_apply",
     "ascend_int8_process_moe_weights",
+    "ascend_routed_chain_int8_precomputed_moe_apply",
+    "ascend_routed_chain_int8_process_moe_weights",
     "ascend_softmax_bias_topk",
 ]

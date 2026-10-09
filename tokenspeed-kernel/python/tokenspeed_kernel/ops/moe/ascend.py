@@ -48,6 +48,12 @@ if current_platform().is_npu:
         ascend_routed_bf16_process_moe_weights as _routed_bf16_process_weights,
     )
     from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_chain_int8_precomputed_moe_apply as _routed_chain_int8_moe_apply,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_chain_int8_process_moe_weights as _routed_chain_int8_process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
         ascend_routed_full_bf16_process_moe_weights as _routed_full_bf16_process_weights,
     )
     from tokenspeed_kernel_npu.ops.moe import (
@@ -168,6 +174,31 @@ if current_platform().is_npu:
         )
         def routed_int8_moe_apply(**kwargs):
             return _routed_int8_moe_apply(**kwargs)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_routed_chain_int8_precomputed_moe_apply",
+        solution="flash_npu_chain",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"int8"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({32}),
+            "internal_activation_dtype": frozenset({"int8"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=0,
+        features={"ascend", "npu_graph", "w8a8", "nz"},
+        weight_preprocessor=_routed_chain_int8_process_weights,
+    )
+    def routed_chain_int8_moe_apply(**kwargs):
+        return _routed_chain_int8_moe_apply(**kwargs)
 
     for name, solution, preprocessor in (
         (

@@ -42,57 +42,50 @@ def adapter(monkeypatch):
 
 @pytest.fixture
 def bindings(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flash_ops", SimpleNamespace())
     mm13 = Mock(
         _schema=torch._C.parse_schema(
-            "custom::fused_init_routing_mm13_swiglu.with_plan(Tensor x, Tensor ids, Tensor weight, Tensor? weight_scale, int expert_start, int cube_cores, Tensor? smooth13, Tensor? smooth2) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+            "custom::fused_init_routing_mm13_swiglu(Tensor x, Tensor ids, Tensor weight, Tensor weight_scale, int expert_start, Tensor? smooth13=None, Tensor? smooth2=None) -> (Tensor, Tensor, Tensor, Tensor)"
         )
     )
+    bf16 = Mock()
     mm2 = Mock(
         _schema=torch._C.parse_schema(
             "custom::fused_mm2_fin_routing(Tensor x, Tensor weight, Tensor? weight_scale, Tensor? x_scale, Tensor counts, Tensor rows, Tensor route_weights, Tensor expert_boundaries, Tensor row_boundaries, Tensor expert_base_boundaries) -> Tensor"
         )
     )
     custom = SimpleNamespace(
-        fused_init_routing_mm13_swiglu=SimpleNamespace(with_plan=mm13),
+        fused_init_routing_mm13_swiglu=SimpleNamespace(default=mm13, bf16=bf16),
         fused_mm2_fin_routing=SimpleNamespace(default=mm2),
     )
     monkeypatch.setattr(torch, "ops", SimpleNamespace(custom=custom))
-    limits = Mock(return_value=dict(cube_core_num=24, vector_core_num=40))
-    monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(get_device_limit=limits), raising=False
-    )
-    monkeypatch.delenv("TOKENSPEED_NPU_MM13_AICPU_BALANCE", raising=False)
-    return custom, mm13, mm2, limits
+    return custom, mm13, bf16, mm2
 
 
-def test_preparation_binds_exact_ops_and_core_quota(adapter, bindings):
-    _, mm13, mm2, limits = bindings
+def test_preparation_binds_standard_ops_and_boundary_placeholders(adapter, bindings):
+    _, mm13, bf16, mm2 = bindings
     w = SimpleNamespace(w13_weight=torch.empty(1))
     plan = {}
     adapter._prepare_routed_full_moe(plan, w)
-    assert plan == dict(
-        routed_mm13_with_plan=mm13, routed_mm2=mm2, routed_cube_cores=20
-    )
-    limits.assert_called_once_with(w.w13_weight.device)
+    assert plan["routed_mm13"] is mm13
+    assert plan["routed_mm13_bf16"] is bf16
+    assert plan["routed_mm2"] is mm2
+    assert plan["routed_boundary"].shape == (25,)
 
 
-@pytest.mark.parametrize(
-    "fault", ["old_mm2", "missing_plan", "aicpu", "too_many_cores"]
-)
+@pytest.mark.parametrize("fault", ["old_mm2", "old_mm13"])
 def test_preparation_rejects_incompatible_contract(
     adapter, bindings, monkeypatch, fault
 ):
-    custom, _, mm2, limits = bindings
+    custom, mm13, _, mm2 = bindings
     if fault == "old_mm2":
         mm2._schema = torch._C.parse_schema(
             "custom::fused_mm2_fin_routing(Tensor x, Tensor weight, Tensor? weight_scale, Tensor? x_scale, Tensor counts, Tensor rows, Tensor route_weights) -> Tensor"
         )
-    elif fault == "missing_plan":
-        del custom.fused_init_routing_mm13_swiglu.with_plan
-    elif fault == "aicpu":
-        monkeypatch.setenv("TOKENSPEED_NPU_MM13_AICPU_BALANCE", "1")
     else:
-        limits.return_value = dict(cube_core_num=32, vector_core_num=64)
+        mm13._schema = torch._C.parse_schema(
+            "custom::fused_init_routing_mm13_swiglu.with_plan(Tensor x, Tensor ids, Tensor weight, Tensor? weight_scale, int expert_start, int cube_cores, Tensor? smooth13, Tensor? smooth2) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+        )
     plan = {}
     with pytest.raises(RuntimeError):
         adapter._prepare_routed_full_moe(
@@ -102,10 +95,8 @@ def test_preparation_rejects_incompatible_contract(
 
 
 @pytest.mark.parametrize("quantized", [True, False])
-def test_full_apply_threads_fresh_plan_and_preserves_bf16_fence(
-    adapter, bindings, quantized
-):
-    _, mm13, mm2, limits = bindings
+def test_full_apply_passes_standard_mm13_outputs_to_mm2(adapter, bindings, quantized):
+    _, mm13, bf16, mm2 = bindings
     w = SimpleNamespace(
         w13_weight=torch.empty(2, 32, 64),
         w2_weight=torch.empty(2, 32, 32),
@@ -129,8 +120,11 @@ def test_full_apply_threads_fresh_plan_and_preserves_bf16_fence(
         else adapter.ascend_routed_bf16_precomputed_moe_apply
     )
     for step in range(2):
-        outputs = tuple(torch.full((4,), step + i) for i in range(7))
-        mm13.return_value = outputs
+        outputs = tuple(
+            torch.full((4,), step + i) for i in range(4 if quantized else 3)
+        )
+        producer = mm13 if quantized else bf16
+        producer.return_value = outputs
         result = apply(
             plan=plan,
             x=x,
@@ -144,26 +138,30 @@ def test_full_apply_threads_fresh_plan_and_preserves_bf16_fence(
             enable_pdl=False,
         )
         assert result is mm2.return_value
-        args = mm13.call_args.args
+        args = producer.call_args.args
         assert args[0] is x and args[1].dtype == torch.int32
-        assert args[3] is (w.w13_weight_scale if quantized else None)
-        assert args[4:6] == (2, 20)
+        if quantized:
+            assert args[3] is w.w13_weight_scale
+            assert args[4] == 2
+        else:
+            assert args[3] == 2
         tail = mm2.call_args.args
         assert tail[0] is outputs[0]
         assert tail[2] is (w.w2_weight_scale if quantized else None)
         assert tail[3] is (outputs[1] if quantized else None)
-        assert tail[4] is outputs[2] and tail[5] is outputs[3]
-        torch.testing.assert_close(tail[6], weights.bfloat16(), rtol=0, atol=0)
-        assert all(a is b for a, b in zip(tail[7:], outputs[4:]))
-    assert mm13.call_count == mm2.call_count == 2
-    assert limits.call_count == 1  # No host device query in forward.
+        offset = 1 if quantized else 0
+        assert tail[4] is outputs[1 + offset]
+        assert tail[5] is outputs[2 + offset]
+        assert tail[6] is weights
+        assert tail[7] is tail[8] is tail[9] is plan["routed_boundary"]
+    assert producer.call_count == mm2.call_count == 2
 
 
 @pytest.mark.parametrize("quantized", [True, False])
 def test_input_only_keeps_original_producer_and_tail(
     adapter, bindings, monkeypatch, quantized
 ):
-    custom, planned, mm2, limits = bindings
+    custom, planned, _, mm2 = bindings
     outputs = tuple(torch.empty(1) for _ in range(4 if quantized else 3))
     producer = Mock(return_value=outputs)
     packet = producer if quantized else SimpleNamespace(bf16=producer)
@@ -206,4 +204,52 @@ def test_input_only_keeps_original_producer_and_tail(
     producer.assert_called_once()
     planned.assert_not_called()
     mm2.assert_not_called()
-    limits.assert_not_called()
+
+
+def test_standard_chain_uses_packaged_abi_and_local_finalization(adapter, monkeypatch):
+    monkeypatch.setitem(sys.modules, "flash_ops", SimpleNamespace())
+    chain = Mock(
+        _schema=torch._C.parse_schema(
+            "custom::fused_mm13_mm2(Tensor x, Tensor ids, Tensor w13, Tensor ws13, Tensor w2, Tensor ws2, Tensor route_weights, Tensor expert_boundaries, Tensor row_boundaries, Tensor expert_base_boundaries, int expert_start=0, int quant_bits=8, Tensor? smooth13=None, Tensor? smooth2=None) -> Tensor"
+        )
+    )
+    monkeypatch.setattr(
+        torch,
+        "ops",
+        SimpleNamespace(
+            custom=SimpleNamespace(fused_mm13_mm2=SimpleNamespace(default=chain))
+        ),
+    )
+    prepared = Mock()
+    monkeypatch.setattr(adapter, "ascend_int8_process_moe_weights", prepared)
+    w = SimpleNamespace(
+        w13_weight=torch.empty(2, 32, 64, dtype=torch.int8),
+        w13_weight_scale=torch.ones(2, 64),
+        w2_weight=torch.empty(2, 32, 32, dtype=torch.int8),
+        w2_weight_scale=torch.ones(2, 32),
+        ep_rank=3,
+        num_local_experts=2,
+        _ascend_int8_moe_weights_processed=True,
+    )
+    plan = {"activation": "swiglu"}
+    adapter.ascend_routed_chain_int8_process_moe_weights(plan=plan, w=w)
+    prepared.assert_called_once_with(plan=plan, w=w)
+    assert w.w2_weight_scale.dtype == torch.bfloat16
+    assert plan["routed_chain_boundary"].shape == (25,)
+    x = torch.zeros(3, 32, dtype=torch.bfloat16)
+    ids = torch.tensor([[6, 7]] * 3, dtype=torch.int64)
+    weights = torch.full((3, 2), 0.5, dtype=torch.float32)
+    result = adapter.ascend_routed_chain_int8_precomputed_moe_apply(
+        plan=plan,
+        x=x,
+        w=w,
+        router_logits=None,
+        topk_weights=weights,
+        topk_ids=ids,
+    )
+    assert result is chain.return_value
+    args = chain.call_args.args
+    assert args[0] is x and args[1].dtype == torch.int32
+    assert args[6] is weights
+    assert args[7] is args[8] is args[9] is plan["routed_chain_boundary"]
+    assert args[10:12] == (6, 8)

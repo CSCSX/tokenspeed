@@ -342,8 +342,10 @@ class AscendDSABackend(LongCatDSABase):
         if config.kv_cache_quant_method not in (None, "none"):
             raise ValueError("LongCat DSA requires unquantized BF16 cache planes")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
-        if self.spec_num_tokens != 1 or self.is_draft:
-            raise ValueError("LongCat DSA MTP is disabled")
+        if self.is_draft:
+            raise ValueError("LongCat DSA draft attention is disabled")
+        if self.spec_num_tokens > 8:
+            raise ValueError("LongCat DSA verify supports at most 8 tokens")
         self._indexer_spec = spec
         self._indexer_kernels = ascend_dsa_kernels()
         self._stream_fork = StreamFork(new_device_stream())
@@ -868,8 +870,14 @@ class AscendDSABackend(LongCatDSABase):
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
-        if q.shape[0] != bs:
-            raise ValueError("LongCat DSA decode requires one token per request")
+        if bs <= 0 or q.shape[0] % bs:
+            raise ValueError("LongCat DSA decode tokens must divide by requests")
+        tokens_per_request = q.shape[0] // bs
+        if tokens_per_request not in (1, self.spec_num_tokens):
+            raise ValueError(
+                "LongCat DSA decode requires one token or a complete verify "
+                "window per request"
+            )
         if save_kv_cache and k is None:
             raise ValueError("LongCat DSA decode cache write requires k")
         if topk_indices is not None or topk_lens is not None:
@@ -879,13 +887,34 @@ class AscendDSABackend(LongCatDSABase):
         metadata = self.forward_decode_metadata
         start = metadata.num_extends
         head_major_output = kwargs.pop("head_major_output", False)
+        if tokens_per_request > 1 and self._dcp.degree > 1:
+            return self._forward_verify_dcp(
+                q,
+                k,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                metadata,
+                start,
+                tokens_per_request,
+                head_major_output,
+                save_kv_cache,
+                kwargs,
+            )
         selection = self._select_indexed(
             q,
             k,
             layer,
             out_cache_loc,
             token_to_kv_pool,
-            torch.arange(1, bs + 1, dtype=torch.int32, device=q.device),
+            torch.arange(
+                tokens_per_request,
+                (bs + 1) * tokens_per_request,
+                tokens_per_request,
+                dtype=torch.int32,
+                device=q.device,
+            ),
             metadata.seq_lens[start : start + bs],
             metadata.page_table[start : start + bs],
             kwargs,
@@ -899,6 +928,80 @@ class AscendDSABackend(LongCatDSABase):
             token_to_kv_pool,
             head_major_output=head_major_output,
         )
+
+    def _forward_verify_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        layer,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        metadata,
+        start: int,
+        width: int,
+        head_major_output: bool,
+        save_kv_cache: bool,
+        kwargs: dict,
+    ) -> torch.Tensor:
+        """Verify a chain with the proven one-query DCP path at each position.
+
+        Each step publishes only the corresponding KV/index row and shortens
+        the visible context before the distributed indexer and attention run.
+        Future candidates never enter the current step's sparse selection.
+        """
+        if get_is_capture_mode():
+            raise NotImplementedError("LongCat DSA DCP verify requires eager mode")
+        step_ends = torch.arange(1, bs + 1, dtype=torch.int32, device=q.device)
+        final_lengths = metadata.seq_lens[start : start + bs]
+        page_table = metadata.page_table[start : start + bs]
+        outputs = []
+        for step in range(width):
+            visible_lengths = metadata.seq_lens.clone()
+            visible_lengths[start : start + bs] = final_lengths - (width - step - 1)
+            self._dcp.refresh_metadata(
+                seq_lens=visible_lengths,
+                page_table=metadata.page_table,
+                page_size=self.kernel_page_size,
+                init_tokens=self.index_init_tokens,
+                local_tokens=self.index_local_tokens,
+            )
+            step_kwargs = dict(kwargs)
+            step_kwargs["index_query"] = kwargs["index_query"][step::width]
+            step_kwargs["index_key"] = kwargs["index_key"][step::width]
+            step_kwargs["index_weights"] = kwargs["index_weights"][step::width]
+            selection = self._select_indexed(
+                q[step::width],
+                k[step::width],
+                layer,
+                out_cache_loc[step::width],
+                token_to_kv_pool,
+                step_ends,
+                visible_lengths[start : start + bs],
+                page_table,
+                step_kwargs,
+                save_kv_cache=save_kv_cache,
+                context_parallel=True,
+                context_parallel_row_start=start,
+            )
+            outputs.append(
+                self._run_indexed_sparse_attention(
+                    selection,
+                    layer,
+                    token_to_kv_pool,
+                    head_major_output=head_major_output,
+                )
+            )
+        self._dcp.refresh_metadata(
+            seq_lens=metadata.seq_lens,
+            page_table=metadata.page_table,
+            page_size=self.kernel_page_size,
+            init_tokens=self.index_init_tokens,
+            local_tokens=self.index_local_tokens,
+        )
+        if head_major_output:
+            return torch.stack(outputs, dim=2).flatten(1, 2)
+        return torch.stack(outputs, dim=1).flatten(0, 1)
 
 
 if current_platform().is_npu:

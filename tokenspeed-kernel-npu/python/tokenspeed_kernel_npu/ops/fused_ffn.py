@@ -47,7 +47,10 @@ def prepare_shared_ffn(module, *, binding=None):
     dtype = gate.weight.dtype
     if dtype != down.weight.dtype or dtype not in (torch.int8, torch.bfloat16):
         raise ValueError("Fused shared FFN requires two BF16 or two INT8 weights")
-    if dtype == torch.int8 and not module._use_int8_swiglu:
+    if dtype == torch.int8 and not (
+        getattr(module, "_use_int8_swiglu", False)
+        or getattr(module, "_manual_int8_quant", False)
+    ):
         raise ValueError("Fused shared FFN requires dynamic-token symmetric W8A8")
     h, i = gate.weight.shape[1], down.weight.shape[1]
     if gate.weight.shape != (2 * i, h) or down.weight.shape[0] != h:
@@ -55,9 +58,14 @@ def prepare_shared_ffn(module, *, binding=None):
     if h % 32 or i % 32:
         raise ValueError("Fused shared FFN requires H/I aligned to 32")
     if not hasattr(torch.ops.custom, "fused_ffn"):
-        if binding is None or not Path(binding).is_file():
+        if binding is None:
+            import flash_ops  # noqa: F401  # production package registers fused_ffn
+        elif Path(binding).is_file():
+            torch.ops.load_library(str(Path(binding).resolve()))
+        else:
             raise ValueError("Set ffn_binding to the deployed fused_ffn binding")
-        torch.ops.load_library(str(Path(binding).resolve()))
+    if not hasattr(torch.ops.custom, "fused_ffn"):
+        raise RuntimeError("flash_ops is missing fused_ffn")
     op = torch.ops.custom.fused_ffn
 
     if dtype == torch.int8:

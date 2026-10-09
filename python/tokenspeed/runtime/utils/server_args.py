@@ -1311,6 +1311,17 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
+        if self.speculative_algorithm == "DUMMY":
+            if (
+                self.speculative_draft_model_path is not None
+                or self.draft_model_path_use_base
+            ):
+                raise ValueError("DUMMY drafting does not accept a draft model path")
+            if int(self.speculative_num_draft_tokens) <= 1:
+                raise ValueError(
+                    "DUMMY drafting requires --speculative-num-draft-tokens > 1"
+                )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -3157,7 +3168,7 @@ class ServerArgs:
             "--speculative-algorithm",
             type=str,
             help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
-            "DSPARK; plugins may register more (validated after plugin "
+            "DSPARK, DUMMY; plugins may register more (validated after plugin "
             "discovery).",
         )
         parser.add_argument(
