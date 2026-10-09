@@ -35,7 +35,6 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -221,10 +220,7 @@ class KimiK3Recipe(CacheRecipe):
             )
         if self.attn_config.kv_cache_quant_method == "per_token_head":
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
-        if (
-            self.attn_config.component(DSAConfig) is None
-            and getattr(self._text_config, "mla_use_nope", None) is not True
-        ):
+        if getattr(self._text_config, "mla_use_nope", None) is not True:
             raise ValueError("Kimi-K3 cache requires mla_use_nope=True")
         linear_attn = self.attn_config.component(LinearAttnConfig)
         if linear_attn is None:

@@ -70,7 +70,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
         "recurrent_state": "_recurrent_state",
-        "dsa_index_k": "_dsa_index_k",
     }
 
     def _bind_layer_planes(self) -> None:
@@ -105,11 +104,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         """Return one KDA state plane. Latent KV is read via ``kv_buffer``."""
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
-        if component_name == "dsa_index_k":
-            value = self._dsa_index_k[layer_id]
-            if value is None:
-                raise ValueError(f"layer {layer_id} has no DSA index-K cache")
-            return value
         try:
             conv, recurrent = self._state_buffers_by_layer[layer_id]
         except KeyError as exc:
@@ -125,32 +119,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             return self._state_buffers_by_layer[layer_id]
         except KeyError as exc:
             raise ValueError(f"layer {layer_id} has no KDA state") from exc
-
-    def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
-        """Return LongCat's separate BF16 index-key plane."""
-        return self.get_component(layer_id, "dsa_index_k")
-
-    def set_index_k_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-        *,
-        write_mask: torch.Tensor | None = None,
-    ) -> None:
-        plane = self.get_index_k_buffer(layer_id)
-        if plane.dtype != torch.bfloat16:
-            raise TypeError("LongCat index-K plane must be BF16")
-        rows = plane.view(-1, plane.shape[-1])
-        keys = index_k.reshape(-1, rows.shape[-1]).to(plane.dtype)
-        if keys.shape[0] != loc.numel():
-            raise ValueError("index-K write locations must cover all key rows")
-        if write_mask is not None:
-            slots = loc[write_mask]
-            keys = keys[write_mask]
-        else:
-            slots = loc
-        rows[slots.to(torch.long)] = keys
 
     def zero_new_blocks(self, new_page_ids: Mapping[str, np.ndarray]) -> None:
         if new_page_ids:

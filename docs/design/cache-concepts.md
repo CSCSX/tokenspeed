@@ -62,13 +62,15 @@ the logical world neither knows nor cares.
 A fourth quantity lives outside the logical world entirely:
 
 * **`kernel_page_size`** — the token span of one attention-kernel page, a
-  property of the *kernel implementation*, not of the scheduler. All kernel
+  property of the *kernel implementation*, not of the scheduler. Shared kernel
   page geometry is registered in one file
   (`runtime/layers/attention/kernel_page_sizes.py`): fixed-page kernels pin a
   constant (FlashMLA = 64), constrained kernels choose within a supported
   set (trtllm-mla ∈ {32, 64}), and flexible kernels carry a chosen default.
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
-  from `prefix_granularity` is a category error and a bug.
+  from `prefix_granularity` is a category error and a bug. A fixed geometry
+  consumed by only one backend, such as Ascend DSA's 128-row pages, may live
+  with that backend; its resolver remains the single source for callers.
 
   DeepSeek V4's geometry is fully
   registry-sourced: the compressed full-history chains declare

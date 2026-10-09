@@ -1128,9 +1128,6 @@ class CacheGroupRouter(AttentionBackend):
             *args, **kwargs
         )
 
-    def run_projection_branches(self, layer, primary, secondary):
-        return self._leaf_for(layer).run_projection_branches(layer, primary, secondary)
-
     # ------------------------------------------------------------------
     # DSA query-shard surface: a sparse-attention model's own top-k over KVP
     # pages reads the sharded extend's request groups and gathers each

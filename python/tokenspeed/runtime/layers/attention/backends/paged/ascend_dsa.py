@@ -46,7 +46,6 @@ from tokenspeed.runtime.layers.attention.dcp.metadata import (
     PositionPreservingDCPMetadata,
     refresh_dcp_page_table_metadata,
 )
-from tokenspeed.runtime.layers.attention.kernel_page_sizes import ASCEND_SFAD_PAGE_SIZE
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import register_backend
@@ -55,6 +54,9 @@ from tokenspeed.runtime.utils.device_stream import (
     limit_stream_cores,
     new_device_stream,
 )
+
+# Fixed page geometry of Ascend SparseFlashAttentionDecode.
+ASCEND_SFAD_PAGE_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -404,39 +406,6 @@ class AscendDSABackend(DSABackend):
         self._dcp.allocate_decode_buffers(
             max_bs * self.spec_num_tokens, self.max_num_pages, self.device
         )
-
-    def run_projection_branches(self, layer, primary, secondary):
-        del layer
-        graph_phase = get_is_cuda_graph_phase()
-        stream_fork = self._stream_fork
-        device_module = stream_fork.device_module
-        main_stream = (
-            device_module.current_stream()
-            if graph_phase and device_module is not None
-            else None
-        )
-        with (
-            limit_stream_cores(
-                main_stream,
-                cube_num=12,
-                vector_num=24,
-                enable=graph_phase,
-            ),
-            limit_stream_cores(
-                stream_fork.aux_stream,
-                cube_num=12,
-                vector_num=24,
-                enable=graph_phase,
-            ),
-            stream_fork.scope(
-                enable=graph_phase,
-                overlap=get_is_capture_mode(),
-            ) as fork,
-        ):
-            primary_result = primary()
-            with fork.branch():
-                secondary_result = secondary()
-        return primary_result, secondary_result
 
     def refresh_decode_metadata(
         self,
