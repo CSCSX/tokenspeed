@@ -7,16 +7,30 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers.attention import backends
 from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+    TRTLLMMLABackend,
+)
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     PositionPreservingDCPMetadata,
 )
+from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 
 
 def test_ascend_backend_reuses_the_common_dsa_base():
     assert issubclass(ascend_dsa.AscendDSABackend, DSABackend)
+
+
+def test_dsa_imports_are_unconditional_but_gpu_leaf_registration_is_not():
+    assert backends.ascend_dsa is ascend_dsa
+    assert backends.dsa.DSABackend is DSABackend
+    assert backends.dsa.TRTLLMMLABackend is TRTLLMMLABackend
+    if not current_platform().is_nvidia:
+        assert "trtllm_mla" not in _BACKEND_REGISTRY
 
 
 def test_each_candidate_keeps_its_own_local_page_prefix():
