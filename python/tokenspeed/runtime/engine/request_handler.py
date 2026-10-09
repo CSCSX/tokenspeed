@@ -36,6 +36,7 @@ from tokenspeed_kernel.profiling import (
     start_profiling,
     stop_profiling,
 )
+from viztracer import VizTracer
 
 from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
@@ -1045,8 +1046,6 @@ class RequestHandler:
                 )
 
         if "VIZTRACER" in activities:
-            from viztracer import VizTracer
-
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
             self.viztracer = VizTracer(
                 output_file=os.path.join(
