@@ -90,7 +90,6 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
-        solution_override: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -343,7 +342,7 @@ class MoELayer(torch.nn.Module):
         self.input_dtype = input_dtype
 
         # Moe Backend plan
-        moe_backend = solution_override or get_moe_backend().value
+        moe_backend = get_moe_backend().value
         # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
         if moe_backend == "deep_gemm_mega_moe":
             moe_backend = "mega_moe"
