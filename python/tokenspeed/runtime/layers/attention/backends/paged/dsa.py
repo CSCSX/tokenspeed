@@ -41,6 +41,9 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+    TRTLLMMLABackend,
+)
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
@@ -136,10 +139,6 @@ def _make_dense_leaf(
     # selected THIS wrapper must not leak through.
     dense_spec = dataclasses.replace(spec, backend_name=None)
     if platform.is_nvidia:
-        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
-            TRTLLMMLABackend,
-        )
-
         return TRTLLMMLABackend(config, dense_spec, kernel_page_size=kernel_page_size)
     if platform.is_amd:
         return MLAAttnBackend(config, dense_spec, kernel_page_size=kernel_page_size)

@@ -30,14 +30,8 @@ import socket
 from collections.abc import Sequence
 from typing import Literal
 
+from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
-
-if current_platform().is_npu:
-    # GDN/FLA is CUDA-only; importing its Triton implementation on Ascend
-    # probes a CUDA/HIP driver before any model has been constructed.
-    FLA_CHUNK_SIZE = 64
-else:
-    from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 from tokenspeed.runtime.configs.numerics import (
     DSA_SLOT_ORDERS,

@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
@@ -868,10 +867,9 @@ def gdn_replay_commit_supported(
 
 # Backend registration (side-effect imports)
 # isort: off
-if not current_platform().is_npu:
-    import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 
 # isort: on
 

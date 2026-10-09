@@ -1232,15 +1232,15 @@ def dsa_plan(
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.ops.attention.dsa.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.deep_gemm  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
+
 if current_platform().is_npu:
     import tokenspeed_kernel.ops.attention.dsa.ascend  # noqa: E402,F401
-else:
-    import tokenspeed_kernel.ops.attention.dsa.cuda  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.dsa.cute_dsl  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.dsa.deep_gemm  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
-    import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
 # isort: on
 
