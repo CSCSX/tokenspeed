@@ -1248,6 +1248,10 @@ rows and local token chunks. The builder sizes them from the existing host
 length mirror and fills both directly from device query boundaries in one
 Triton launch. Every layer reads the same tensors and block size; the conv
 wrapper neither rebuilds them nor initializes/uploads per-layer scratch.
+The metadata also retains host int64 sequence boundaries for registered
+convolution implementations that plan from host lengths; GPU Triton ignores
+that field. Decode and prefill select a registered convolution implementation
+through the same operator facade, leaving backend scheduling unchanged.
 This is transient execution metadata, not a new cache group or model state.
 
 The same extend/mixed metadata owns a device int64 mirror of the int32
