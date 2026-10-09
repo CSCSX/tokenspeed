@@ -64,8 +64,6 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
         kernel_page_size=128,
         step_counter=None,
         _dcp=SimpleNamespace(degree=1),
-        index_init_tokens=0,
-        index_local_tokens=0,
     )
     key = torch.ones((1, 1, 32))
     locations = torch.tensor([3], dtype=torch.int32)
@@ -83,6 +81,8 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
             "index_key": key,
             "index_query": torch.ones((1, 1, 32)),
             "index_weights": torch.ones((1, 1)),
+            "index_init_tokens": 0,
+            "index_local_tokens": 0,
         },
     )
     assert len(writes) == 1
@@ -151,8 +151,6 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
     class FakeBackend:
         spec_num_tokens = width
         kernel_page_size = 128
-        index_init_tokens = 1
-        index_local_tokens = 1
         forward_decode_metadata = metadata
 
         def __init__(self):
@@ -207,7 +205,8 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
     torch.testing.assert_close(
         backend._decode_query_page_table, table.repeat_interleave(width, dim=0)
     )
-    torch.testing.assert_close(backend._dcp.refreshed[0][0], expected_lengths)
+    # The model supplies selection policy at execution, not metadata refresh.
+    assert not backend._dcp.refreshed
 
     rows = 2 * width
     query = torch.arange(rows * 2, dtype=torch.float32).view(rows, 1, 2)
@@ -229,10 +228,114 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
     torch.testing.assert_close(visible, expected_lengths[width:])
     torch.testing.assert_close(pages, table[1:].repeat_interleave(width, dim=0))
     torch.testing.assert_close(selected_locations, locations)
-    assert options["context_parallel_row_start"] == width
+    assert options["context_parallel"] is True
 
 
-def test_single_token_mixed_decode_restores_request_shaped_dcp_metadata():
+@pytest.mark.parametrize("initial,local", [(-1, 0), (0, -1), (3, 2)])
+def test_index_policy_is_validated_at_execution(initial, local):
+    backend = SimpleNamespace(_indexer_spec=SimpleNamespace(index_topk=4))
+    with pytest.raises(ValueError):
+        ascend_dsa.AscendDSABackend._select_indexed(
+            backend,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            {"index_init_tokens": initial, "index_local_tokens": local},
+        )
+
+
+@pytest.mark.parametrize("width", [2, 4, 8])
+def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
+    class ReachedIndexer(Exception):
+        pass
+
+    lengths = torch.arange(253, 253 + width, dtype=torch.int32)
+    table = torch.tensor([[1, 2, 3]] * width, dtype=torch.int32)
+    initial, local = 130, 129
+    records = []
+
+    class Dcp:
+        degree = 2
+        ready = True
+
+        def refresh_metadata(
+            self, *, seq_lens, page_table, page_size, init_tokens, local_tokens
+        ):
+            assert init_tokens == initial and local_tokens == local
+            placement = PositionPreservingDCPMetadata(
+                virtual_page_table=page_table,
+                local_page_table=page_table,
+                virtual_block_count=8,
+                degree=2,
+                rank=1,
+                owner_mask=torch.tensor([[False, True, False]] * width),
+            )
+            self.current = ascend_dsa._compact_dcp_kernel_metadata(
+                placement=placement,
+                seq_lens=seq_lens,
+                page_size=page_size,
+                init_tokens=init_tokens,
+                local_tokens=local_tokens,
+            )
+
+        def metadata(self, *, start, end):
+            assert start == 0 and end == width
+            return self.current
+
+    class Kernels:
+        def scatter(self, *args):
+            pass
+
+        def index_partial(self, *args, **kwargs):
+            records.append(args)
+            raise ReachedIndexer
+
+    backend = SimpleNamespace(
+        _indexer_spec=SimpleNamespace(index_head_dim=8, index_topk=512),
+        _indexer_kernels=Kernels(),
+        kernel_page_size=128,
+        step_counter=None,
+        _dcp=Dcp(),
+    )
+    with pytest.raises(ReachedIndexer):
+        ascend_dsa.AscendDSABackend._select_indexed(
+            backend,
+            torch.ones(width, 1, 8),
+            None,
+            SimpleNamespace(layer_id=0),
+            torch.arange(width),
+            SimpleNamespace(get_component=lambda *args: torch.zeros(3, 128, 1, 8)),
+            torch.arange(1, width + 1, dtype=torch.int32),
+            lengths,
+            table,
+            {
+                "index_key": torch.ones(width, 1, 8),
+                "index_query": torch.ones(width, 1, 8),
+                "index_weights": torch.ones(width, 1),
+                "index_init_tokens": initial,
+                "index_local_tokens": local,
+            },
+            context_parallel=True,
+        )
+    args = records[0]
+    expected_initial = [
+        sum(128 <= p < 256 for p in range(min(initial, n))) for n in lengths.tolist()
+    ]
+    expected_local = [
+        sum(128 <= p < 256 for p in range(max(n - local, 0), n))
+        for n in lengths.tolist()
+    ]
+    assert args[8].tolist() == expected_initial
+    assert args[9].tolist() == expected_local
+    assert args[5].tolist() == [min(max(n - 128, 0), 128) for n in lengths.tolist()]
+
+
+def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
     metadata = SimpleNamespace(
         seq_lens=torch.tensor([12, 24], dtype=torch.int32),
         page_table=torch.tensor([[1], [2]], dtype=torch.int32),
@@ -252,8 +355,6 @@ def test_single_token_mixed_decode_restores_request_shaped_dcp_metadata():
     class FakeBackend:
         spec_num_tokens = 4
         kernel_page_size = 128
-        index_init_tokens = 1
-        index_local_tokens = 1
         forward_decode_metadata = metadata
 
         def __init__(self):
@@ -279,7 +380,7 @@ def test_single_token_mixed_decode_restores_request_shaped_dcp_metadata():
             assert q_ends.tolist() == [1]
             assert kv_lengths.tolist() == [24]
             assert pages.tolist() == [[2]]
-            assert options["context_parallel_row_start"] == 1
+            assert options["context_parallel"] is True
             return q
 
         def _run_indexed_sparse_attention(
@@ -300,4 +401,4 @@ def test_single_token_mixed_decode_restores_request_shaped_dcp_metadata():
         None,
         1,
     )
-    assert backend._dcp.refreshed[0][0].tolist() == [12, 24]
+    assert not backend._dcp.refreshed

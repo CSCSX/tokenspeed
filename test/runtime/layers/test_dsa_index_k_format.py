@@ -146,20 +146,6 @@ def test_bf16_plane_costs_its_own_rows():
     )
 
 
-def test_longcat_bf16_index_policy_is_explicit_and_bounded():
-    spec = _dsa_spec("bf16")
-    assert spec.uses_separate_bf16_index_cache
-    assert not _dsa_spec("fp8_scaled").uses_separate_bf16_index_cache
-    from dataclasses import replace
-
-    bounded = replace(
-        spec, index_topk=2048, index_init_tokens=16, index_local_tokens=1024
-    )
-    assert (bounded.index_init_tokens, bounded.index_local_tokens) == (16, 1024)
-    with pytest.raises(ValueError, match="exceed index_topk"):
-        replace(spec, index_init_tokens=2, index_local_tokens=3)
-
-
 @pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
 def test_the_history_gather_workspace_plan_follows_the_plane_format(index_k_format):
     """The query-context-parallel gather workspace the recipe reserves holds

@@ -348,7 +348,7 @@ class AscendDSABackend(DSABackend):
         *,
         kernel_page_size: int,
     ) -> None:
-        if not (spec.is_dsa and spec.uses_separate_bf16_index_cache):
+        if not (spec.is_dsa and spec.index_k_format == "bf16"):
             raise NotImplementedError(
                 "Ascend DSA currently requires the LongCat BF16 indexer/cache contract"
             )
@@ -362,8 +362,6 @@ class AscendDSABackend(DSABackend):
         if config.kv_cache_quant_method not in (None, "none"):
             raise ValueError("LongCat DSA requires unquantized BF16 cache planes")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
-        self.index_init_tokens = spec.index_init_tokens
-        self.index_local_tokens = spec.index_local_tokens
         if self.is_draft:
             raise ValueError("LongCat DSA draft attention is disabled")
         if self.spec_num_tokens > 8:
@@ -439,14 +437,6 @@ class AscendDSABackend(DSABackend):
         self._decode_query_page_table = self._dcp._copy_buffer(
             "query_page_table", query_table
         )
-        if self._dcp.degree > 1:
-            self._dcp.refresh_metadata(
-                seq_lens=self._decode_query_seq_lens,
-                page_table=self._decode_query_page_table,
-                page_size=self.kernel_page_size,
-                init_tokens=self.index_init_tokens,
-                local_tokens=self.index_local_tokens,
-            )
 
     def init_forward_metadata(
         self,
@@ -501,7 +491,6 @@ class AscendDSABackend(DSABackend):
         kwargs,
         *,
         context_parallel=False,
-        context_parallel_row_start=0,
     ):
         """Write the index cache and select request-local sparse indices.
 
@@ -510,6 +499,12 @@ class AscendDSABackend(DSABackend):
         """
         del k
         spec = self._indexer_spec
+        init_tokens = kwargs["index_init_tokens"]
+        local_tokens = kwargs["index_local_tokens"]
+        if init_tokens < 0 or local_tokens < 0:
+            raise ValueError("DSA initial/local token counts must be nonnegative")
+        if init_tokens + local_tokens > spec.index_topk:
+            raise ValueError("DSA initial/local tokens exceed index_topk")
         kernels = self._indexer_kernels
         index_cache = pool.get_component(layer.layer_id, "dsa_index_k")
         page = self.kernel_page_size
@@ -526,8 +521,8 @@ class AscendDSABackend(DSABackend):
                 kv_lengths,
                 table,
                 spec.index_topk,
-                self.index_init_tokens,
-                self.index_local_tokens,
+                init_tokens,
+                local_tokens,
             )
             return _AscendSparseSelection(
                 q,
@@ -542,8 +537,16 @@ class AscendDSABackend(DSABackend):
 
         if not self._dcp.ready:
             raise RuntimeError("LongCat DSA CP process group was not configured")
-        row_end = context_parallel_row_start + table.shape[0]
-        local = self._dcp.metadata(start=context_parallel_row_start, end=row_end)
+        # Model-owned selection parameters arrive with the indexer inputs.
+        # Prepare precisely these query rows, including each verify candidate.
+        self._dcp.refresh_metadata(
+            seq_lens=kv_lengths,
+            page_table=table,
+            page_size=page,
+            init_tokens=init_tokens,
+            local_tokens=local_tokens,
+        )
+        local = self._dcp.metadata(start=0, end=table.shape[0])
         # Each verify candidate is a one-row query with its own visible
         # length. Cyclic page ownership stays unchanged; sparse mode 3 scans
         # only that candidate's local prefix on each rank.
@@ -898,19 +901,9 @@ class AscendDSABackend(DSABackend):
             query_table = self._decode_query_page_table[query_start:query_end]
         else:
             # Mixed rounds may carry one decode row even when the configured
-            # target verify width is larger. Restore request-shaped DCP rows
-            # before that singleton query reads its local metadata.
-            query_start = start
+            # target verify width is larger.
             query_lengths = metadata.seq_lens[start : start + bs]
             query_table = metadata.page_table[start : start + bs]
-            if self._dcp.degree > 1:
-                self._dcp.refresh_metadata(
-                    seq_lens=metadata.seq_lens,
-                    page_table=metadata.page_table,
-                    page_size=self.kernel_page_size,
-                    init_tokens=self.index_init_tokens,
-                    local_tokens=self.index_local_tokens,
-                )
         selection = self._select_indexed(
             q,
             k,
@@ -922,7 +915,6 @@ class AscendDSABackend(DSABackend):
             query_table,
             kwargs,
             context_parallel=True,
-            context_parallel_row_start=query_start,
         )
         return self._run_indexed_sparse_attention(
             selection,
