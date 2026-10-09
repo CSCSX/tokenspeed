@@ -39,6 +39,7 @@ if platform.is_nvidia:
     from tokenspeed.runtime.layers.attention.backends.paged import trtllm  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
         tokenspeed_mla,
+        trtllm_mla,
     )
 
 from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
@@ -48,5 +49,4 @@ from tokenspeed.runtime.layers.attention.backends.paged import qsa  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
     ascend_dsa,
     dsa,
-    trtllm_mla,
 )
