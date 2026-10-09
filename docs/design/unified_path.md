@@ -607,6 +607,14 @@ request order stay unchanged, they reuse the compact tables and ownership
 prefixes from the full refresh and update local visibility in place. Eager
 execution and CUDA graph replay use the same hooks and persistent buffers.
 
+Ascend DSA target verify expands each request's decode metadata into one row
+per candidate, with that candidate's causal visible length and the request's
+page table. Its DCP adapter compacts each row to locally owned pages, and one
+indexer/attention forward consumes the whole request-major verify window.
+The buffers are allocated for the maximum decode batch before capture and
+refreshed in place for each batch size. A mixed round carrying one decode row
+uses request-shaped metadata instead of the expanded verify window.
+
 One named exception: draft-tree lanes (`docs/design/tree-speculation.md`)
 read `TreeDraftInputs`, which the drafter writes inside the round -- the
 frontier and lane window lengths once, then each step's lane masks, plus

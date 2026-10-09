@@ -46,7 +46,7 @@ if not platform.is_npu:
     from tokenspeed.runtime.layers.attention.backends.paged import dsa  # noqa: F401
 else:
     from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
-        ascend_longcat_dsa,
+        ascend_dsa,
     )
 
 from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
