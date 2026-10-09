@@ -317,10 +317,6 @@ class AscendDSABackend(DSABackend):
     supports_mla_dcp = True
     default_kernel_page_size = ASCEND_SFAD_PAGE_SIZE
 
-    @property
-    def dsa_selection_policy(self) -> tuple[int, int]:
-        return self.index_init_tokens, self.index_local_tokens
-
     @classmethod
     def resolve_kernel_page_size(cls, config, block_granularity: int) -> int:
         del block_granularity

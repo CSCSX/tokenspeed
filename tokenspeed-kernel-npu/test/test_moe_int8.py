@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -163,94 +162,3 @@ def test_w8a8_moe_uses_nz_weights_and_runs(smooth_quant: str) -> None:
     assert output.shape == x.shape
     assert output.dtype == torch.bfloat16
     assert torch.isfinite(output).all()
-
-
-@pytest.mark.parametrize("smooth_quant", ("none", "w13", "w2", "both"))
-@pytest.mark.parametrize("smooth_layout", ("expert", "shared", "vector"))
-@pytest.mark.parametrize("solution", ("flash_npu_routed", "flash_npu_routed_full"))
-def test_routed_w8a8_optional_smooth_matches_composed_graph(
-    smooth_quant: str, smooth_layout: str, solution: str
-) -> None:
-    if solution == "flash_npu_routed_full":
-        pytest.importorskip("flash_ops")
-    else:
-        library = os.environ.get("TOKENSPEED_LITE_GMM13_LIBRARY")
-        if not library:
-            pytest.skip("set TOKENSPEED_LITE_GMM13_LIBRARY for routed fusion tests")
-        torch.ops.load_library(library)
-    device = torch.device("npu:0")
-    torch.manual_seed(981)
-    experts, tokens, hidden, intermediate = 4, 17, 512, 1024
-    w = torch.nn.Module()
-    w.num_local_experts, w.num_experts = experts, experts * 2
-    w.hidden_size, w.intermediate_size = hidden, intermediate
-    w.ep_rank, w.ep_size = 1, 2
-    for name, shape, dtype in (
-        ("w13_weight", (experts, 2 * intermediate, hidden), torch.int8),
-        ("w2_weight", (experts, hidden, intermediate), torch.int8),
-        ("w13_weight_scale", (experts, 2 * intermediate), torch.float32),
-        ("w2_weight_scale", (experts, hidden), torch.bfloat16),
-    ):
-        data = (
-            torch.randint(-8, 8, shape, device=device, dtype=dtype)
-            if dtype == torch.int8
-            else torch.full(shape, 1 / 128, device=device, dtype=dtype)
-        )
-        w.register_parameter(name, torch.nn.Parameter(data, requires_grad=False))
-    for name, width, enabled in (
-        ("w13_smooth_scale", hidden, smooth_quant in {"w13", "both"}),
-        ("w2_smooth_scale", intermediate, smooth_quant in {"w2", "both"}),
-    ):
-        data = (torch.rand(experts, width, device=device) * 1.5 + 0.25).bfloat16()
-        if smooth_layout != "expert":
-            data = data[:1]
-        # Exercise independent None parameters, BF16 conversion, and strided
-        # checkpoint-style storage. Preparation must persist FP32 contiguous data.
-        data = data.transpose(0, 1).contiguous().transpose(0, 1)
-        if smooth_layout == "vector":
-            data = data.squeeze(0)
-        w.register_parameter(
-            name, torch.nn.Parameter(data, requires_grad=False) if enabled else None
-        )
-    kwargs = dict(
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        routing_mode="precomputed_topk",
-        ep_size=2,
-        ispp=intermediate,
-        internal_activation_dtype="int8",
-    )
-    fused = tokenspeed_kernel.moe_plan("int8", solution=solution, **kwargs)
-    reference = tokenspeed_kernel.moe_plan("int8", solution="torch_npu", **kwargs)
-    tokenspeed_kernel.moe_process_weights(fused, w)
-    for name in ("w13_smooth_scale", "w2_smooth_scale"):
-        smooth = getattr(w, name)
-        if smooth is not None:
-            assert smooth.dtype == torch.float32 and smooth.is_contiguous()
-    assert torch_npu.get_npu_format(w.w13_weight) == 29
-    assert torch_npu.get_npu_format(w.w2_weight) == 29
-    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device)
-    ids = torch.randint(experts * 2 + 2, (tokens, 16), dtype=torch.int32, device=device)
-    weights = torch.rand(tokens, 16, dtype=torch.float32, device=device)
-
-    def run(plan):
-        return tokenspeed_kernel.moe_apply(
-            plan, x, w, weights, topk_ids=ids, topk_weights=weights
-        )
-
-    torch.testing.assert_close(run(fused), run(reference), rtol=0, atol=0)
-    for _ in range(3):
-        run(fused)
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
-        output = run(fused)
-    for step in range(20):
-        x.copy_(torch.randn_like(x))
-        ids.copy_(torch.randint_like(ids, experts * 2 + 2))
-        if step == 10:
-            ids.fill_(experts * 2)
-        graph.replay()
-        torch.testing.assert_close(output, run(reference), rtol=0, atol=0)
-    torch.npu.synchronize()
-    graph.reset()

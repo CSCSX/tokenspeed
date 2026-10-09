@@ -204,16 +204,13 @@ class DeepseekV3MLP(nn.Module):
         is_shared_expert: bool = False,
         *,
         batch_invariant: bool,
-        replicate_shared: bool = False,
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        if replicate_shared and not is_shared_expert:
-            raise ValueError("Only shared experts can request replicated weights")
         if is_shared_expert:
-            tp_rank = 0 if replicate_shared else self.mapping.moe.tp_ep_rank
-            tp_size = 1 if replicate_shared else self.mapping.moe.tp_ep_size
-            tp_group = None if replicate_shared else self.mapping.moe.tp_ep_group
+            tp_rank = self.mapping.moe.tp_ep_rank
+            tp_size = self.mapping.moe.tp_ep_size
+            tp_group = self.mapping.moe.tp_ep_group
         else:
             tp_rank = self.mapping.dense.tp_rank
             tp_size = self.mapping.dense.tp_size
