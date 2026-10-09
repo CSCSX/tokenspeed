@@ -40,7 +40,8 @@ every endpoint write.
 The key change is the lifetime of cached decode inputs. The current path does
 have cached recurrent/conv state and per-round speculative workspace; it does
 not retain accepted K/U/D history across decode rounds. The replacement makes
-that accepted history persistent and LCM-owned:
+that accepted history persistent in a fixed-capacity buffer owned by each KDA
+layer class. LCM continues to own exact recurrent and convolution checkpoints.
 
 | Concern | Current implementation | Replay-SSM replacement |
 | --- | --- | --- |
@@ -48,7 +49,7 @@ that accepted history persistent and LCM-owned:
 | Standard decode | Update and write the full exact recurrent state for every token. | Use the same protocol with `T=1`; append one accepted history entry and materialize only when required. |
 | Speculative verify | Keep the current candidate window's projections/intermediates in per-round workspace. | Produce candidate K/U/D history `[e,e+w)` against the reconstructed state. |
 | After acceptance | Replay the accepted prefix from the per-round workspace and write exact `S_e`. | Promote `[e,e+a)` into persistent accepted history; exclude rejected `[e+a,e+w)` without post-acceptance recurrent replay. |
-| History lifetime and owner | Candidate intermediates are valid only for the current verify/commit round and are backend workspace. | Accepted history survives across rounds for the live request and is owned, admitted and reclaimed by LCM. |
+| History lifetime and owner | Candidate intermediates are valid only for the current verify/commit round and are backend workspace. | Accepted history survives across rounds for the live request in a KDA-layer-owned buffer. Runtime request-slot lifecycle controls initialization and reset. |
 | Full-state materialization | Standard decode writes every step; speculative decode writes after every accepted replay. | Write on capacity flush, an aligned reusable checkpoint, or another explicit snapshot boundary. |
 | Reuse scope | Candidate intermediates are reused only within the current round. | Later rounds of the same live request reuse accepted history; another request never inherits it. Prefix reuse still starts from an exact checkpoint and empty history. |
 | Standard/speculative relationship | Different state-maintenance behavior. | One prepare → reconstruct → forward → acceptance → commit protocol; only `T` and accepted count differ. |
@@ -97,31 +98,61 @@ exact recurrent S_c + accepted history [c, e) = logical recurrent S_e
                       candidate history [e, e+w) is not committed yet
 ```
 
-The proposed history stores FP32 normalized key `K`, correction vector `U`, and
-multiplicative decay `D` per token. KDA decay is per key channel, not a scalar.
-Queries are needed for current outputs but are not retained. Rejected candidates
-never become part of the logical state, even if their bytes remain allocated.
+The canonical record stores FP32 normalized key `K_i`, correction vector
+`U_i`, and token-local multiplicative decay `D_i`. KDA decay is per key
+channel. It is not a scalar or a product across tokens. For state layout
+`[value_dim, key_dim]`, record `i` defines:
 
-The small convolution window stays at accepted endpoint `e`; recurrent state may
-remain at `c`. That combination is valid only with the accepted history. It is
-**not** an exact snapshot for prefix reuse or transfer until recurrent state has
-also been materialized at the advertised endpoint.
+```text
+S_(i+1) = S_i * D_i[None, :] + U_i[:, None] * K_i[None, :]
+```
+
+The producer computes `U_i` from the state after decay, using the current
+token's value and beta. Recovery uses the saved correction; it does not
+compute that projection again. Each record also has an absolute input position
+and validity information. Queries are used for outputs and are not retained.
+Rejected records never enter logical history.
+
+The vLLM Kimi-K3 RecoverSSM source uses FP32 corrections and activation-dtype
+raw keys/gates. The adapter converts this payload to the canonical FP32 K/U/D
+record at its producer. It preserves token-local KDA vector decay. It does not
+import the scalar-decay GDN protocol. This change needs the numerical and
+performance checks in Sections 7 and 9.
+
+Convolution uses a separate payload: the initial convolution window plus the
+current round's raw convolution inputs. It is not reconstructed from K/U/D.
+The accepted convolution window remains in the existing state storage.
+
+The live convolution window stays at accepted endpoint `e`; the recurrent
+checkpoint may remain at `c`. The live window uses a writable continuation
+slot. An exact checkpoint has its own convolution window at the same endpoint
+as its recurrent state. Never advance or overwrite a published checkpoint's
+convolution window. The live window plus lagging recurrent state is valid only
+with accepted history and is not a reusable exact snapshot.
+
+When a capacity flush stores `S_e`, copy the current live convolution window
+into that checkpoint's destination. When acceptance selects an aligned
+endpoint `E`, derive its window from the round-entry window and accepted raw
+convolution inputs, and write it beside `S_E`. Publish only after both writes
+complete. Retraction follows the existing prefix-recovery protocol. It can recover
+from an available exact published recurrent/conv pair or recompute from an
+earlier prefix. A private capacity-flush checkpoint is not a new recovery
+source. The live continuation window is not a reusable checkpoint.
 
 | Owner | Responsibility |
 | --- | --- |
-| LCM cache | Persistent state/history fields, allocation, exclusive writable ownership, prefix snapshot immutability, in-flight fences and reclamation. |
-| C++ scheduler | Token-level demand, retention and admission, exact checkpoint publication, request lifecycle and recovery. No recurrence computation. |
-| Runtime | Refresh graph-stable metadata, order forward/acceptance/commit, validate completion and report successful materialization. |
-| `tokenspeed-kernel` | Validate device backing, reconstruct state, compute outputs/history, and write selected states/windows/stamps into caller-owned storage. No allocation or publication authority. |
+| LCM cache | Exact recurrent and convolution checkpoints, allocation, prefix snapshot immutability, in-flight fences and reclamation. It does not store replay history. |
+| C++ scheduler | Token-level state demand, bounded checkpoint retention and admission, exact checkpoint publication, request lifecycle and recovery. It does not allocate or inspect per-layer replay history. |
+| Runtime and KDA layer class | Assign a stable request slot and generation, own the fixed-capacity K/U/D history buffer for each layer, refresh graph-stable metadata, reset reused slots, and order forward/acceptance/commit. |
+| `tokenspeed-kernel` | Validate layer-buffer metadata, reconstruct state, compute outputs/history, and write selected states/windows/stamps into caller-provided views. It has no checkpoint allocation or publication authority. |
 
-There is no backend-private persistent request ring. Backend-owned storage is
-limited to fixed-address batch metadata and reusable per-round scratch.
-
-Do not model this after a pool-private tail such as GLM-5.3-Flash KPool. Such
-storage is outside scheduler admission and cache-reclaim accounting and has no
-general prefix/transfer lifecycle. Replay history determines whether a
-checkpoint can reconstruct the live state, so LCM must own it as a
-request-local cache group.
+Each KDA layer class owns one persistent, fixed-address replay-history ring.
+The ring is private to the layer and is indexed by a runtime-assigned request
+slot and generation. It is not an LCM cache group. This is an explicit
+backend-private-state exception: the history is small, bounded, consumed only
+by KDA, excluded from prefix reuse and host transfer, and useful only while the
+request stays live on the same worker. Exact checkpoints remain in LCM so a
+request can recover after retraction, prefix reuse or buffer reset.
 
 ## 4. Cache management contract
 
@@ -138,50 +169,55 @@ must share this calculation. Otherwise admission can promise memory that a live
 checkpoint still needs. Startup budgets add `ceil(d/G)` state blocks per live
 request to the existing working set, including prefill input/checkpoint/tail and
 overlap protection. Lag is not a replacement for those allowances.
+LCM also reserves one writable convolution continuation block per live request
+for PR2, unless an existing working-set allowance already provides a distinct
+block. Startup accounting must demonstrate that reuse before omitting it.
+A flush writes to an allocated unpublished destination. An in-place write is
+allowed only when the old checkpoint is unpublished and all old readers have
+completed. Published checkpoints are immutable.
 
 The Python cache spec, bridge, C++ config and serialized contract carry the same
 explicit value. Unaffected recipes keep zero lag. Runtime and scheduler bindings
 must be rebuilt together; missing contract fields must not silently assume a value.
 
-### Request-local history — generic LCM extension and final replacement
+### Request-local history — KDA layer buffer
 
-Main currently rejects sliding retention on a state-family group; preserve that
-snapshot-state invariant. Preparation adds a distinct row-backed `history`
-family whose sliding groups may name a state group through
-`replay_checkpoint_group`; it does not turn a state group into a sliding group.
-P2 must update `cache-concepts.md`, `scheduler.md`, the Python spec and the C++
-bridge together for this new family, dependency and scheduling contract.
+Each KDA layer allocates a fixed-address GPU buffer at startup. Its logical
+shape is `[max_request_slots, L, local_heads, ...]` for K, U and D, plus
+per-slot metadata. The allocation is independent of LCM page allocation and
+does not add dynamic LCM demand. `max_request_slots` must cover the maximum
+number of requests that can stay resident on the worker. Startup must reject a
+configuration in which the runtime can exhaust layer-buffer slots.
 
-The proposed initial policy uses history window `L` and state lag `d=L-T_max`,
-with `L >= 2*T_max`. Validate the dependency and require
-the history window to exceed the declared lag.
+The initial policy uses history capacity `L` and state lag `d=L-T_max`, with
+`L >= 2*T_max`. The layer buffer follows these rules:
 
-The history group follows these rules:
-
-- Block tables use absolute token positions, not modulo-`L` indices. The number
-  of history rows packed into a physical block is a separate layout decision.
-- History is private to the live request. It is excluded from prefix publication,
-  canonicalization and host writeback. A prefix hit starts from an exact state
-  snapshot with empty history, not another request's live history.
-- Long prefill does not allocate history for every prompt token. Intermediate
-  chunks advance absolute tables with holes; the completing chunk reserves the
-  suffix needed for the next decode window. Allocated rows before that endpoint
-  are not initialized history. Ordinary sliding attention is unchanged.
-- Cache-owned position stamps associate accepted history with its checkpoint.
-  Stamp updates follow payload/state stores. Missing history cannot be recovered
-  by treating a missing stamp as an empty buffer; empty seeding requires an exact
-  state and freshly initialized storage.
-- Retained history, candidates, overlap and partial-block rounding all count
-  toward physical allocation. Python startup sizing and C++ admission must use
-  matching bounds derived from #1597's exact frontier and the in-flight
-  reservation horizon.
+- Runtime assigns one stable request slot while a request is live. All KDA
+  layers use that slot to address their own buffer.
+- Each slot records a generation, checkpoint position `c`, accepted endpoint
+  `e`, ring origin and position stamps. A row is valid only when its generation
+  and absolute token position match the current request.
+- Kernels may map an absolute token position to a physical row modulo `L`.
+  Position stamps prevent stale or rejected rows from becoming logical history.
+- Candidate history `[e,e+w)` is written into the same slot. Acceptance
+  advances `e`; rejected rows remain invalid and may be overwritten.
+- Prefill and prefix hits start from an exact LCM checkpoint and initialize an
+  empty layer-buffer history. Long prefill never stores replay history for the
+  complete prompt.
+- Slot reuse waits for all in-flight readers and writers. Runtime then increments
+  the generation and resets metadata before assigning the slot to another
+  request. A generation mismatch is an invariant failure, not an empty history.
+- History is excluded from LCM prefix publication, canonicalization, host
+  writeback and P-D transfer. Only a materialized exact checkpoint can cross
+  those boundaries.
 
 For scale, FP32 history costs `4*(2*D_k+D_v)` bytes per head/token. With TP8,
 69 local KDA layers, 12 local heads and `D_k=D_v=128`, `L=8` needs about
-**9.7 MiB per live request per GPU** in logical K/U/D payload. This is an
-analytical estimate, not a measurement of total memory use: add retained state
-blocks, stamps, page packing, overlap/candidate protection and runtime scratch.
-Larger `L` also increases reconstruction work; it is not automatically faster.
+**9.7 MiB per configured request slot per GPU** in logical K/U/D payload.
+Because the layer buffer is allocated at startup, multiply this value by
+`max_request_slots`, not by the instantaneous live-request count. This is an
+analytical estimate: add retained LCM state blocks, generations, stamps and
+runtime scratch. Larger `L` also increases reconstruction work.
 
 ## 5. Scheduler and lifecycle changes
 
@@ -189,8 +225,9 @@ The scheduler retains one admission/forward path. It schedules logical tokens
 and cache demands; it does not inspect per-layer history or shorten a verify
 window to fit a backend buffer. Flush decisions remain per-request device data.
 
-Beyond bounded retention, integration needs sparse prefill history demand and
-the history reuse restrictions above. Publication builds on #1597: record an
+Beyond bounded checkpoint retention, the scheduler has no replay-history
+demand. Runtime maps request start, finish, cancellation and retraction to safe
+layer-buffer slot initialization or reset. Publication builds on #1597: record an
 aligned boundary only after that exact accepted endpoint was materialized.
 Crossing a boundary, allocating a block, committing convolution, or planning a
 capacity flush does not establish an exact reusable snapshot. Failed admission
@@ -199,19 +236,20 @@ must not consume pending materialization evidence; publish before reclaiming.
 Lifecycle requirements are:
 
 - **Prefill → decode / prefix hit:** start from an exact checkpoint and empty
-  history. Agentic continuations currently arrive as new requests using prefix
+  layer-buffer history. Agentic continuations arrive as new requests using prefix
   matching, not live `Decoding → Prefilling` transitions.
 - **Accepted boundary:** selectively materialize the actual aligned accepted
   endpoint before reporting it as reusable; do not invent every crossed state.
 - **Retraction:** retain existing exact-prefix checkpoint recovery and suffix
-  recomputation. Do not export live history as an exact state.
+  recomputation. Invalidate the layer-buffer generation before slot reuse. Do
+  not export live history as an exact state.
 - **Finish/cancel:** no final full-state write is required unless a snapshot is
-  being published. Preserve in-flight ownership until all readers/writers finish.
+  being published. Preserve the slot until all readers/writers finish, then
+  increment its generation and reset its metadata.
 - **Direct live handoff / P-D transfer:** require quiescent endpoint
   materialization using fresh tables before admission reshapes or reclaims them.
   Keep these configurations outside the replacement PR. A future
-  handoff requires scheduler/lifecycle integration as well as a materialization
-  kernel.
+  handoff requires materialization and a new layer-buffer slot on the receiver.
 
 GPU validation flags travel through the normal forward-result path. CPU/rank
 agreement must complete before successful scheduler feedback. An invalid backing
@@ -229,20 +267,24 @@ sequenceDiagram
     participant S as C++ scheduler
     participant C as LCM cache
     participant R as Runtime
+    participant H as KDA layer history
     participant K as KDA kernels
-    S->>C: Reserve token demand and retain live checkpoint/history
-    C-->>R: Reserved block tables and field views
-    R->>K: Prepare/validate, then run layer forwards
-    K-->>R: Verification outputs and candidate history
+    S->>C: Reserve token demand and retain live checkpoint
+    C-->>R: Reserved checkpoint tables and field views
+    R->>H: Bind request slot and validate generation
+    R->>K: Pass checkpoint and layer-history views
+    K-->>R: Verification outputs
+    K-->>H: Candidate history
     R->>K: Commit actual accepted inputs and materialize selected endpoint
-    Note over C,K: Cache-owned storage: stamps follow payload/state writes
+    Note over H,K: History stamps follow K/U/D writes
+    Note over C,K: Exact-state evidence follows state writes
     K-->>R: Completion and validity results
     R->>R: Check completion and rank agreement
     R-->>S: Successful feedback with exact-boundary evidence
     Note over S,C: Materialization is not publication
     S->>S: Retain pending evidence until successful admission
     S->>C: Publish eligible exact checkpoint on successful admission
-    C->>C: Reclaim only expired, no-longer-in-flight storage
+    C->>C: Reclaim only expired checkpoint storage
 ```
 
 Only the exact checkpoint becomes reusable; live history remains request-local.
@@ -258,9 +300,9 @@ implementation choices to review after agreeing on this contract.
 
 | Phase | Inputs | Outputs / side effects |
 | --- | --- | --- |
-| Prepare and validate, once per group | Current raw tables, accepted endpoints, valid widths, pool geometry, `L`, `T_max` | Checkpoint positions, history lengths, flush masks and backing-validity flags in fixed buffers. |
-| Forward, per layer | Q/K/V and gate producers, checkpoint/history views with explicit strides, prepared positions | Verification outputs and candidate K/U/D; optionally an exact pre-candidate checkpoint. |
-| Accepted commit, after layer forwards | Actual accepted input counts, candidate payload, endpoint masks and current tables | Accepted convolution window, selected exact recurrent endpoints and ordered position stamps. |
+| Prepare and validate, once per group | Current checkpoint tables, request slots and generations, accepted endpoints, valid widths, `L`, `T_max` | Checkpoint positions, history lengths, flush masks and layer-buffer validity flags in fixed buffers. |
+| Forward, per layer | Q/K/V and gate producers, checkpoint views, layer-owned history views and prepared positions | Verification outputs and candidate K/U/D in the request slot; optionally an exact pre-candidate checkpoint. |
+| Accepted commit, after layer forwards | Actual accepted input counts, candidate payload, endpoint masks, request slots and generations | Accepted convolution window, selected exact recurrent endpoints and ordered layer-history stamps. |
 | Quiescent materialization, for a future live handoff | Fresh request tables and accepted endpoints | Exact endpoint states and completion validity, without consuming candidates or requiring space for another window. Future extension; live handoff is outside the replacement PR. |
 
 ### One decode round
@@ -381,33 +423,28 @@ State reconstruction must preserve the ordered FP32 KDA updates. Algebraic
 equivalence alone is insufficient: changed rounding can alter verify outputs,
 acceptance length and end-to-end performance.
 
-Before phase two begins, maintainers must select and fill in one of these
-contracts in this document. Do not wait for kernel results and relax the gate
-afterward.
+The following gate applies before PR1 review and remains in force for PR2.
+Fix the reference commit, seeds and test corpus before optimization. Do not
+relax thresholds after inspecting results.
 
-| Numerical contract | Acceptance criteria that must be fixed in advance |
+| Check | Required result |
 | --- | --- |
-| Bitwise contract | Verification outputs, accepted recurrent/conv state and deterministic acceptance sequences match the current implementation bit for bit over the reference matrix. |
-| Tolerance contract | Record dtype-specific output/state `atol`/`rtol`, acceptance criteria for a deterministic corpus and the full agentic workload, and permitted AIME and E2E deltas. |
+| FP32 scalar reference | Verify outputs: `atol=2e-2, rtol=2e-2` after BF16 output conversion. Recurrent state: `atol=3e-2, rtol=2e-2`. These are the existing RecoverSSM reference-test limits. Report maximum and RMS error as well as pass/fail. |
+| Differential against main | Use the same output/state limits. Convolution endpoints, checkpoint positions, accepted counts and padding effects must match exactly. Reject NaN/Inf. |
+| Deterministic serving corpus | Identical greedy output tokens and per-round acceptance counts for fixed prompts, weights, seed and token limits. Include standard decode and MTP3. |
+| AIME 2026 | Same dataset, prompt template, sampling settings and answer parser. No lower number of correct answers in the paired deterministic run. Retain per-question results. |
+| Performance | Pass the fixed protocol in Section 9.1. Correctness and speed are independent requirements. |
 
-If the selected contract cannot be met, return the final PR to design review
-and revise this section; do not lower the standard inside the same implementation
-review. This gives rounding failures a resolution path instead of leaving the
-replacement in draft indefinitely.
+The tolerances measure numerical agreement; they do not permit a different
+logical endpoint or stale history. Bitwise FP32 state equality is not promised.
+The deterministic serving gate tests whether rounding changes affect decoding.
+If a gate fails, investigate and revise the implementation. A change to the
+numerical contract requires a separate design decision.
 
-The initial numerical target is to preserve the existing verification outputs
-and accepted-state updates. Compare against an independent reference for the
-current implementation, including convolution and gate producer precision,
-before tuning kernels.
-
-One candidate keeps BF16 verification producers and FP32 accepted-history
-producers separate, with two register-local recurrence chains sharing one
-history reconstruction. Another choice is explicit verification arithmetic for
-Replay-SSM. It may round differently from the current path. It may be explored
-on the replacement branch, but cannot merge as a preparation PR because
-preparation must preserve current numerics. The replacement must pass the
-agreed numerical, acceptance, AIME and performance gates; do not redefine the
-baseline or relax tolerances merely to obtain equality.
+Producer and recovery must use the same normalization, gate transform, update
+order and FP32 rounding rules. K/U/D are stored after the required FP32
+operations. Do not cast them to BF16 or preweight one field by cumulative decay.
+Tensor-core reassociation is outside these PRs.
 
 Potential optimizations, subject to that contract, include:
 
@@ -449,8 +486,9 @@ Account for all of the following costs:
   4.85 GiB/GPU, before lagging checkpoints, stamps, page rounding,
   candidate/overlap protection and runtime scratch.
 - State lag `d=L-T_max` also raises retraction cost. The newest publishable
-  checkpoint may trail by up to `d` tokens, so recovery may recompute up to `d`
-  extra tokens per retracted request.
+  live checkpoint is bounded by `d`, but the newest available prefix checkpoint
+  is not. Recovery cost depends on published-prefix availability and eviction.
+  Measure the actual recomputed tokens; do not claim an upper bound of `d`.
 - Larger `L` may reduce flushes and full-state writes, but increases memory,
   history reads and reconstruction work. Extra metadata/commit launches can
   offset kernel gains.
@@ -470,95 +508,254 @@ work for the target workload. Then settle:
 
 1. Bounded lag semantics, the shared expiry rule, and admission/startup budgets
    under #1597's exact frontier.
-2. Request-local history as an LCM-owned group, its checkpoint dependency, sparse
-   prefill demand and exclusion from prefix reuse/host writeback.
+2. Layer-owned request history, its fixed capacity, request-slot generation and
+   reset rules, memory budget, and exclusion from prefix reuse/host writeback.
 3. Publication evidence and completion ordering: what proves an exact state,
    how failed admissions retain evidence, and how overlap protects live storage.
 4. Lifecycle boundaries: exact-state recovery, cancellation fences and keeping
    direct live handoff/P-D transfer gated until owner-level integration exists.
 5. Numerical scope: choose bitwise or a pre-quantified tolerance contract and
-   fill in output/state, acceptance, AIME and E2E criteria. Phase two cannot
-   begin before this blocking decision is complete.
+   use the fixed output/state, acceptance, AIME and E2E gates below. Both PRs
+   must pass these gates before review is complete.
 6. Replacement scope: supported shapes and capacities, public API boundaries,
    the `L ∈ {8,16,32}` × target-concurrency sweep, and which kernel
    optimizations should remain separate follow-up work.
 
-### 9.1 Two-stage delivery plan
+### 9.1 Two-PR implementation plan
 
-Delivery has two phases: preparation may contain several small PRs; the final
-change is one replacement PR. The boundary is not the number of files or
-components, but whether main would contain two KDA decode semantics at once.
+The feature lands through two implementation PRs. Each merged revision has one
+serving path. Neither PR adds a legacy/new environment variable, CLI option or
+runtime selector. A separate worktree or baseline binary may be used for
+offline comparison.
 
-#### Phase one: preparation—extend existing modules without changing behavior
+Upstream #1597 is a prerequisite for both PRs. Bounded checkpoint retention from
+fork #3, or an equivalent reviewed change, is a prerequisite for PR2. Small
+behavior-preserving changes to shared request-slot or decode descriptors may
+land separately only when the current implementation uses and validates them;
+they must not install an unused Replay-SSM branch.
 
-Each preparation PR must migrate the current implementation onto the generalized
-interface; it must not merely add an unused Replay-SSM side path. After every PR,
-standard and speculative decode still run the current KDA algorithm. Cache
-geometry, memory use, scheduler decisions, kernel dispatch, numerics and
-performance should remain unchanged. General interfaces describe current
-behavior with explicit arguments rather than silent defaults.
+#### Gate before PR1: one composable replay record
 
-The proposed PRs are below. Adjacent items may be combined during review, but a
-single Python/C++ protocol must not be split into mismatched changes.
+PR1 and PR2 use the FP32 K/U/D record defined in Section 3. Recovery consumes
+`(S_c, record_view, c, E)`. The view contains buffer strides, capacity `R`,
+request slot, generation and absolute-position stamps. It maps position `i`
+to row `i % R`. It must reject invalid rows before using them.
 
-| Preparation PR | Generalization | How the current implementation uses it | Independent validation |
-| --- | --- | --- | --- |
-| P1: bounded state retention | Make checkpoint lag, expiry, admission, reclaim and startup budgets cache-group properties. | Existing recipes explicitly pass zero lag and keep the current checkpoint lifecycle. | Prove zero-lag block tables, admission, reclaim and budgets match main; separately test nonzero-lag boundaries. |
-| P2: LCM request-local dependent groups | Preserve the state+sliding prohibition and add a row-backed `history` family; express ownership, checkpoint dependency, prefix/host-transfer policy, dense/sparse demand and absolute positions, updating cache/scheduler design docs and the Python/C++ contract together. | Existing KV/state groups restate their current policies; no K/U/D history group is created and no page is added. | Differential-test existing recipe geometry/demand; test generic request-local allocation, protection and reclaim, including an adversarial “allocated hole is not an empty exact-state seed” case, without KDA integration. |
-| P3: unified decode descriptor, state-commit and completion protocol | Generalize fixed-address runtime/backend decode descriptors, prepare, commit, validity, materialized-endpoint and cross-rank completion feedback. | Current standard/speculative KDA consume the same class of batch description and report exact per-round state through the new protocol; kernel dispatch and scheduler publication are unchanged. | Compare current standard/speculative input descriptions, state, publication boundaries, cancellation, retraction, mixed batch, eager/graph and overlap. |
+PR1 uses `R=T_max`, begins each round with `c=e`, and recovers only the
+accepted prefix. PR2 changes capacity to `L`, extends the lifetime of
+accepted rows and adds reconstruction in forward. It keeps the record math
+and recovery interface. Internal tiling can change without changing this
+contract. A PR1 implementation that needs a different record format in PR2
+does not pass this gate.
 
-Phase one adds no Replay-SSM kernel, instantiates no replay history and adds no
-legacy/Replay-SSM selector. It does not change the standard or speculative
-decode algorithm. Every preparation PR therefore remains useful even if the
-final replacement is delayed or cancelled: it generalizes existing modules,
-LCM and lifecycle instead of leaving half of a feature in main.
+Before PR1 is accepted, an attention-only test must prove composition:
 
-#### Phase two: final change—replace the KDA core atomically in one PR
+```text
+Replay(S_c, accepted records from all windows)
+    ~= SequentialUpdate(S_c, the same accepted inputs)
+```
 
-The final PR builds on the phase-one interfaces, integrates Replay-SSM and
-removes the old post-acceptance replay implementation in the same change. After
-merge, KDA has one decode state-management semantic: standard decode is the
-same protocol with window width and accepted count equal to one, while
-speculative decode uses a wider window. Both share checkpoint/history,
-reconstruction, flush, accepted commit, metadata, workspace and completion
-feedback. Kernels may specialize for `T=1` and `T>1`, but these specializations
-must not create separate runtime lifecycles.
+Produce each later window through the actual verify producer, starting from
+the reconstructed preceding endpoint. Do not generate all records from an
+independent reference, since that would miss producer/recovery drift. Test
+T=1 and T=4, every accepted length, mixed batches, padding, rejected suffixes,
+R=8/16/32, ring wraparound and at least 128 rounds with repeated checkpoint
+resets. Include stale generations and slot reuse. Check recurrent states,
+outputs, convolution endpoints and validity stamps. The test uses a local
+ring harness; PR1 serving still discards records after each round.
 
-| Atomic content of the final PR | Definition of complete |
-| --- | --- |
-| Kimi-K3 history recipe | Instantiate LCM-managed K/U/D/stamp groups and define block layout, budget, checkpoint dependency, sparse prefill demand and prefix/host-transfer exclusions. |
-| Replay-SSM kernels | Implement paged reconstruction, candidate history, `h + 2*T_max > L` capacity flush, accepted-only recurrent/conv commit, stamps and exact-endpoint materialization. |
-| Unified decode runtime | Standard and speculative decode use one prepare → forward → acceptance → commit flow; pure/mixed, eager/CUDA graph and overlap share one metadata/workspace contract. |
-| Scheduler and publication closure | Use phase one's common demand, retention and commit feedback; publish only successfully materialized exact endpoints and never silently fall back after failure. |
-| Removal of the old implementation | Delete post-acceptance recurrent replay, the separate standard-decode state path, and environment, CLI or runtime branches that select legacy versus Replay-SSM. Capacity may tune only the new implementation. |
-| Correctness and performance acceptance | On the final replacement revision, pass kernel/reference, lifecycle, real-NVFP4 TP8 agentic, CUDA graph/overlap, AIME, `L ∈ {8,16,32}` × target-concurrency sweep and E2E no-regression validation. |
+#### PR1: replace current-round accepted-state replay
 
-The final PR may contain multiple development commits, and experiments may keep
-a baseline binary or separate worktree for comparison. Its review diff must not
-retain both legacy and Replay-SSM serving implementations. If correctness or
-performance is not ready, keep the PR in draft rather than merging a dual-path
-switch as a transition.
+PR1 replaces the current Kimi-K3 speculative accepted-state replay with the
+vLLM RecoverSSM kernel structure. It is an atomic replacement of the current
+replay implementation, not a new mode.
+
+```text
+verify candidates
+    -> write canonical replay records to fixed-address per-round workspace
+    -> receive accepted length
+    -> run one shared recovery plan
+    -> recover and commit all KDA layers
+    -> write exact recurrent and convolution state
+    -> discard the per-round records
+```
+
+PR1 has these boundaries:
+
+- Replay records live for one decode round only.
+- LCM and scheduler semantics do not change.
+- Every round still commits an exact recurrent and convolution endpoint.
+- Standard decode keeps its current state-maintenance behavior.
+- Planning is shared across layers. It computes accepted lengths, source and
+  destination state IDs, aligned-boundary lengths and validity masks once.
+  Layer pointer tables supply layer-specific addresses. The expected commit
+  sequence has one planner launch, one all-layer recurrent recovery launch
+  and one all-layer convolution commit launch.
+- Kernel code copied from vLLM stays under `tokenspeed-kernel/thirdparty/`,
+  preserves its Apache-2.0 license and is exposed through a registered
+  `tokenspeed-kernel` operation.
+- The old post-acceptance replay kernel and orchestration are removed in the
+  same PR.
+
+PR1 keeps the current commit lifecycle: verify can run in the decode CUDA
+graph; accepted-state recovery runs after acceptance on the ordered stream.
+Eager and graph verify use the same record buffers and commit entry point.
+Capturing the complete acceptance/commit sequence is PR2 work. Test the kernels
+under graph capture separately, but do not report that as E2E graph coverage.
+
+Allocate record and plan buffers before capture. Size them for the maximum
+runtime batch, including eager batches above the capture ladder. Keep their
+addresses stable. Padding has accepted count zero and cannot read or write a
+live state. Rebinding a state pool must invalidate pointer tables and rebuild
+workspace before recapture. Per-round rows cannot be reused before commit
+completion. Preserve existing overlap and feedback ordering.
+
+Publish an exact endpoint only after both recurrent and convolution writes
+complete at that endpoint. Preserve the existing scheduler publication event.
+Do not publish on recurrent completion alone. Reclaim workspace only after
+confirmed consumer completion.
+
+For FP32 records, payload bytes per GPU are
+`num_layers * max_runtime_batch * T_max * num_heads * 4*(2*D_k+D_v)`.
+With 69 layers, 12 local heads, dimension 128 and T_max=4, this is about
+4.85 MiB per configured batch slot. Also report convolution payload, pointer
+tables, plan buffers and peak temporary storage. Workspace must be accounted
+for during startup memory sizing. It must not silently reduce the usable cache
+or maximum supported concurrency.
+
+PR1 correctness covers Section 7 and the composition test above. Include
+aligned checkpoint boundaries, all accepted lengths, source/destination alias
+cases, padding, mixed batches, idle graphs, batches above the graph ladder,
+pool rebind and overlap. Full-model validation uses real Kimi-K3 NVFP4 weights,
+TP8, standard decode, MTP3, the agentic workflow and AIME 2026.
+
+The performance protocol is fixed before tuning:
+
+- Compare against unmodified remote main at the recorded rebase commit.
+- Use the same GPU allocation, clocks/power policy, container, dependency
+  versions, weights, model settings, prompt data and output limits.
+- Measure KDA verify plus the complete accepted-state commit for B=4/8/16/32,
+  T=1/4 and accepted lengths 1 through T. Report each component and the total.
+- Measure agentic E2E for concurrency 4/8/16/32. Enable decode CUDA graphs in
+  both arms. Run an eager correctness smoke test.
+- Use at least ten independent server starts per arm. Alternate baseline
+  and candidate order. Warm up each start. Retain raw per-request measurements.
+- Report median and p99 TPOT, throughput, acceptance length, GPU memory and
+  startup workspace. Use 10,000 bootstrap resamples of matched start-level log ratios and
+  simultaneous 95% intervals across all cells and gated metrics, using the
+  maximum standardized deviation in each resample. Use a predeclared 2% measurement margin: the upper latency-ratio
+  bound must be at most 1.02, and the lower throughput-ratio bound at least
+  0.98, in every E2E matrix cell. The KDA total must meet the same latency
+  bound. Use a predeclared second batch of ten starts if the first batch is
+  inconclusive. Report an unresolved gate after that batch; do not stop early
+  when an interval first passes.
+- A statistically significant slowdown is a failure even within the 2%
+  measurement margin. The margin handles uncertainty; it is not a speed-loss
+  budget. A local KDA gain cannot override an E2E regression.
+
+Record commands, commit IDs, environment, results and artifact paths in the
+progress document. Keep the design documents on the PR1 branch during work;
+remove them only in the final cleanup after validation and review.
+
+#### PR2: retain accepted replay records across decode rounds
+
+PR2 changes the lifetime and ownership of the PR1 records. It moves them from
+per-round workspace into the fixed-address buffer owned by each KDA layer. It
+does not introduce another replay arithmetic path.
+
+```text
+exact LCM checkpoint S_c
+    + accepted layer-local records [c,e)
+    + current candidates [e,e+w)
+    -> reconstruct and verify
+    -> retain only accepted records
+    -> materialize exact state only at a required boundary
+```
+
+PR2 completes these items in one replacement:
+
+- Add the per-layer K/U/D/stamp ring, request-slot generations, startup memory
+  budget, completion fences and safe reset.
+- Reuse accepted history across rounds and exclude rejected history.
+- Add `h + 2*T_max > L` capacity flush and exact-endpoint materialization.
+- Use bounded LCM checkpoint retention and publish only confirmed exact states.
+- Make standard decode the same protocol with `T=1`; speculative decode uses
+  the same path with a wider window.
+- Remove per-round exact-state commit when no capacity or snapshot boundary
+  requires it.
+- Keep eager, CUDA graph, mixed-batch and overlap execution on one runtime path.
+
+PR2 uses this execution order in both eager and CUDA graph runs:
+
+```text
+refresh stable metadata
+    -> model forward (reconstruct, capacity flush, verify, candidate records)
+    -> sampling/acceptance produces device accepted counts
+    -> commit graph (conv endpoints, selected recurrent endpoints, stamps)
+    -> existing ordered completion/feedback
+```
+
+The model forward and post-acceptance commit are separately captured graphs.
+Acceptance may remain in its current execution mechanism between them.
+Accepted counts are copied or written into fixed-address device buffers before
+the commit graph runs on the ordered stream. Eager execution calls the same
+forward and commit entry points. No CPU decision selects flush requests.
+
+A fixed-address per-layer convolution workspace stores the round-entry window
+and raw candidate inputs until commit completes. Its dimensions cover the
+maximum runtime batch, channel count, conv width and T_max. The next round
+cannot overwrite it before the ordered commit completes.
+
+Before forward, scheduler admission reserves every state-table boundary that
+the scheduled window can require, using the existing speculative state-demand
+contract. Device acceptance selects among these destinations. Unused blocks
+follow the existing reclamation rules. If the existing reservation is
+insufficient, fix that contract in PR2 before enabling the kernel; a kernel
+cannot allocate an unplanned endpoint after acceptance.
+
+The runtime maps active batch rows to stable request slots. Padding maps to a
+dedicated null slot with width and accepted count zero; kernels perform no
+history, checkpoint or stamp writes for that slot. Slot storage covers all
+resident requests, while row metadata covers the maximum runtime batch.
+Neither is limited by the graph capture ladder. Pool rebind or slot-storage
+replacement invalidates captures and pointer tables; reset generations,
+rebuild metadata and recapture before serving. A slot is reused only after
+all previous consumers complete.
+
+The recurrent/conv pairing and publication rule in Section 3 applies to PR2
+capacity flush and selected endpoint writes. Stamps and feedback follow both
+writes. A capacity flush alone does not publish a prefix-cache entry.
+
+PR2 must not keep PR1's per-round-only orchestration as a fallback. Kernel
+specialization for `T=1` and `T>1` is allowed, but ownership, metadata,
+commit and lifecycle remain one path.
+
+PR2 validation adds multi-window composition, stale-generation rejection, slot
+reuse, capacity flush, prefix hits, retraction, cancellation, tight memory,
+`L ∈ {8,16,32}`, target concurrency, AIME and full agentic E2E performance.
+Apply the PR1 performance protocol, including confidence intervals and the
+2% uncertainty margin, to PR2 versus approved PR1. Sweep L=8/16/32 over the same
+matrix. Each capacity offered for serving must pass correctness and
+non-regression. A failing capacity remains test-only and cannot become a
+recipe default. L=8 has no exception to this rule.
+
+Run this protocol independently for the standard-decode recipe (T_max=1)
+and the MTP3 recipe (T_max=4). Each has its own capacity selection. For each
+recipe and capacity, require non-regression versus approved PR1 in every cell
+and gated metric. Also measure against the fixed unmodified-main commit.
+Compute the geometric mean of the throughput ratios versus main, with equal
+weight per concurrency. Bootstrap the complete matched-start vector to retain
+correlation across cells. A benefit requires its simultaneous 95% lower bound
+to exceed 1.0. A passing capacity meets all correctness checks, all per-cell
+non-regression gates versus PR1 and main, and this aggregate benefit gate.
+Select the smallest capacity whose aggregate throughput is within 2% of the
+best passing capacity. If no capacity passes, PR2 is not ready
+to merge. This rule is fixed before the sweep.
 
 Live-request handoff/P-D, output-only or window-parallel KDA, dynamic `L`, and
-generalization to GDN/Qwen or other linear-attention models are outside this
-replacement PR and require their own later designs. The common LCM interfaces
-should permit reuse, but must not pre-install branches for unapproved behavior
-that current functionality cannot validate.
-
-Required gates are zero-lag/cache/SWA regressions after #1597; tight-pool,
-overlap, prefix-hit and cancellation tests; independent multi-window recurrence
-and accepted-state checks; eager/graph, padding and mixed-batch coverage; and
-E2E comparisons on the integration commit. Plan full-model, real-NVFP4 TP8
-agentic tests with CUDA graphs and runtime overlap, comparing matched workloads
-across independent startups. Measure latency, throughput, memory and acceptance;
-the target is no E2E regression against the unmodified baseline.
-
-If the replacement branch explores different arithmetic, retain three offline
-controls as needed: original main, an arithmetic experiment revision and the
-final Replay-SSM replacement. The experiment must not merge as a preparation
-PR, and these revisions do not imply three runtime paths. Run AIME on the final
-replacement revision before a model-quality claim. Kernel tests or KDA-only
-timing do not substitute for these serving gates.
+generalization to GDN/Qwen or other linear-attention models remain future work.
+The checkpoint, replay-record and request-slot interfaces may support that work,
+but must not pre-install unapproved serving branches.
 
 ## References
 
