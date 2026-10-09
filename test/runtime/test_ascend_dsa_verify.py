@@ -15,6 +15,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     PositionPreservingDCPMetadata,
 )
+from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 
 
 def test_ascend_backend_reuses_the_common_dsa_base():
@@ -24,6 +25,7 @@ def test_ascend_backend_reuses_the_common_dsa_base():
 def test_both_dsa_modules_are_imported():
     assert backends.ascend_dsa is ascend_dsa
     assert backends.dsa.DSABackend is DSABackend
+    assert _BACKEND_REGISTRY["dsa"][1] is DSABackend
 
 
 def test_ascend_mla_prologue_is_limited_to_native_absorbed_kv():

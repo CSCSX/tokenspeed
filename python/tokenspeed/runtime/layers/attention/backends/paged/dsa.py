@@ -1346,5 +1346,4 @@ class DSABackend(PagedAttentionBackend):
         return out.reshape(-1, heads * layer.v_head_dim)
 
 
-if not current_platform().is_npu:
-    register_backend("dsa", {AttentionArch.DSA}, DSABackend)
+register_backend("dsa", {AttentionArch.DSA}, DSABackend)
