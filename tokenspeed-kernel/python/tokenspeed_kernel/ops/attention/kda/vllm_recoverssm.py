@@ -1,0 +1,722 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""TokenSpeed adapters for the vendored vLLM KDA RecoverSSM kernels."""
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
+    NULL_BLOCK_ID,
+    _commit_kda_state_kernel,
+    _prepare_commit_plan_kernel,
+    kda_recoverssm_verify,
+)
+
+_DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
+
+
+@register_kernel(
+    "attention",
+    "kda_recoverssm_verify",
+    name="vllm_triton_kda_recoverssm_verify",
+    solution="vllm_triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.REFERENCE,
+    traits={
+        "paged_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+)
+def vllm_triton_kda_recoverssm_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    checkpoint_state: torch.Tensor,
+    correction_cache: torch.Tensor,
+    kd_cache: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_indices: torch.Tensor,
+    spec_query_len: int,
+    lower_bound: float | None,
+    out: torch.Tensor,
+    replay_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    verify_decay: torch.Tensor | None,
+    verify_qk: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    """Verify candidates and save current-window recovery records.
+
+    q/k/v and raw_g pack tokens as [1, tokens, heads, dim]; raw_beta omits
+    the final dim. A_log and dt_bias parameterize the gate. lower_bound
+    selects the bounded gate, or None selects the softplus gate.
+
+    checkpoint_state uses [page, head, value, key]. state_indices selects
+    request pages, with zero reserved for padding. query_start_loc gives
+    packed-token offsets; spec_query_len bounds each request's window.
+    correction_cache and kd_cache are request/head/token/channel FP32
+    destinations. The latter stores normalized K followed by decay.
+
+    replay_inputs provides independent FP32 normalized K, convolved V and
+    multiplicative decay. None records the verify chain instead.
+    verify_qk optionally supplies FP32 normalized/scaled Q and normalized K.
+    verify_decay optionally supplies FP32 decay after BF16 gate rounding.
+    These prepared inputs remove repeated transforms from value tiles.
+
+    Return out after writing verify results. The checkpoint is unchanged.
+    """
+    return kda_recoverssm_verify(
+        q,
+        k,
+        v,
+        raw_g,
+        raw_beta,
+        A_log,
+        dt_bias,
+        lower_bound,
+        checkpoint_state,
+        correction_cache,
+        kd_cache,
+        query_start_loc,
+        state_indices,
+        spec_query_len,
+        out=out,
+        replay_inputs=replay_inputs,
+        verify_decay=verify_decay,
+        verify_qk=verify_qk,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_recoverssm_commit",
+    name="vllm_triton_kda_recoverssm_commit",
+    solution="vllm_triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.REFERENCE,
+    traits={
+        "attention_only": frozenset({True}),
+        "paged_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+)
+def vllm_triton_kda_recoverssm_commit(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    checkpoint_state: torch.Tensor,
+    correction_cache: torch.Tensor,
+    kd_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    final_state_indices: torch.Tensor,
+    boundary_state_indices: torch.Tensor,
+    boundary_recovery_lens: torch.Tensor,
+    state_base_addrs: torch.Tensor,
+    correction_cache_base_addrs: torch.Tensor,
+    kd_cache_base_addrs: torch.Tensor,
+    spec_query_len: int,
+) -> None:
+    """Commit one layer's accepted FP32 K/U/decay records in place.
+
+    q/k/v identify the registry's activation format; recovery does not read
+    them. checkpoint_state uses [page, head, value, key]. correction_cache
+    and kd_cache use [request, head, token, channel], with K then decay in
+    the latter. The three base-address tables each contain this layer's
+    pool pointer. Tensor strides describe those pools.
+
+    state_indices selects live source/destination pages (> 0); non-positive
+    pages are padding. query_start_loc gives each request's token boundaries.
+    num_accepted_tokens is clamped to that window and spec_query_len by the
+    planner. commit_lens, final_state_indices, boundary_state_indices and
+    boundary_recovery_lens are caller-owned int32 planner scratch.
+
+    Return None after updating checkpoint_state. No gate inputs are needed:
+    verify already saved multiplicative decay in kd_cache.
+    """
+    del q, k, v
+    batch = state_indices.shape[0]
+    if batch == 0:
+        return
+    _prepare_commit_plan_kernel[(batch,)](
+        num_accepted_tokens,
+        None,
+        state_indices,
+        query_start_loc,
+        None,
+        None,
+        commit_lens,
+        final_state_indices,
+        boundary_state_indices,
+        boundary_recovery_lens,
+        NULL_BLOCK_ID,
+        1,
+        1,
+        num_accepted_tokens.stride(0),
+        0,
+        state_indices.stride(0),
+        query_start_loc.stride(0),
+        0,
+        0,
+        0,
+        SPEC_QUERY_LEN=spec_query_len,
+        num_warps=1,
+    )
+    _, num_heads, value_dim, key_dim = checkpoint_state.shape
+    block_k = triton.next_power_of_2(key_dim)
+    grid = lambda meta: (
+        triton.cdiv(meta["V"], meta["BV"]),
+        batch,
+        num_heads,
+    )
+    _commit_kda_state_kernel[grid](
+        checkpoint_state,
+        state_base_addrs,
+        checkpoint_state.stride(0),
+        correction_cache,
+        correction_cache_base_addrs,
+        correction_cache.stride(0),
+        kd_cache,
+        kd_cache_base_addrs,
+        kd_cache.stride(0),
+        state_indices,
+        commit_lens,
+        final_state_indices,
+        boundary_state_indices,
+        boundary_recovery_lens,
+        NULL_BLOCK_ID,
+        checkpoint_state.stride(1),
+        checkpoint_state.stride(2),
+        checkpoint_state.stride(3),
+        correction_cache.stride(1),
+        correction_cache.stride(2),
+        correction_cache.stride(3),
+        kd_cache.stride(1),
+        kd_cache.stride(2),
+        kd_cache.stride(3),
+        state_indices.stride(0),
+        None,
+        0,
+        1,
+        K=key_dim,
+        V=value_dim,
+        BK=block_k,
+        NUM_HEADS=num_heads,
+        ALIGN_MODE=False,
+        BATCH=batch,
+        LAUNCH_DEPENDENT_KERNELS=False,
+        num_stages=2,
+    )
+
+
+__all__ = [
+    "vllm_triton_kda_recoverssm_commit",
+    "vllm_triton_kda_recoverssm_verify",
+]
+
+
+def batched_recoverssm_commit(
+    descriptors: torch.Tensor,
+    group_indices: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    *,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    qkv_stride: int,
+    conv_stride: int,
+    correction_stride: int,
+    key_decay_stride: int,
+    state_stride: int,
+    conv_width: int,
+) -> None:
+    """Recover all layers from request-major FP32 records and commit conv.
+
+    Descriptors retain the runtime's ten-column layout. Columns 0, 2 and 8
+    hold raw QKV, conv state and recurrent state. Columns 3 and 5 hold
+    correction and key/decay records. The remaining columns are unused here
+    but retained for the shared descriptor ABI. All strides count elements;
+    record token strides may include row padding.
+
+    group_indices maps each layer to a row of read_indices/write_indices.
+    Those tables are contiguous [groups, batch]; live pages must be positive.
+    Padding uses negative source/destination pages and accepted count zero.
+    The shared state-page planner must clamp accepted_length to [0, draft_token_num] before this
+    call. A zero count copies the source endpoint without reading records.
+
+    State pages use contiguous [head, value, key] FP32 values; conv pages
+    use contiguous [channel, conv_width - 1] BF16 values. Record K/U/decay
+    is FP32. Source and destination pages may alias within a request, but
+    requests must not share writable pages.
+
+    Return None after recurrent and convolution commits on the caller stream.
+    """
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        batched_kda_commit_conv_window_kernel,
+    )
+
+    if head_dim != 128 or conv_width != 4:
+        raise ValueError("batched KDA commit requires head_dim=128 and conv_width=4")
+    layers = descriptors.shape[0]
+    if descriptors.shape != (layers, 10) or not descriptors.is_contiguous():
+        raise ValueError("descriptors must be a contiguous [layers, 10] pointer table")
+    if group_indices.shape != (layers,) or not group_indices.is_contiguous():
+        raise ValueError("group_indices must be a contiguous per-layer vector")
+    batch = accepted_length.numel()
+    if (
+        accepted_length.shape != (batch,)
+        or read_indices.ndim != 2
+        or read_indices.shape[1] != batch
+        or write_indices.shape != read_indices.shape
+        or any(
+            not tensor.is_contiguous()
+            for tensor in (accepted_length, read_indices, write_indices)
+        )
+    ):
+        raise ValueError(
+            "commit metadata must be contiguous [groups, batch] and [batch]"
+        )
+    if not batch:
+        return
+    grid = lambda meta: (
+        triton.cdiv(head_dim, meta["BV"]),
+        batch,
+        layers * num_heads,
+    )
+    # Empty typed views provide pointer element types. No kernel dereferences
+    # these placeholders; all storage comes from the persistent descriptor.
+    typed = torch.empty(0, dtype=torch.float32, device=descriptors.device)
+    _commit_kda_state_kernel[grid](
+        typed,
+        descriptors[:, 8],
+        state_stride,
+        typed,
+        descriptors[:, 3],
+        draft_token_num * correction_stride,
+        typed,
+        descriptors[:, 5],
+        draft_token_num * key_decay_stride,
+        read_indices,
+        accepted_length,
+        write_indices,
+        None,
+        None,
+        NULL_BLOCK_ID,
+        head_dim * head_dim,
+        head_dim,
+        1,
+        head_dim,
+        correction_stride,
+        1,
+        2 * head_dim,
+        key_decay_stride,
+        1,
+        read_indices.stride(1),
+        group_indices,
+        read_indices.stride(0),
+        descriptors.stride(0),
+        K=head_dim,
+        V=head_dim,
+        BK=triton.next_power_of_2(head_dim),
+        NUM_HEADS=num_heads,
+        ALIGN_MODE=False,
+        BATCH=batch,
+        LAUNCH_DEPENDENT_KERNELS=False,
+        num_stages=2,
+    )
+    batched_kda_commit_conv_window_kernel[
+        (layers, batch, triton.cdiv(3 * num_heads * head_dim, 128))
+    ](
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        batch,
+        T=draft_token_num,
+        STRIDE_QKV=qkv_stride,
+        STRIDE_CONV=conv_stride,
+        CONV_DIM=3 * num_heads * head_dim,
+        BLOCK=128,
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _replay_conv_inputs_kernel(
+    raw,
+    weights,
+    pool,
+    read_indices,
+    output,
+    verify_output,
+    verify_qk,
+    captured_raw,
+    stride_raw: tl.constexpr,
+    stride_pool: tl.constexpr,
+    stride_capture: tl.constexpr,
+    T: tl.constexpr,
+    P: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    request, position = row // T, row % T
+    page = tl.load(read_indices + request).to(tl.int64)
+    mask = channel < 3 * P
+    feature = channel
+    current = tl.load(raw + row * stride_raw + feature, mask=mask, other=0).to(
+        tl.float32
+    )
+    weight = tl.load(weights + feature * 4 + 3, mask=mask, other=0).to(tl.float32)
+    # Match _kda_window_step: current tap first, then taps 0, 1, 2.
+    current_term = current * weight
+    acc = current_term
+    verify_acc = tl.full((BLOCK,), 0.0, tl.float32)
+    for tap in tl.static_range(3):
+        offset = position + tap
+        from_raw = offset >= 3
+        history = tl.load(
+            pool + tl.maximum(page, 0) * stride_pool + feature * 3 + offset,
+            mask=mask & ~from_raw & (page >= 0),
+            other=0,
+        ).to(tl.float32)
+        candidate = tl.load(
+            raw + (request * T + offset - 3) * stride_raw + feature,
+            mask=mask & from_raw,
+            other=0,
+        ).to(tl.float32)
+        weight = tl.load(weights + feature * 4 + tap, mask=mask, other=0).to(tl.float32)
+        value = tl.where(from_raw, candidate, history)
+        acc += value * weight
+        verify_acc += value * weight
+    verify_acc += current * tl.load(weights + feature * 4 + 3, mask=mask, other=0).to(
+        tl.float32
+    )
+    tl.store(
+        verify_output + row * (3 * P) + channel,
+        verify_acc * tl.sigmoid(verify_acc),
+        mask=mask,
+    )
+    # Match main's BF16 producer boundary before FP32 normalization.
+    rounded_verify = (
+        (verify_acc * tl.sigmoid(verify_acc)).to(raw.dtype.element_ty).to(tl.float32)
+    )
+    verify_heads = rounded_verify.reshape((BLOCK // HEAD_DIM, HEAD_DIM))
+    normalized_verify = verify_heads / tl.sqrt(
+        tl.sum(verify_heads * verify_heads, axis=1)[:, None] + 1e-6
+    )
+    normalized_verify = normalized_verify.reshape((BLOCK,))
+    normalized_verify = tl.where(
+        feature < P, normalized_verify * HEAD_DIM**-0.5, normalized_verify
+    )
+    tl.store(
+        verify_qk + row * (2 * P) + feature,
+        normalized_verify,
+        mask=mask & (feature < 2 * P),
+    )
+    tl.store(captured_raw + row * stride_capture + channel, current, mask=mask)
+    activated = acc * tl.sigmoid(acc)
+    per_head = activated.reshape((BLOCK // HEAD_DIM, HEAD_DIM))
+    normalized = per_head / tl.sqrt(tl.sum(per_head * per_head, axis=1)[:, None] + 1e-6)
+    # Record production needs normalized K, but the original convolved V.
+    replay_input = tl.where(feature < 2 * P, normalized.reshape((BLOCK,)), activated)
+    tl.store(
+        output + row * (2 * P) + feature - P,
+        replay_input,
+        mask=mask & (feature >= P),
+    )
+
+
+@triton.jit(do_not_specialize=["ROWS"])
+def _recoverssm_gate_inputs_kernel(
+    fa,
+    fb,
+    a_log,
+    bias,
+    raw_gate,
+    replay_gate,
+    verify_decay,
+    stride_fa: tl.constexpr,
+    ROWS,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    DFA: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    DOT: tl.constexpr,
+    LOWER: tl.constexpr,
+):
+    head, tile, column_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    key = column_tile * BK + tl.arange(0, BK)
+    channel = head * K + key
+    reduction = tl.arange(0, DFA)
+    weights = tl.load(
+        fb + channel[:, None] * DFA + reduction[None, :], mask=key[:, None] < K, other=0
+    )
+    a = tl.exp(tl.load(a_log + head).to(tl.float32))
+    dt = tl.load(bias + channel, mask=key < K, other=0).to(tl.float32)
+    if DOT:
+        rows = tile * BT + tl.arange(0, BT)
+        values = tl.load(
+            fa + rows[:, None] * stride_fa + reduction[None, :],
+            mask=rows[:, None] < ROWS,
+            other=0,
+        )
+        gate = tl.dot(values, tl.trans(weights))
+        tl.store(
+            raw_gate + rows[:, None] * H * K + channel[None, :],
+            gate,
+            mask=(rows[:, None] < ROWS) & (key[None, :] < K),
+        )
+        rounded = gate.to(raw_gate.dtype.element_ty).to(tl.float32) + dt[None, :]
+        if LOWER is not None:
+            verify_log = LOWER * tl.sigmoid(a * rounded)
+        else:
+            verify_log = -a * tl.where(
+                rounded > 20.0, rounded, tl.log(1.0 + tl.exp(rounded))
+            )
+        tl.store(
+            verify_decay + rows[:, None] * H * K + channel[None, :],
+            tl.exp(verify_log),
+            mask=(rows[:, None] < ROWS) & (key[None, :] < K),
+        )
+        biased = gate + dt[None, :]
+        if LOWER is not None:
+            log_decay = LOWER * tl.sigmoid(a * biased)
+        else:
+            log_decay = -a * tl.where(
+                biased < 20.0, tl.log(1.0 + tl.exp(biased)), biased
+            )
+        tl.store(
+            replay_gate + rows[:, None] * H * K + channel[None, :],
+            tl.exp(log_decay),
+            mask=(rows[:, None] < ROWS) & (key[None, :] < K),
+        )
+    else:
+        for index in range(BT):
+            row = tile * BT + index
+            if row < ROWS:
+                values = tl.load(fa + row * stride_fa + reduction).to(tl.float32)
+                gate = tl.sum(weights.to(tl.float32) * values[None, :], axis=1)
+                tl.store(raw_gate + row * H * K + channel, gate, mask=key < K)
+                rounded = gate.to(raw_gate.dtype.element_ty).to(tl.float32) + dt
+                if LOWER is not None:
+                    verify_log = LOWER * tl.sigmoid(a * rounded)
+                else:
+                    verify_log = -a * tl.where(
+                        rounded > 20.0, rounded, tl.log(1.0 + tl.exp(rounded))
+                    )
+                tl.store(
+                    verify_decay + row * H * K + channel,
+                    tl.exp(verify_log),
+                    mask=key < K,
+                )
+                biased = gate + dt
+                if LOWER is not None:
+                    log_decay = LOWER * tl.sigmoid(a * biased)
+                else:
+                    log_decay = -a * tl.where(
+                        biased < 20.0, tl.log(1.0 + tl.exp(biased)), biased
+                    )
+                tl.store(
+                    replay_gate + row * H * K + channel, tl.exp(log_decay), mask=key < K
+                )
+
+
+def prepare_recoverssm_conv(
+    raw: torch.Tensor,
+    captured_raw: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Prepare convolution inputs for the two independent state chains.
+
+    raw and captured_raw use packed [request * width, 3 * heads * dim]
+    Q/K/V rows. conv_weights uses [channel, 4]. conv_pool stores three
+    prior values per channel. read_indices selects each request's page.
+
+    Return BF16 verify QKV, FP32 normalized replay K, FP32 convolved
+    replay V, and the FP32 normalized verify Q/K pair. Q includes the
+    attention scale. Each chain retains main's convolution tap order.
+    Verify normalization occurs after BF16 rounding, never before it.
+    """
+    rows, channels = raw.shape[0], num_heads * head_dim
+    if width <= 0 or rows % width:
+        raise ValueError("width must be positive and divide the packed row count")
+    if head_dim <= 0 or head_dim & (head_dim - 1) or 256 % head_dim:
+        raise ValueError("head_dim must be a power of two that divides 256")
+    if raw.shape != (rows, 3 * channels) or raw.stride(-1) != 1:
+        raise ValueError("raw must have packed Q/K/V rows with unit channel stride")
+    if raw.dtype != torch.bfloat16 or captured_raw.dtype != raw.dtype:
+        raise ValueError("raw and captured_raw must use BF16")
+    if captured_raw.shape != raw.shape or captured_raw.stride(-1) != 1:
+        raise ValueError("captured_raw must match the packed raw layout")
+    if conv_weights.shape != (3 * channels, 4) or not conv_weights.is_contiguous():
+        raise ValueError("conv_weights must be contiguous [3 * heads * dim, 4]")
+    if (
+        conv_pool.ndim != 3
+        or conv_pool.shape[1] < 3 * channels
+        or conv_pool.shape[2] != 3
+        or conv_pool.stride()[1:] != (3, 1)
+    ):
+        raise ValueError("conv_pool must have contiguous channel/tap dimensions")
+    if conv_weights.dtype != raw.dtype or conv_pool.dtype != raw.dtype:
+        raise ValueError("convolution weights and state must use BF16")
+    if (
+        read_indices.shape != (rows // width,)
+        or read_indices.dtype not in (torch.int32, torch.int64)
+        or read_indices.stride(0) != 1
+    ):
+        raise ValueError("read_indices must be a contiguous integer request vector")
+    if any(
+        tensor.device != raw.device
+        for tensor in (captured_raw, conv_weights, conv_pool, read_indices)
+    ):
+        raise ValueError("convolution inputs must use the same device")
+    # The kernel writes dense rows even when raw is a strided projection view.
+    conv = torch.empty_like(raw, memory_format=torch.contiguous_format)
+    verify_qk = torch.empty(
+        (rows, 2 * channels), device=raw.device, dtype=torch.float32
+    )
+    kv = torch.empty((rows, 2 * channels), device=raw.device, dtype=torch.float32)
+    _replay_conv_inputs_kernel[(rows, triton.cdiv(3 * channels, 256))](
+        raw,
+        conv_weights,
+        conv_pool,
+        read_indices,
+        kv,
+        conv,
+        verify_qk,
+        captured_raw,
+        raw.stride(0),
+        conv_pool.stride(0),
+        captured_raw.stride(0),
+        T=width,
+        P=channels,
+        HEAD_DIM=head_dim,
+        BLOCK=256,
+        num_warps=4,
+    )
+    shape = (1, rows, num_heads, head_dim)
+    k, v = kv.chunk(2, dim=-1)
+    q_verify, k_verify = verify_qk.chunk(2, dim=-1)
+    return (
+        conv,
+        k.view(shape),
+        v.view(shape),
+        (q_verify.view(shape), k_verify.view(shape)),
+    )
+
+
+def prepare_recoverssm_gate(
+    f_a: torch.Tensor,
+    f_b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    lower_bound: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return BF16 raw gates, FP32 replay decay and FP32 verify decay.
+
+    Low-rank gate inputs and weights use the existing main-path layout.
+    FP32 accumulation follows main replay's shape-based tiling rule.
+    """
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        _gate_tiling,
+        _gate_tiling_dot,
+    )
+
+    rows, channels = f_a.shape[0], num_heads * head_dim
+    if f_a.ndim != 2 or f_a.stride(-1) != 1 or f_a.dtype != torch.bfloat16:
+        raise ValueError("f_a must be BF16 [rows, rank] with unit rank stride")
+    rank = f_a.shape[1]
+    if rank <= 0 or rank & (rank - 1):
+        raise ValueError("gate projection rank must be a positive power of two")
+    if f_b.shape != (channels, rank) or not f_b.is_contiguous():
+        raise ValueError("f_b must be contiguous [heads * dim, rank]")
+    if f_b.dtype != f_a.dtype:
+        raise ValueError("gate projection weights must match the BF16 inputs")
+    if (
+        A_log.shape != (num_heads,)
+        or dt_bias.numel() != channels
+        or not A_log.is_contiguous()
+        or not dt_bias.is_contiguous()
+    ):
+        raise ValueError("gate parameters must have contiguous per-head/channel values")
+    if any(tensor.device != f_a.device for tensor in (f_b, A_log, dt_bias)):
+        raise ValueError("gate inputs must use the same device")
+    raw_gate = torch.empty((rows, channels), device=f_a.device, dtype=f_a.dtype)
+    gate = torch.empty((rows, channels), device=f_a.device, dtype=torch.float32)
+    verify_decay = torch.empty_like(gate)
+    bt, bk = (
+        _gate_tiling_dot(rows, head_dim)
+        if rows >= 16
+        else _gate_tiling(rows, num_heads, head_dim, f_a.device)
+    )
+    _recoverssm_gate_inputs_kernel[
+        (num_heads, triton.cdiv(rows, bt), triton.cdiv(head_dim, bk))
+    ](
+        f_a,
+        f_b,
+        A_log,
+        dt_bias,
+        raw_gate,
+        gate,
+        verify_decay,
+        stride_fa=f_a.stride(0),
+        ROWS=rows,
+        H=num_heads,
+        K=head_dim,
+        DFA=f_a.shape[-1],
+        BT=bt,
+        BK=bk,
+        DOT=rows >= 16,
+        LOWER=lower_bound,
+        num_warps=1 if bt >= 4 else 2,
+    )
+    return (
+        raw_gate,
+        gate.view(1, rows, num_heads, head_dim),
+        verify_decay.view(1, rows, num_heads, head_dim),
+    )

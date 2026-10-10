@@ -348,14 +348,41 @@ PR1 评审前固定以下标准，PR2 继续使用。优化完成后不能按结
 | 检查 | 验收标准 |
 | --- | --- |
 | 独立 FP32 reference | BF16 输出的 atol=2e-2、rtol=2e-2；recurrent state 的 atol=3e-2、rtol=2e-2。同时报告最大误差和 RMS 误差。 |
-| 与 main 对照 | 使用相同的输出/state 容差。Conv endpoint、checkpoint position、accepted count 和 padding 副作用必须完全一致。拒绝 NaN/Inf。 |
+| 与 main 对照 | BF16 verify 输出使用固定 atol=2e-2、rtol=2e-2。保留现有回归测试的容差。Accepted recurrent state 使用 atol=1e-5、rtol=1e-3；不得用较宽的独立 reference 容差替代。Conv endpoint、checkpoint position、accepted count 和 padding 副作用必须完全一致。拒绝 NaN/Inf。 |
 | 确定性 serving corpus | 固定权重、输入、seed 和生成长度。Standard decode 与 MTP3 的 greedy token 和逐轮 acceptance 必须一致。 |
 | AIME 2026 | 使用相同数据、prompt、采样设置和答案解析器。成对的确定性测试中，正确题数不能降低。保留逐题结果。 |
 | 性能 | 通过第 9.1 节的固定协议。正确性和性能分别验收。 |
 
-Producer 与 recovery 使用相同的归一化、gate 变换和有序 FP32 更新。
+Record producer 与 recovery 使用相同的归一化、gate 变换和有序 FP32 更新。
 K/U/D 在对应的 FP32 运算后写入。不得转为 BF16，也不提前乘入累计 decay。
 本次两项 PR 不包含改变结合顺序的 Tensor Core 重建。
+
+当前 NVIDIA 路径使用两种 producer 精度。Verify 使用 BF16 convolution 和 gate
+输出；accepted-state replay 重新计算 FP32 convolution 和 gate。恢复 record
+必须使用后者。不能直接使用 verify 的低精度输入来计算 recovery correction。
+
+PR1 必须同时保留 verify 输出和 main 的 accepted-state 算术。可在 producer
+内部维护两条寄存器 state 链：一条计算 verify 输出，另一条生成 FP32 record。
+必须测量额外计算的成本。只有同时保持这两个数值约定，才可融合 producer。
+
+两条链从相同的 FP32 accepted checkpoint 和 BF16 committed conv window 开始。
+Record 链使用 main replay 的 tap 顺序、FP32 累加、activation 和 gate 变换。
+不得读取 verify 链的低精度中间结果或 state。测试必须改变 verify 输入，同时固定
+record 输入；写出的 record 和恢复的 state 必须不变。
+
+PR1 不改变 standard decode。PR2 的 T=1 reference 是 main 的 standard fused decode，
+不是 BF16 split verify。Main 的 fused decode 在 FP32 寄存器中计算 convolution、
+activation 和 gate。使用同一 FP32 record 协议和上述严格 state 容差。
+不能把 width-one speculative 测试当作 standard decode 验证。
+
+PR1 的多轮 reference 是逐轮执行 main accepted-state replay。每轮提交新的精确
+checkpoint，下一轮从该 checkpoint 开始。这不等于跨轮 history 验证。
+PR2 对 history 长度直到 L-T_max、L=8/16/32 的 ring wraparound，必须满足同样的
+严格 state 容差。两类测试都报告最大误差和 RMS 误差。
+
+除总 KDA 时间外，还报告 verify-only 时间，以及双链 producer 的 register 数、
+spill 和 occupancy。性能不达标时，在当前数值约定内优化，例如改变融合或拆出
+record kernel。不得改用 verify correction 或放宽容差来解决性能问题。
 
 测试失败时先定位原因并修改实现。改变数值契约需要独立的设计决定。
 代数等价不代表浮点结果或 acceptance 一致。
@@ -403,7 +430,7 @@ latency、吞吐、GPU memory、flush 频率、retraction 恢复成本和 accept
    以及 overlap 如何保护仍在使用的存储。
 4. 生命周期边界：基于精确 state 的恢复、取消时的在途保护，以及在所有权管理层
    完成接入前，继续禁止直接移交活跃请求和 P-D 传输。
-5. 数值范围：两项 PR 都必须通过第 7 节的固定数值、acceptance、AIME 和性能标准。
+5. 数值范围：使用固定容差和两种 producer 精度的约定。两项 PR 都必须通过第 7 节的固定数值、acceptance、AIME 和性能标准。
 6. 正式替换范围：支持的 shape 和容量、公共 API 边界、`L ∈ {8,16,32}` × 目标
    concurrency 的 sweep 计划，以及哪些 kernel 优化应留作独立的后续工作。
 
@@ -422,7 +449,9 @@ S_(i+1) = S_i * D_i[None, :] + U_i[:, None] * K_i[None, :]
 ```
 
 vLLM Kimi-K3 源码使用 FP32 correction 和 activation dtype 的原始 key/gate。
-本地适配在 producer 中生成上述标准 record，保留 Apache-2.0 许可。
+Vendored recovery kernel 也改为直接读取 FP32 K/U/D，并在 provenance 说明中记录。
+本地适配从原始 projection 输入按 main 的 FP32 replay 算术生成 record，保留 Apache-2.0 许可。
+不能把 verify 的低精度输入直接转为 FP32。U 来自 record 链自身 decay 后的 state。
 这不是将 GDN 的 scalar decay 直接用于 KDA。
 
 Recovery 接口为 (S_c, record_view, c, E)。View 包含 stride、容量 R、
@@ -483,6 +512,10 @@ idle graph、超过 capture ladder 的 batch、rebind 和 overlap。
 - 首批结果不明确时，按预先约定追加十次启动。仍不明确则标记未通过验收，
   不在结果首次通过时提前停止。
 - KDA 改善不能抵消 E2E 退步。记录命令、环境、commit、结果和 artifact 路径。
+
+性能判断中的“显著变慢”有固定含义：同时置信区间的 latency ratio 下界大于 1.0，
+或 throughput ratio 上界小于 1.0。若执行第二组十次独立启动，使用全部二十组
+配对启动重新计算区间。2% 是测量不确定性的余量，不是允许的性能损失。
 
 #### PR2：保留跨轮 accepted history，统一 decode
 

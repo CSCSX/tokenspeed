@@ -114,10 +114,13 @@ and validity information. Queries are used for outputs and are not retained.
 Rejected records never enter logical history.
 
 The vLLM Kimi-K3 RecoverSSM source uses FP32 corrections and activation-dtype
-raw keys/gates. The adapter converts this payload to the canonical FP32 K/U/D
-record at its producer. It preserves token-local KDA vector decay. It does not
-import the scalar-decay GDN protocol. This change needs the numerical and
-performance checks in Sections 7 and 9.
+raw keys/gates. The adapter produces canonical FP32 K/U/D from raw projection
+inputs with main's FP32 replay arithmetic. A cast from the rounded verify
+inputs is insufficient. Each U comes from the record chain's own post-decay
+state. The adapter preserves token-local KDA vector decay; it does not import
+the scalar-decay GDN protocol. The vendored recovery kernel is adapted to
+read the FP32 records directly; its provenance notes list that change.
+Sections 7 and 9 define the acceptance checks.
 
 Convolution uses a separate payload: the initial convolution window plus the
 current round's raw convolution inputs. It is not reconstructed from K/U/D.
@@ -430,7 +433,7 @@ relax thresholds after inspecting results.
 | Check | Required result |
 | --- | --- |
 | FP32 scalar reference | Verify outputs: `atol=2e-2, rtol=2e-2` after BF16 output conversion. Recurrent state: `atol=3e-2, rtol=2e-2`. These are the existing RecoverSSM reference-test limits. Report maximum and RMS error as well as pass/fail. |
-| Differential against main | Use the same output/state limits. Convolution endpoints, checkpoint positions, accepted counts and padding effects must match exactly. Reject NaN/Inf. |
+| Differential against main | Verify outputs use the fixed `atol=2e-2, rtol=2e-2` after BF16 conversion. Preserve existing regression limits. Accepted recurrent state uses `atol=1e-5, rtol=1e-3`; do not replace this with the looser scalar-reference limit. Convolution endpoints, checkpoint positions, accepted counts and padding effects must match exactly. Reject NaN/Inf. |
 | Deterministic serving corpus | Identical greedy output tokens and per-round acceptance counts for fixed prompts, weights, seed and token limits. Include standard decode and MTP3. |
 | AIME 2026 | Same dataset, prompt template, sampling settings and answer parser. No lower number of correct answers in the paired deterministic run. Retain per-question results. |
 | Performance | Pass the fixed protocol in Section 9.1. Correctness and speed are independent requirements. |
@@ -441,10 +444,46 @@ The deterministic serving gate tests whether rounding changes affect decoding.
 If a gate fails, investigate and revise the implementation. A change to the
 numerical contract requires a separate design decision.
 
-Producer and recovery must use the same normalization, gate transform, update
+The record producer and recovery must use the same normalization, gate transform, update
 order and FP32 rounding rules. K/U/D are stored after the required FP32
 operations. Do not cast them to BF16 or preweight one field by cumulative decay.
 Tensor-core reassociation is outside these PRs.
+
+The current NVIDIA path has two producer precisions. Verify consumes BF16
+convolution and gate outputs. Accepted-state replay recomputes convolution and
+gates in FP32. Records for recovery must use the latter arithmetic. Corrections
+from the rounded verify inputs are not interchangeable with replay corrections.
+
+PR1 must retain verify outputs and main's accepted-state recurrence. One
+implementation uses two register-local state chains in the producer: one for
+verify outputs, one for FP32 recovery records. The extra arithmetic is a cost
+to measure, not an assumed optimization. Producer fusion may remove launches
+only if both numerical contracts remain satisfied.
+
+Both chains start from the same FP32 accepted checkpoint and committed BF16
+convolution window. The record chain uses main replay's convolution tap order,
+FP32 accumulation and activation, and FP32 gate transform. It must not read
+the verify chain's rounded intermediates or recurrent state. Test this by
+changing the verify inputs while keeping the record inputs fixed; saved
+records and recovered state must not change.
+
+PR1 leaves standard decode unchanged. For PR2, compare T=1 against main's
+standard fused decode, not against the split BF16 verify path. Main's fused
+decode computes convolution, activation and gates in FP32 registers. Use the
+same FP32 record protocol and the strict accepted-state tolerance above. Do
+not infer T=1 correctness from a width-one speculative test.
+
+The multi-round PR1 reference is sequential main accepted-state replay. Each
+round commits a new exact checkpoint, then starts the next round from it.
+This is not a cross-round history test. PR2 must pass the same strict state
+limit with retained history up to L-T_max, including wraparound at L=8/16/32.
+Report maximum and RMS error in both cases.
+
+Report verify-only latency as well as total KDA time. Include register count,
+spills and occupancy for the two-chain producer. If the performance gate
+fails, optimize within this contract. Different fusion or a separate record
+kernel may be tested. Verify-derived corrections and relaxed tolerances are
+not remedies for a performance failure.
 
 Potential optimizations, subject to that contract, include:
 
@@ -514,7 +553,7 @@ work for the target workload. Then settle:
    how failed admissions retain evidence, and how overlap protects live storage.
 4. Lifecycle boundaries: exact-state recovery, cancellation fences and keeping
    direct live handoff/P-D transfer gated until owner-level integration exists.
-5. Numerical scope: choose bitwise or a pre-quantified tolerance contract and
+5. Numerical scope: use the pre-quantified tolerance and two-producer-precision contract, and
    use the fixed output/state, acceptance, AIME and E2E gates below. Both PRs
    must pass these gates before review is complete.
 6. Replacement scope: supported shapes and capacities, public API boundaries,
@@ -647,9 +686,12 @@ The performance protocol is fixed before tuning:
   bound must be at most 1.02, and the lower throughput-ratio bound at least
   0.98, in every E2E matrix cell. The KDA total must meet the same latency
   bound. Use a predeclared second batch of ten starts if the first batch is
-  inconclusive. Report an unresolved gate after that batch; do not stop early
+  inconclusive. Recompute intervals over all twenty matched starts.
+  Report an unresolved gate after that batch; do not stop early
   when an interval first passes.
-- A statistically significant slowdown is a failure even within the 2%
+- A statistically significant slowdown means the simultaneous interval's
+  lower latency-ratio bound exceeds 1.0, or its upper throughput-ratio bound
+  is below 1.0. It is a failure even within the 2%
   measurement margin. The margin handles uncertainty; it is not a speed-loss
   budget. A local KDA gain cannot override an E2E regression.
 

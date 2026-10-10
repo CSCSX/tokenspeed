@@ -817,7 +817,9 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
         x["dt_bias"],
     )
     fused = triton_nvidia_kda_fused_paged_verify_no_store(*args, **kwargs)
-    split = triton_nvidia_kda_fused_paged_verify_split(*args, **kwargs)
+    split = triton_nvidia_kda_fused_paged_verify_split(
+        *args, **kwargs, replay_records=None
+    )
     conv_qkv = fused_kda_verify_conv_update(
         x["qkv_raw"],
         x["conv_w"],
@@ -829,7 +831,7 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
     )
     g_raw = torch.mm(x["f_a"], x["w_fb"].t())
     precomputed = triton_nvidia_kda_fused_paged_verify_split(
-        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv
+        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv, replay_records=None
     )
     torch.testing.assert_close(split, fused, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(precomputed, split, atol=0.0, rtol=0.0)

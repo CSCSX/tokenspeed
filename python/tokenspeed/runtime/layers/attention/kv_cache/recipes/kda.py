@@ -83,12 +83,23 @@ def kda_verify_workspace_bytes(
             * sum(field.payload_bytes for field in state_fields)
         )
 
-    from tokenspeed_kernel.ops.attention.kda import kda_batched_replay_uses_raw_gate
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_batched_replay_uses_raw_gate,
+        kda_fused_paged_verify_uses_split_producers,
+        kda_recurrent_layout,
+    )
 
     linear = config.component(LinearAttnConfig)
     heads, head_dim, _ = linear.temporal_state_shape
     raw_gate = kda_batched_replay_uses_raw_gate(
         config.dtype, num_heads=heads, head_dim=head_dim
+    )
+    records = kda_fused_paged_verify_uses_split_producers(
+        config.dtype,
+        store_states=False,
+        recurrent_layout=kda_recurrent_layout(),
+        num_heads=heads,
+        head_dim=head_dim,
     )
     conv_fields = tuple(
         field for field in state_fields if field.field_id.endswith(".conv_state")
@@ -104,4 +115,9 @@ def kda_verify_workspace_bytes(
         * head_dim
         * (torch.bfloat16.itemsize if raw_gate else torch.float32.itemsize)
     )
+    if records:
+        # Raw QKV retains the accepted convolution window; FP32 U/K/D
+        # replaces the old low-rank gate input, beta and gate scratch.
+        row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
+        row_bytes += 3 * heads * head_dim * torch.float32.itemsize
     return conv_bytes + len(conv_fields) * config.max_bs * draft_token_num * row_bytes

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
+    KdaReplayRecords,
     kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
@@ -40,7 +41,6 @@ from tokenspeed_kernel.ops.attention.kda import (
 )
 from tokenspeed_kernel.ops.attention.kda import (
     kda_replay_commit_supported,
-    kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
@@ -302,13 +302,34 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         device=self.device,
                     ),
                     torch.empty(
-                        (*payload_shape, head_dim), dtype=self.dtype, device=self.device
+                        (
+                            *payload_shape,
+                            hv * head_dim if self._verify_split_producers else head_dim,
+                        ),
+                        dtype=(
+                            torch.float32
+                            if self._verify_split_producers
+                            else self.dtype
+                        ),
+                        device=self.device,
                     ),
                     torch.empty(
-                        (*payload_shape, hv), dtype=self.dtype, device=self.device
+                        (
+                            *payload_shape,
+                            2 * hv * head_dim if self._verify_split_producers else hv,
+                        ),
+                        dtype=(
+                            torch.float32
+                            if self._verify_split_producers
+                            else self.dtype
+                        ),
+                        device=self.device,
                     ),
                     torch.empty(
-                        (*payload_shape, hv * head_dim),
+                        (
+                            *payload_shape,
+                            0 if self._verify_split_producers else hv * head_dim,
+                        ),
                         dtype=(
                             torch.bfloat16
                             if self._replay_uses_raw_gate
@@ -321,7 +342,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 self._replay_group_indices = group_indices
 
     def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
-        """Return one layer row from the stacked replay workspaces."""
+        """Return one layer's views in the shared descriptor order.
+
+        Split producers store raw QKV, FP32 U, FP32 K/decay and empty gate
+        scratch. Other backends retain raw QKV, f_a, beta and gate scratch.
+        The tuple order stays stable across backend-specific payload formats.
+        """
         assert self._replay_payloads is not None
         row = self._descriptor_row_by_layer[layer_id]
         return tuple(payload[row] for payload in self._replay_payloads)
@@ -644,6 +670,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             replay_payload = {}
+            replay_records = None
             split_producers = {}
             if self._replay_uses_raw_gate:
                 # Fused verify writes QKV, raw-g, and beta directly into the
@@ -654,38 +681,61 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     "replay_beta": beta[:rows, : beta_raw.shape[-1]],
                 }
             elif self._verify_split_producers:
+                from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+                    prepare_recoverssm_conv,
+                    prepare_recoverssm_gate,
+                )
+
+                heads = value_dim // attn_tp_size // head_v_dim
                 fork = self._verify_producer_forks[layer_id]
                 with fork.scope(enable=True) as producer_fork:
                     with producer_fork.branch():
-                        capture_replay_payload(
-                            (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
-                            (
-                                qkv[:rows, : mixed_qkv.shape[-1]],
-                                f_a[:rows, : f_a_out.shape[-1]],
-                                beta[:rows, : beta_raw.shape[-1]],
-                            ),
-                            rows,
+                        g_raw, replay_gate, verify_decay = prepare_recoverssm_gate(
+                            f_a_out[:rows],
+                            f_b_weight,
+                            A_log,
+                            dt_bias,
+                            num_heads=heads,
+                            head_dim=head_v_dim,
+                            lower_bound=lower_bound,
                         )
-                        g_raw = torch.nn.functional.linear(f_a_out[:rows], f_b_weight)
-                    conv_qkv = kda_verify_conv_update(
-                        mixed_qkv[:rows],
-                        conv_weights,
-                        conv_comp,
-                        state_in_blocks[:batch_size],
-                        num_heads=value_dim // attn_tp_size // head_v_dim,
-                        head_dim=head_v_dim,
-                        draft_token_num=draft_token_num,
-                        recurrent_layout=self.kda_recurrent_layout,
+                    conv_qkv, replay_key, replay_value, verify_qk = (
+                        prepare_recoverssm_conv(
+                            mixed_qkv[:rows],
+                            qkv[:rows, : mixed_qkv.shape[-1]],
+                            conv_weights,
+                            conv_comp,
+                            state_in_blocks[:batch_size],
+                            num_heads=heads,
+                            head_dim=head_v_dim,
+                            width=draft_token_num,
+                        )
                     )
-                # The graph capture pool owns captured allocations. In eager
-                # mode the producer tensors outlive this Python scope while
-                # verify runs on the main stream, so register that use with
-                # the caching allocator before launching its consumer.
+                # Eager allocations on the producer stream stay live through
+                # the consumer's verify. Graph capture owns its allocations.
                 if not torch.cuda.is_current_stream_capturing():
                     consumer_stream = torch.cuda.current_stream()
                     g_raw.record_stream(consumer_stream)
-                    conv_qkv.record_stream(consumer_stream)
+                    replay_gate.record_stream(consumer_stream)
+                    verify_decay.record_stream(consumer_stream)
+                record_inputs = (replay_key, replay_value, replay_gate)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
+                # NVIDIA saves corrections and normalized key/decay records.
+                # Request rows, not pool block IDs, size the per-round cache.
+                replay_records = KdaReplayRecords(
+                    correction=f_a[:rows, : heads * head_v_dim]
+                    .view(batch_size, draft_token_num, heads, head_v_dim)
+                    .transpose(1, 2),
+                    key_decay=beta[:rows, : 2 * heads * head_v_dim]
+                    .view(batch_size, draft_token_num, heads, 2 * head_v_dim)
+                    .transpose(1, 2),
+                    query_start_loc=self.forward_metadata.query_start_loc[
+                        : batch_size + 1
+                    ],
+                    replay_inputs=record_inputs,
+                    verify_decay=verify_decay,
+                    verify_qk=verify_qk,
+                )
             else:
                 capture_replay_payload(
                     (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
@@ -730,6 +780,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 lower_bound=lower_bound,
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
+                replay_records=replay_records,
                 **replay_payload,
                 **split_producers,
             )
@@ -762,6 +813,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
                 recurrent_layout=self.kda_recurrent_layout,
+                replay_records=None,
             )
 
     @override
@@ -870,6 +922,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
             self._verify_commit_ctx = None
             return
+        if self._verify_split_producers:
+            # The per-layer fallback expects projections, not FP32 K/U/decay.
+            raise RuntimeError(
+                "batched record-based KDA replay was not ready at commit"
+            )
         if self._replay_uses_raw_gate:
             raise RuntimeError("batched raw-g KDA replay was not ready at commit")
         pages_by_group = {g: write_stack[i] for i, g in enumerate(group_ids)}

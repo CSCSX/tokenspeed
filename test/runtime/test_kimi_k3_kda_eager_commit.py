@@ -912,3 +912,88 @@ def test_hybrid_rebinding_reaches_the_state_child():
     assert share.prefill is None and share.decode is None
     assert_no_alias(hybrid, old_slabs)
     assert_no_alias(harness.backend, old_slabs)
+
+
+def test_padded_graph_verify_keeps_live_rows_and_commits_isolated():
+    """Padding may have undefined outputs, but cannot change live state."""
+    captured = _Harness(eager_replay=True, seed=982)
+    eager = _Harness(eager_replay=True, seed=982)
+    bs, real_bs = 4, 2
+    rpis = [0, 1]
+    pages = {
+        group_id: [2 + group * real_bs + i for i in range(real_bs)]
+        for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    seq_lens = [8 + T] * real_bs
+    captured.prepare_metadata(rpis, pages, seq_lens)
+    captured.forward(captured.inputs(real_bs, 901), real_bs)
+    capture_tables = {
+        group_id: torch.full((bs, 1), -1, dtype=torch.int32, device=DEV)
+        for group_id in _STATE_GROUPS
+    }
+    captured.backend.init_forward_metadata_capture_cuda_graph(
+        bs,
+        torch.arange(bs, dtype=torch.int32, device=DEV),
+        torch.full((bs,), 8 + T, dtype=torch.int32, device=DEV),
+        ForwardMode.DECODE,
+        block_tables=capture_tables,
+    )
+    stable_inputs = captured.inputs(bs, 902)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        captured.forward(stable_inputs, bs)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = captured.forward(stable_inputs, bs)
+
+    for round_index, counts in enumerate(([0, T], [1, 2])):
+        tables = {
+            group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
+            for group_id in _STATE_GROUPS
+        }
+        captured.backend.refresh_decode_metadata(
+            bs,
+            real_bs,
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=_tables_for(captured.contract, tables, DEV),
+        )
+        inputs = captured.inputs(bs, 903 + round_index)
+        for name, value in inputs.items():
+            stable_inputs[name].copy_(value)
+        graph.replay()
+        accepted = torch.tensor(counts, dtype=torch.int32, device=DEV)
+        captured.backend.commit_verified_state(accepted, accepted_path=None)
+        eager.prepare_metadata(rpis, pages, seq_lens)
+        eager_outputs = eager.forward(
+            {name: value[: real_bs * T] for name, value in inputs.items()}, real_bs
+        )
+        eager.backend.commit_verified_state(accepted, accepted_path=None)
+        for actual, expected in zip(graph_outputs, eager_outputs, strict=True):
+            torch.testing.assert_close(
+                actual.reshape(-1, KEY_DIM)[: real_bs * T],
+                expected.reshape(-1, KEY_DIM),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        for layer_id in captured.layer_ids:
+            for component in ("conv_state", "recurrent_state"):
+                torch.testing.assert_close(
+                    captured.pool.get_component(layer_id, component),
+                    eager.pool.get_component(layer_id, component),
+                    atol=0 if component == "conv_state" else 1e-5,
+                    rtol=0 if component == "conv_state" else 1e-3,
+                )
+        seq_lens = [length + count for length, count in zip(seq_lens, counts)]
+
+    # Never reinterpret canonical records as the legacy projection payload.
+    eager.prepare_metadata(rpis, pages, seq_lens)
+    eager.forward(eager.inputs(real_bs, 910), real_bs)
+    eager.backend._batched_replay_ready = False
+    with pytest.raises(RuntimeError, match="record-based KDA replay was not ready"):
+        eager.backend.commit_verified_state(accepted, accepted_path=None)

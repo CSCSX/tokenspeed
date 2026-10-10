@@ -361,7 +361,9 @@ S_(i+1) = S_i * D_i[None, :] + U_i[:, None] * K_i[None, :]
 ```
 
 Output tolerance is atol=2e-2 and rtol=2e-2 after BF16 conversion.
-State tolerance is atol=3e-2 and rtol=2e-2.
+Scalar-reference state tolerance is atol=3e-2 and rtol=2e-2.
+For accepted-state comparison with main, use atol=1e-5 and rtol=1e-3.
+Keep the stricter limits in existing regression tests.
 Report maximum and RMS error. Reject NaN and Inf.
 Convolution endpoints, positions, accepted counts and padding effects must match exactly.
 The fixed greedy corpus must produce the same tokens and acceptance counts.
@@ -370,6 +372,33 @@ Keep the same prompts, sampling settings and answer parser.
 
 Do not relax a failed gate after implementation.
 Tensor Core reassociation is outside these two PRs.
+
+Main uses BF16 convolution and gate outputs for verify.
+Main uses FP32 convolution and gate results for accepted-state replay.
+Create recovery records from the FP32 results.
+Do not use the rounded verify inputs for these records.
+
+PR1 must preserve both calculations.
+One producer can keep two state chains in registers.
+Use one chain for verify outputs. Use the other chain for recovery records.
+Measure the cost of the second chain.
+Fuse producers only when both numerical contracts still pass.
+Start both chains from the same FP32 state and BF16 convolution window.
+Use main replay's tap order and FP32 activation and gate calculations.
+Create U from the record chain's own state after decay.
+Do not make these records by casting verify inputs.
+The copied recovery kernel reads the FP32 K/U/D records directly.
+
+PR1 does not change standard decode.
+For PR2, compare T=1 with main's standard fused decode.
+That kernel calculates convolution and gates in FP32 registers.
+Use the strict state tolerance. A width-one speculative test is not sufficient.
+
+PR1 commits an exact checkpoint after each round in its multi-round tests.
+PR2 must meet the same strict state limit with retained history.
+Test history lengths up to L-T_max and wraparound at L=8/16/32.
+Report verify-only time, total KDA time, registers, spills and occupancy.
+A performance failure does not permit relaxed accuracy limits.
 
 ## 12. Expected benefit and cost
 
@@ -547,9 +576,12 @@ The performance protocol is fixed before tuning:
   bound must be at most 1.02, and the lower throughput-ratio bound at least
   0.98, in every E2E matrix cell. The KDA total must meet the same latency
   bound. Use a predeclared second batch of ten starts if the first batch is
-  inconclusive. Report an unresolved gate after that batch; do not stop early
+  inconclusive. Recompute intervals over all twenty matched starts.
+  Report an unresolved gate after that batch; do not stop early
   when an interval first passes.
-- A statistically significant slowdown is a failure even within the 2%
+- A statistically significant slowdown means the simultaneous interval's
+  lower latency-ratio bound exceeds 1.0, or its upper throughput-ratio bound
+  is below 1.0. It is a failure even within the 2%
   measurement margin. The margin handles uncertainty; it is not a speed-loss
   budget. A local KDA gain cannot override an E2E regression.
 
