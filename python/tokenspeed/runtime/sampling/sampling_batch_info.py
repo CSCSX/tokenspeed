@@ -82,6 +82,8 @@ class SamplingBatchInfo:
     # batch's extend rows (score requests never decode); rows without score
     # labels are zero-filled. None on the standard hot path.
     score_label_ids: torch.Tensor | None = None
+    # Host row indices avoid discovering scored rows through a CUDA nonzero.
+    score_row_indices: tuple[int, ...] = ()
 
     # Device
     device: str = "cuda"
@@ -102,6 +104,16 @@ class SamplingBatchInfo:
         def _slice(t):
             return t[s] if t is not None else None
 
+        score_rows = set(self.score_row_indices)
+        sliced_score_rows = (
+            tuple(
+                i
+                for i, row in enumerate(range(self.score_label_ids.shape[0])[s])
+                if row in score_rows
+            )
+            if self.score_label_ids is not None
+            else ()
+        )
         return dataclasses.replace(
             self,
             temperatures=_slice(self.temperatures),
@@ -112,5 +124,6 @@ class SamplingBatchInfo:
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
             score_label_ids=_slice(self.score_label_ids),
+            score_row_indices=sliced_score_rows,
             batch_row_offset=self.batch_row_offset + (s.start or 0),
         )

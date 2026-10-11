@@ -248,7 +248,9 @@ def test_score_megatron_reduction_matches_sampled_logprobs():
         2, 2 * MEGATRON_VOCAB_BLOCK, device="cuda", dtype=torch.bfloat16
     )
     labels = torch.tensor([[0, MEGATRON_VOCAB_BLOCK + 1], [7, 100]], device="cuda")
-    scores = gather_score_logprobs(logits, labels, 2, logprob_order="megatron")
+    scores = gather_score_logprobs(
+        logits, labels, 2, score_row_indices=(0, 1), logprob_order="megatron"
+    )
     for column in range(labels.shape[1]):
         sampled = gather_token_logprobs(
             logits, labels[:, column], logprob_order="megatron"
@@ -258,7 +260,10 @@ def test_score_megatron_reduction_matches_sampled_logprobs():
 
 def test_score_label_upload_does_not_synchronize_serving_stream():
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.score_utils import build_score_label_ids
+    from tokenspeed.runtime.sampling.score_utils import (
+        build_score_label_ids,
+        gather_score_logprobs,
+    )
 
     params = [
         SamplingParams(score_label_token_ids=[5, 9]),
@@ -266,12 +271,17 @@ def test_score_label_upload_does_not_synchronize_serving_stream():
         SamplingParams(score_label_token_ids=[1, 2, 3]),
     ]
     previous = torch.cuda.get_sync_debug_mode()
+    logits = torch.randn(3, 20, device="cuda")
     try:
         torch.cuda.set_sync_debug_mode("error")
         labels = build_score_label_ids(params, 3, "cuda")
+        scores = gather_score_logprobs(
+            logits, labels, 3, score_row_indices=(0, 2), logprob_order="torch"
+        )
     finally:
         torch.cuda.set_sync_debug_mode(previous)
     assert labels.cpu().tolist() == [[5, 9, 0], [0, 0, 0], [1, 2, 3]]
+    assert scores[1].cpu().tolist() == [0.0, 0.0, 0.0]
 
 
 if __name__ == "__main__":

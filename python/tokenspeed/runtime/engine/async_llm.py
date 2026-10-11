@@ -471,23 +471,31 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await self.input_processor.tokenize_batch(objs)
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                warmup_obj = prepare_prefix_warmup(tmp_obj, tokenized_objs[i])
-                self._send_one_request(tmp_obj, warmup_obj, created_time)
-                await self._wait_one_response(tmp_obj).__anext__()
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for replica_index in range(obj.parallel_sample_num):
+            setup_rids = []
+            try:
+                # Cache the common prefix for parallel sampling.
+                for i in range(batch_size):
                     tmp_obj = copy.copy(objs[i])
-                    replica_obj = prepare_parallel_sampling_replica(
-                        tmp_obj, tokenized_objs[i], replica_index
-                    )
-                    self._send_one_request(tmp_obj, replica_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj))
-                    rids.append(tmp_obj.rid)
+                    warmup_obj = prepare_prefix_warmup(tmp_obj, tokenized_objs[i])
+                    setup_rids.append(tmp_obj.rid)
+                    self._send_one_request(tmp_obj, warmup_obj, created_time)
+                    await self._wait_one_response(tmp_obj).__anext__()
+
+                # Track before sending: even a failed send may register state.
+                for i in range(batch_size):
+                    for replica_index in range(obj.parallel_sample_num):
+                        tmp_obj = copy.copy(objs[i])
+                        replica_obj = prepare_parallel_sampling_replica(
+                            tmp_obj, tokenized_objs[i], replica_index
+                        )
+                        setup_rids.append(tmp_obj.rid)
+                        self._send_one_request(tmp_obj, replica_obj, created_time)
+                        generators.append(self._wait_one_response(tmp_obj))
+                        rids.append(tmp_obj.rid)
+            except BaseException:
+                for rid in setup_rids:
+                    self.abort_request(rid)
+                raise
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream

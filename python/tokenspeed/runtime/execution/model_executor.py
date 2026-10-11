@@ -1574,6 +1574,7 @@ class ModelExecutor:
                 logits_output.next_token_logits,
                 sampling_info.score_label_ids,
                 ctx.output_layout.num_prefill_outputs,
+                score_row_indices=sampling_info.score_row_indices,
                 logprob_order=self.sampling_backend.config.logprob_order,
             )
 
@@ -1701,6 +1702,11 @@ class ModelExecutor:
             # only extend rows are covered (score requests never decode).
             sampling_info.score_label_ids = build_score_label_ids(
                 sampling_params_list, num_extends, self.device
+            )
+            sampling_info.score_row_indices = tuple(
+                row
+                for row, params in enumerate(sampling_params_list[:num_extends])
+                if params.score_label_token_ids is not None
             )
         return sampling_info
 

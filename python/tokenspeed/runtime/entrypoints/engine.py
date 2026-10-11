@@ -305,11 +305,14 @@ class Engine(EngineBase):
         """Score each ``query + item`` sequence over the label token set.
 
         The low-level ``/v1/score`` contract: every item runs as an
-        independent prefill-only sequence (SIS execution; the shared query
-        prefix is reused through the radix cache), and at each item's answer
+        independent prefill-only sequence (SIS execution; committed query
+        pages can be reused through the radix cache), and at each item's answer
         boundary the full-vocab logprobs are gathered at ``label_token_ids``.
         Unlike top-k generation logprobs, the declared labels are always all
         scored.
+
+        Cold siblings admitted together may recompute their shared prefix;
+        this API does not add a warmup or guarantee within-batch cache reuse.
 
         Args:
             query: Shared context + question text every item sees.

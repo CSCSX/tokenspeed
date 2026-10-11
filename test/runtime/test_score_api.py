@@ -130,7 +130,9 @@ def test_score_gather_uses_emitted_prefill_prefix():
     # One completed prefill, one skipped incomplete prefill, then decode logits.
     logits = torch.tensor([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]])
     labels = torch.tensor([[0, 2], [1, 2]])
-    out = gather_score_logprobs(logits, labels, 1, logprob_order="torch")
+    out = gather_score_logprobs(
+        logits, labels, 1, score_row_indices=(0, 1), logprob_order="torch"
+    )
     assert out.shape == (1, 2)
     assert torch.allclose(
         out, torch.log_softmax(logits[:1], dim=-1).gather(-1, labels[:1])
@@ -141,7 +143,11 @@ def test_score_gather_skips_all_incomplete_prefills():
     # The only logits belong to decode; no prefill row was emitted.
     assert (
         gather_score_logprobs(
-            torch.ones(1, 3), torch.tensor([[0, 2], [1, 2]]), 0, logprob_order="torch"
+            torch.ones(1, 3),
+            torch.tensor([[0, 2], [1, 2]]),
+            0,
+            score_row_indices=(0, 1),
+            logprob_order="torch",
         )
         is None
     )
@@ -159,7 +165,9 @@ def test_score_gather_forwards_resolved_logprob_order(monkeypatch):
         return torch.full_like(targets, -0.5, dtype=torch.float32)
 
     monkeypatch.setattr(score_utils, "gather_token_logprobs", gather)
-    result = gather_score_logprobs(logits, labels, 1, logprob_order="megatron")
+    result = gather_score_logprobs(
+        logits, labels, 1, score_row_indices=(0, 1), logprob_order="megatron"
+    )
     assert result.tolist() == [[-0.5, -0.5]]
     rows, targets, order = calls[0]
     assert torch.equal(rows, logits[:1])
@@ -239,9 +247,41 @@ def test_gather_score_logprobs_matches_manual():
     torch.manual_seed(0)
     logits = torch.randn(3, 50)
     label_ids = torch.tensor([[0, 1], [2, 3], [4, 5]])
-    gathered = gather_score_logprobs(logits, label_ids, 3, logprob_order="torch")
+    gathered = gather_score_logprobs(
+        logits, label_ids, 3, score_row_indices=(0, 1, 2), logprob_order="torch"
+    )
     expected = torch.log_softmax(logits.float(), dim=-1).gather(-1, label_ids)
     assert torch.equal(gathered, expected)
+
+
+def test_score_gather_normalizes_only_scored_emitted_rows(monkeypatch):
+    from tokenspeed.runtime.sampling import score_utils
+
+    logits = torch.randn(4, 7)
+    labels = torch.tensor([[1, 3], [0, 0], [2, 5], [4, 6]])
+    gathered_rows = []
+    original_gather = score_utils.gather_token_logprobs
+
+    def gather(rows, targets, *, logprob_order):
+        gathered_rows.append(rows)
+        return original_gather(rows, targets, logprob_order=logprob_order)
+
+    monkeypatch.setattr(score_utils, "gather_token_logprobs", gather)
+    result = gather_score_logprobs(
+        logits, labels, 3, score_row_indices=(0, 2, 3), logprob_order="torch"
+    )
+    assert len(gathered_rows) == 1
+    assert torch.equal(gathered_rows[0], logits[[0, 2]])
+    expected = torch.log_softmax(logits[[0, 2]], dim=-1).gather(-1, labels[[0, 2]])
+    assert torch.equal(result[[0, 2]], expected)
+    assert result[1].tolist() == [0.0, 0.0]
+    assert (
+        gather_score_logprobs(
+            logits, labels, 2, score_row_indices=(2, 3), logprob_order="torch"
+        )
+        is None
+    )
+    assert len(gathered_rows) == 1
 
 
 def test_finalize_score_row_raw_passthrough():
@@ -270,9 +310,12 @@ def test_sampling_batch_info_slices_score_label_ids():
     label_ids = torch.tensor([[5, 9], [0, 0], [1, 2]])
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
-    info = SamplingBatchInfo(score_label_ids=label_ids)
+    info = SamplingBatchInfo(score_label_ids=label_ids, score_row_indices=(0, 2))
     assert info[:2].score_label_ids.tolist() == [[5, 9], [0, 0]]
     assert info[2:].score_label_ids.tolist() == [[1, 2]]
+    assert info[:2].score_row_indices == (0,)
+    assert info[2:].score_row_indices == (0,)
+    assert info[1:2].score_row_indices == ()
     assert SamplingBatchInfo()[:2].score_label_ids is None
 
 

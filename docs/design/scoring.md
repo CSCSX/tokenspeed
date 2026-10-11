@@ -37,7 +37,8 @@ Semantics that must not drift:
 - **Score readout obeys the resolved `logprob_order`.** It uses the same
   selected-token reduction as output and prompt logprobs, including
   Megatron's fixed vocab-block fold. Multiple labels share one vocab
-  reduction per row.
+  reduction per row. Mixed batches normalize only emitted rows carrying
+  score labels; unrelated generation rows pay no Score normalization cost.
 - **The answer boundary is the last prefill position** of each
   `query + item` sequence. Scores are read there exactly once, on the
   final prefill chunk; mid-chunk positions are not answer boundaries.

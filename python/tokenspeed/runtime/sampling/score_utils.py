@@ -74,6 +74,7 @@ def gather_score_logprobs(
     score_label_ids: torch.Tensor,
     num_prefill_outputs: int,
     *,
+    score_row_indices: tuple[int, ...],
     logprob_order: str,
 ) -> torch.Tensor | None:
     """Gather full-vocab logprobs at the label positions.
@@ -85,16 +86,29 @@ def gather_score_logprobs(
     chunks and decode rows have no score readout. Zero returns ``None``.
     ``logprob_order`` uses the same resolved reduction as sampled and prompt
     logprobs, including the trainer's fixed vocab-block order.
-    Returns raw logprobs ``[num_prefill_outputs, max_labels]`` — padded columns and rows
-    without score labels hold values the consumer must ignore.
+    ``score_row_indices`` comes from host request metadata, so selecting the
+    scored rows needs no device-to-host synchronization. Only those rows pay
+    for vocabulary normalization. The dense result preserves output-row
+    indexing; non-scoring rows are zero-filled and ignored by the consumer.
     """
     if num_prefill_outputs == 0:
         return None
-    return gather_token_logprobs(
-        next_token_logits[:num_prefill_outputs],
-        score_label_ids[:num_prefill_outputs],
+    rows = [row for row in score_row_indices if row < num_prefill_outputs]
+    if not rows:
+        return None
+    indices = torch.tensor(
+        rows,
+        dtype=torch.int64,
+        device="cpu",
+        pin_memory=next_token_logits.device.type == "cuda",
+    ).to(next_token_logits.device, non_blocking=True)
+    values = gather_token_logprobs(
+        next_token_logits.index_select(0, indices),
+        score_label_ids.index_select(0, indices),
         logprob_order=logprob_order,
     )
+    result = values.new_zeros((num_prefill_outputs, values.shape[1]))
+    return result.index_copy_(0, indices, values)
 
 
 def finalize_score_row(row_logprobs: list[float], apply_softmax: bool) -> list[float]:

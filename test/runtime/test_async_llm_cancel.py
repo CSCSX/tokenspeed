@@ -31,6 +31,7 @@ from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import AbortReq, GenerateReqInput  # noqa: E402
 from tokenspeed.runtime.engine.output_processor import ReqState  # noqa: E402
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 
 class _FakeScheduler:
@@ -175,6 +176,90 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBatchSetupCleanup(unittest.IsolatedAsyncioTestCase):
+    def _parallel_setup(self, *, missing_second_seed=False):
+        obj = GenerateReqInput(
+            text=["first", "second"], sampling_params={"max_new_tokens": 1, "n": 2}
+        )
+        obj.normalize_batch_and_arguments()
+        mgr = _StubAsyncLLM()
+        tokenized = [
+            types.SimpleNamespace(
+                created_time=0.0,
+                sampling_params=SamplingParams(
+                    max_new_tokens=1,
+                    seed=None if missing_second_seed and i == 1 else 7,
+                ),
+                multimodal_inputs=None,
+            )
+            for i in range(2)
+        ]
+        mgr.input_processor = types.SimpleNamespace(
+            tokenize_batch=AsyncMock(return_value=tokenized)
+        )
+        return mgr, obj
+
+    async def test_parallel_setup_failures_retire_submitted_requests(self):
+        for stage in ("warmup send", "replica send", "replica preparation"):
+            with self.subTest(stage=stage):
+                mgr, obj = self._parallel_setup(
+                    missing_second_seed=stage == "replica preparation"
+                )
+                send = mgr._send_one_request
+                replicas = []
+
+                def complete_warmups_or_fail(req, tokenized, created_time):
+                    send(req, tokenized, created_time)
+                    if tokenized.sampling_params.max_new_tokens == 0:
+                        if stage == "warmup send":
+                            raise OSError("warmup send failed")
+                        state = mgr.rid_to_state[req.rid]
+                        state.finished = True
+                        state.collector.put(
+                            {
+                                "text": "",
+                                "output_ids": [],
+                                "meta_info": {"id": req.rid, "finish_reason": None},
+                            },
+                            stream=False,
+                        )
+                        state.event.set()
+                    else:
+                        replicas.append(req.rid)
+                        if stage == "replica send" and len(replicas) == 2:
+                            raise OSError("replica send failed")
+
+                mgr._send_one_request = complete_warmups_or_fail
+                error = ValueError if stage == "replica preparation" else OSError
+                with self.assertRaises(error):
+                    await mgr._handle_batch_request(obj, created_time=0.0).__anext__()
+                self.assertEqual(mgr.rid_to_state, {})
+                aborted = [
+                    message.rid
+                    for message in mgr.engine_core_client.send_to_scheduler.aborts
+                    if isinstance(message, AbortReq)
+                ]
+                self.assertEqual(len(aborted), 1 if stage == "warmup send" else 2)
+                if replicas:
+                    self.assertEqual(aborted, replicas)
+
+    async def test_parallel_warmup_cancellation_retires_request(self):
+        mgr, obj = self._parallel_setup()
+        generator = mgr._handle_batch_request(obj, created_time=0.0)
+        task = asyncio.create_task(generator.__anext__())
+        await asyncio.sleep(0)
+        self.assertEqual(len(mgr.rid_to_state), 1)
+        rid = next(iter(mgr.rid_to_state))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(mgr.rid_to_state, {})
+        aborted = [
+            message.rid
+            for message in mgr.engine_core_client.send_to_scheduler.aborts
+            if isinstance(message, AbortReq)
+        ]
+        self.assertEqual(aborted, [rid])
+
     def _batch(self):
         obj = GenerateReqInput(
             text=["valid", "too long"],
