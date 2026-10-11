@@ -125,7 +125,7 @@ A score request is an ordinary generation request with
   `score_apply_softmax` sampling parameters. The text-based Score and Decision
   helpers require a tokenizer; supplying label IDs does not tokenize inputs.
 - SMG gateway: the control server proxies `/v1/score` unchanged, but
-  the pinned `tokenspeed-smg==1.10.1.post20260920` does not implement
+  the pinned `tokenspeed-smg==1.11.0.post20261007` does not implement
   that endpoint or decode the score column. HTTP Score serving requires
   the separate gateway follow-up and a matching dependency pin. Its
   decoder skips unknown trailing columns, preserving ordinary generation

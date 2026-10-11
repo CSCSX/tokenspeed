@@ -1632,7 +1632,6 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "forward_prefill_metadata",
                 "forward_decode_metadata",
                 "spec_cache_seqlens_buf",
-                "tree_prefix_lens_buf",
             ],
         )
 
@@ -1665,8 +1664,8 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "forward_prefill_metadata",
                 "chunked_prefill_metadata",
                 "_decode_tile_metadata",
-                "dcp_block_granularity",
-                "dcp_virtual_block_count",
+                "kvp_block_granularity",
+                "kvp_virtual_block_count",
                 "dcp_metadata",
             ],
             workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"),
