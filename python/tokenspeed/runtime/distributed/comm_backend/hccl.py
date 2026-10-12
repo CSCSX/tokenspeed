@@ -132,6 +132,9 @@ class HcclBackend(CommBackend):
 
         gathered = tensor.new_empty(len(group) * max_tokens, tensor.shape[-1])
         self.all_gather_single(gathered, tensor.contiguous(), group)
+        # Equal-sized shards already form the contiguous, rank-ordered output.
+        if all(tokens == max_tokens for tokens in scattered_num_tokens):
+            return gathered
         return torch.cat(
             [
                 gathered[rank * max_tokens : rank * max_tokens + tokens]

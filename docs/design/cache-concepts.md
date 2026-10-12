@@ -1447,6 +1447,28 @@ When drafting advances or reanchors to an accepted prefix, the runtime
 translates the global visibility bounds according to page ownership; a change
 in the global token count is not the same change in the local token count.
 
+Ascend DSA uses this same placement contract for both latent KV and Index-K.
+Its placement keeps forward-scoped local write slots: the MLA prolog and
+indexer, across layers sharing that placement, reuse the first translation.
+Every metadata refresh and pool rebind invalidates this scratch. Graph
+capture records the translation once, so replay recomputes it from the
+refreshed virtual slots rather than retaining a previous round's values.
+Compact read metadata is also shared within a forward: the same table and
+length views, page geometry and selection windows reuse the first preparation.
+Different row spans or windows refresh it; a new forward, capture setup or pool
+rebind invalidates it even when input addresses are unchanged. Graph replay
+executes the recorded preparation against refreshed inputs once, not once per
+DSA layer. Per-layer Index-K writes and index scores are never shared.
+Writers resolve virtual slots through `resolve_cache_slots`; the Ascend
+scatter/prolog ABI represents skipped writes with -1. Its indexer and sparse
+attention consume the common `CompactDCPLayout` local page table, including
+the scheduler-block-to-kernel-page ratio. Initial/local selection windows
+are translated through the owned-page prefix, not through a second ownership
+formula. Prefill and verify queries carry their own global causal endpoints.
+The Top-K exchange selects rank/candidate pairs; selected indices remain
+offsets in that rank's compact history, which sparse attention reads through
+the same local table before the LSE merge. They are not global cache slots.
+
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
 size and each group's declared demand: a replicated full-history group holds

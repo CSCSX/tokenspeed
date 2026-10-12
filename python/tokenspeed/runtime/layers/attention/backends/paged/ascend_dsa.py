@@ -42,9 +42,13 @@ from tokenspeed.runtime.execution.forward_step import (
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
-    PositionPreservingDCPLayout,
-    PositionPreservingDCPMetadata,
+    CompactDCPLayout,
+    CompactDCPMetadata,
     refresh_dcp_page_table_metadata,
+)
+from tokenspeed.runtime.layers.attention.dcp.placement import (
+    CachePlacement,
+    resolve_cache_slots,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -57,6 +61,34 @@ from tokenspeed.runtime.utils.device_stream import (
 
 # Fixed page geometry of Ascend SparseFlashAttentionDecode.
 ASCEND_SFAD_PAGE_SIZE = 128
+
+
+@dataclass(frozen=True)
+class _AscendCachePlacement(CachePlacement):
+    # Per-forward scratch, not persistent cache state. Keep the source alive
+    # so an allocator cannot reuse its address during the same forward.
+    write_slots: dict = dataclasses.field(default_factory=dict, compare=False)
+
+
+def ascend_cache_write_slots(locations, placement):
+    """Share one local-slot translation across MLA/indexer writes and layers.
+
+    The Ascend leaf clears this scratch at each metadata refresh and pool
+    rebind. During capture the first use records the translation; later
+    layers reuse its output, which is recomputed by every graph replay.
+    Only this Ascend ABI uses -1 for non-owner writes; the common placement
+    helper retains its zero-address plus ownership-mask contract.
+    """
+    if placement is None:
+        return locations
+    key = (locations.data_ptr(), locations.shape, locations.stride(), locations.dtype)
+    if isinstance(placement, _AscendCachePlacement) and key in placement.write_slots:
+        return placement.write_slots[key][1]
+    local, owned = resolve_cache_slots(locations, placement)
+    local = torch.where(owned, local, -1)
+    if isinstance(placement, _AscendCachePlacement):
+        placement.write_slots[key] = (locations, local)
+    return local
 
 
 @dataclass(frozen=True)
@@ -77,64 +109,6 @@ class _AscendDCPKernelMetadata:
     seq_lens: torch.Tensor
     init_counts: torch.Tensor
     local_counts: torch.Tensor
-
-
-def _compact_dcp_kernel_metadata(
-    *,
-    placement: PositionPreservingDCPMetadata,
-    seq_lens: torch.Tensor,
-    page_size: int,
-    init_tokens: int,
-    local_tokens: int,
-) -> _AscendDCPKernelMetadata:
-    """Adapt canonical DCP ownership to the Ascend indexer kernel ABI."""
-    page_table = placement.virtual_page_table
-    if seq_lens.ndim != 1 or seq_lens.shape[0] != page_table.shape[0]:
-        raise ValueError("DCP seq_lens must have one entry per page-table row")
-    if page_size <= 0:
-        raise ValueError("DCP page_size must be positive")
-    if init_tokens < 0 or local_tokens < 0:
-        raise ValueError("DCP init/local token counts must be nonnegative")
-
-    columns = torch.arange(page_table.shape[1], device=page_table.device)
-    lengths_i64 = seq_lens.to(torch.int64)
-    valid_columns = columns.unsqueeze(0) < (
-        (lengths_i64.unsqueeze(1) + page_size - 1) // page_size
-    )
-    owned = placement.owner_mask & valid_columns
-    mapped = torch.where(owned, page_table, 0)
-    permutation = (~owned).to(torch.int32).argsort(dim=1, stable=True)
-    compact_table = mapped.gather(1, permutation)
-    page_tokens = (
-        lengths_i64.unsqueeze(1) - columns.to(torch.int64).unsqueeze(0) * page_size
-    ).clamp(min=0, max=page_size)
-    local_lengths = (page_tokens * owned).sum(dim=1).to(torch.int32)
-
-    def count_window(positions: torch.Tensor) -> torch.Tensor:
-        valid = positions < lengths_i64.unsqueeze(1)
-        page_columns = (positions // page_size).clamp_max(page_table.shape[1] - 1)
-        return (valid & owned.gather(1, page_columns)).sum(dim=1, dtype=torch.int32)
-
-    batch = lengths_i64.shape[0]
-    init_positions = (
-        torch.arange(init_tokens, device=page_table.device, dtype=torch.int64)
-        .unsqueeze(0)
-        .expand(batch, -1)
-    )
-    local_offsets = (
-        torch.arange(local_tokens, device=page_table.device, dtype=torch.int64)
-        .unsqueeze(0)
-        .expand(batch, -1)
-    )
-    local_positions = (lengths_i64 - local_tokens).clamp_min(0).unsqueeze(
-        1
-    ) + local_offsets
-    return _AscendDCPKernelMetadata(
-        page_table=compact_table,
-        seq_lens=local_lengths,
-        init_counts=count_window(init_positions),
-        local_counts=count_window(local_positions),
-    )
 
 
 class _AscendDSAContextParallel:
@@ -162,13 +136,15 @@ class _AscendDSAContextParallel:
         self.primary_process_group = None
         self.auxiliary_process_group = None
         self.virtual_block_count = virtual_block_count
-        self.page_placement: PositionPreservingDCPMetadata | None = None
+        self.page_placement: CompactDCPMetadata | None = None
         self.page_table: torch.Tensor | None = None
         self.seq_lens: torch.Tensor | None = None
         self.init_counts: torch.Tensor | None = None
         self.local_counts: torch.Tensor | None = None
         self._metadata_buffers: dict[str, torch.Tensor] = {}
         self._decode_rows_capacity: int | None = None
+        self._prepared_metadata_key: tuple | None = None
+        self._metadata_sources: tuple[torch.Tensor, ...] = ()
 
         if degree > 1 and dist.is_initialized() and dist.get_world_size() > max(ranks):
             self.primary_process_group = pg_manager.get_device_process_group(ranks)
@@ -176,10 +152,51 @@ class _AscendDSAContextParallel:
                 ranks, auxiliary_namespace
             )
 
+    def clear_forward_metadata(self) -> None:
+        """Invalidate layer-shared results before the next forward/capture."""
+        self._prepared_metadata_key = None
+        self._metadata_sources = ()
+
+    def prepare_metadata(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        page_size: int,
+        block_granularity: int,
+        init_tokens: int,
+        local_tokens: int,
+    ) -> None:
+        # New views of the same rows share results, but different row spans or
+        # selection windows must refresh. Sources stay alive until invalidation.
+        key = (
+            tuple(
+                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device)
+                for t in (seq_lens, page_table)
+            ),
+            page_size,
+            block_granularity,
+            init_tokens,
+            local_tokens,
+        )
+        if key == self._prepared_metadata_key:
+            return
+        self.refresh_metadata(
+            seq_lens=seq_lens,
+            page_table=page_table,
+            page_size=page_size,
+            block_granularity=block_granularity,
+            init_tokens=init_tokens,
+            local_tokens=local_tokens,
+        )
+        self._metadata_sources = (seq_lens, page_table)
+        self._prepared_metadata_key = key
+
     def bind_virtual_block_count(self, virtual_block_count: int) -> None:
         """Bind the scheduler capacity published by the cache arena."""
         if virtual_block_count <= 1:
             raise ValueError("DSA CP cache must contain usable virtual blocks")
+        self.clear_forward_metadata()
         if self.virtual_block_count != virtual_block_count:
             self.virtual_block_count = virtual_block_count
             self.page_placement = None
@@ -198,11 +215,13 @@ class _AscendDSAContextParallel:
 
     def allocate_decode_buffers(self, rows: int, columns: int, device) -> None:
         """Keep all decode metadata at stable addresses across batch sizes."""
+        self.clear_forward_metadata()
         self._metadata_buffers = {
             name: torch.empty(shape, dtype=torch.int32, device=device)
             for name, shape in (
                 ("query_page_table", (rows, columns)),
                 ("query_seq_lens", (rows,)),
+                ("query_ends", (rows,)),
                 ("page_table", (rows, columns)),
                 ("seq_lens", (rows,)),
                 ("init_counts", (rows,)),
@@ -235,31 +254,60 @@ class _AscendDSAContextParallel:
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         page_size: int,
+        block_granularity: int,
         init_tokens: int,
         local_tokens: int,
     ) -> None:
+        self.clear_forward_metadata()
         virtual_block_count = self.virtual_block_count
         if virtual_block_count is None:
             raise RuntimeError("DSA CP cache metadata was not bound")
+        # Translate global selection windows through the common owned-page
+        # prefix, including blocks containing multiple kernel pages.
+        visible = torch.stack(
+            (
+                seq_lens.clamp_max(init_tokens),
+                (seq_lens - local_tokens).clamp_min(0),
+                seq_lens,
+            ),
+            dim=1,
+        )
+        previous = self.page_placement
+        if previous is not None and previous.local_page_table.shape != page_table.shape:
+            previous = None
         self.page_placement = refresh_dcp_page_table_metadata(
             page_table=page_table,
             virtual_block_count=virtual_block_count,
             degree=self.degree,
             rank=self.rank,
-            layout=PositionPreservingDCPLayout(),
-            previous=self.page_placement,
+            layout=CompactDCPLayout(
+                seq_lens=seq_lens,
+                page_size=page_size,
+                block_granularity=block_granularity,
+                visible_lens=visible,
+            ),
+            previous=previous,
         )
-        metadata = _compact_dcp_kernel_metadata(
-            placement=self.page_placement,
-            seq_lens=seq_lens,
-            page_size=page_size,
-            init_tokens=init_tokens,
-            local_tokens=local_tokens,
+        metadata = self.page_placement
+        endpoints = metadata.local_visible_lens
+        assert endpoints is not None
+        if self._decode_rows_capacity is not None and (
+            seq_lens.shape[0] > self._decode_rows_capacity
+            or page_table.shape[1:] != self._metadata_buffers["page_table"].shape[1:]
+        ):
+            # Prefill can have a different shape from the decode graph ladder.
+            # Use this call's common metadata without replacing decode buffers.
+            self.page_table = metadata.local_page_table
+            self.seq_lens = metadata.local_seq_lens
+            self.init_counts = endpoints[:, 0].contiguous()
+            self.local_counts = endpoints[:, 2] - endpoints[:, 1]
+            return
+        self.page_table = self._copy_buffer("page_table", metadata.local_page_table)
+        self.seq_lens = self._copy_buffer("seq_lens", metadata.local_seq_lens)
+        self.init_counts = self._copy_buffer("init_counts", endpoints[:, 0])
+        self.local_counts = self._copy_buffer(
+            "local_counts", endpoints[:, 2] - endpoints[:, 1]
         )
-        self.page_table = self._copy_buffer("page_table", metadata.page_table)
-        self.seq_lens = self._copy_buffer("seq_lens", metadata.seq_lens)
-        self.init_counts = self._copy_buffer("init_counts", metadata.init_counts)
-        self.local_counts = self._copy_buffer("local_counts", metadata.local_counts)
 
     def metadata(self, *, start: int, end: int) -> _AscendDCPKernelMetadata:
         values = (self.page_table, self.seq_lens, self.init_counts, self.local_counts)
@@ -371,6 +419,8 @@ class AscendDSABackend(DSABackend):
         self._stream_fork = StreamFork(new_device_stream())
         self._decode_query_page_table: torch.Tensor | None = None
         self._decode_query_seq_lens: torch.Tensor | None = None
+        self._decode_query_ends: torch.Tensor | None = None
+        self._ascend_placement: _AscendCachePlacement | None = None
         dcp_size = int(config.dcp_size)
         if dcp_size > 1:
             self._indexer_kernels.require_context_parallel()
@@ -390,6 +440,8 @@ class AscendDSABackend(DSABackend):
         )
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        self._ascend_placement = None
+        self._dcp.clear_forward_metadata()
         super()._publish_cache_pool(cache_pool)
         if self._dcp.degree > 1:
             counts = cache_pool.arena.runtime_contract.virtual_block_counts
@@ -397,10 +449,29 @@ class AscendDSABackend(DSABackend):
                 raise ValueError("DSA CP requires a full-attention cache group")
             self._dcp.bind_virtual_block_count(counts[FULL_ATTENTION])
 
+    def cache_placement(self, layer) -> CachePlacement | None:
+        if self._ascend_placement is None:
+            placement = super().cache_placement(layer)
+            if placement is not None:
+                self._ascend_placement = _AscendCachePlacement(
+                    placement.block_granularity,
+                    placement.virtual_block_count,
+                    placement.group,
+                    placement.rank,
+                )
+        return self._ascend_placement
+
+    def _clear_forward_scratch(self) -> None:
+        if self._ascend_placement is not None:
+            self._ascend_placement.write_slots.clear()
+        self._dcp.clear_forward_metadata()
+
     def init_cuda_graph_state(self, max_bs: int) -> None:
+        self._clear_forward_scratch()
         super().init_cuda_graph_state(max_bs)
         self._decode_query_page_table = None
         self._decode_query_seq_lens = None
+        self._decode_query_ends = None
         self._dcp.allocate_decode_buffers(
             max_bs * self.spec_num_tokens, self.max_num_pages, self.device
         )
@@ -415,6 +486,7 @@ class AscendDSABackend(DSABackend):
         num_extends: int = 0,
         for_graph_replay: bool = False,
     ) -> None:
+        self._clear_forward_scratch()
         self._dense_backend.refresh_decode_metadata(
             bs,
             actual_bs,
@@ -437,6 +509,10 @@ class AscendDSABackend(DSABackend):
         self._decode_query_page_table = self._dcp._copy_buffer(
             "query_page_table", query_table
         )
+        self._decode_query_ends = self._dcp._copy_buffer(
+            "query_ends",
+            torch.arange(1, bs * width + 1, dtype=torch.int32, device=seq_lens.device),
+        )
 
     def init_forward_metadata(
         self,
@@ -453,11 +529,15 @@ class AscendDSABackend(DSABackend):
         extend_with_prefix: bool,
         **kwargs,
     ):
+        self._clear_forward_scratch()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "DSA decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend/mixed ({forward_mode})"
             )
+        self._decode_query_ends = torch.arange(
+            1, bs * self.spec_num_tokens + 1, dtype=torch.int32, device=seq_lens.device
+        )
         self._dense_backend.init_forward_metadata(
             bs,
             num_extends,
@@ -509,7 +589,9 @@ class AscendDSABackend(DSABackend):
         index_cache = pool.get_component(layer.layer_id, "dsa_index_k")
         page = self.kernel_page_size
         index_cache = index_cache.view(-1, page, 1, spec.index_head_dim)
-        kernels.scatter(kwargs["index_key"].contiguous(), index_cache, out_cache_loc)
+        placement = self.cache_placement(layer)
+        index_slots = ascend_cache_write_slots(out_cache_loc, placement)
+        kernels.scatter(kwargs["index_key"].contiguous(), index_cache, index_slots)
         if self.step_counter is not None:
             self.step_counter.record_cache()
         if not context_parallel or self._dcp.degree == 1:
@@ -539,10 +621,11 @@ class AscendDSABackend(DSABackend):
             raise RuntimeError("LongCat DSA CP process group was not configured")
         # Model-owned selection parameters arrive with the indexer inputs.
         # Prepare precisely these query rows, including each verify candidate.
-        self._dcp.refresh_metadata(
+        self._dcp.prepare_metadata(
             seq_lens=kv_lengths,
             page_table=table,
             page_size=page,
+            block_granularity=placement.block_granularity,
             init_tokens=init_tokens,
             local_tokens=local_tokens,
         )
@@ -823,16 +906,37 @@ class AscendDSABackend(DSABackend):
         self._validate_logit_cap(layer.logit_cap)
         metadata = self.forward_prefill_metadata
         head_major_output = kwargs.pop("head_major_output", False)
+        q_ends = metadata.cum_extend_seq_lens[1:].to(torch.int32)
+        kv_lengths = metadata.seq_lens.to(torch.int32)
+        table = metadata.page_table
+        context_parallel = self._dcp.degree > 1
+        if context_parallel:
+            # Compact history drops foreign pages. Translate each prefill
+            # query's global causal endpoint, as verify does; local KV lengths
+            # cannot be used to infer the global Q offsets.
+            starts = metadata.cum_extend_seq_lens[:-1]
+            requests = torch.repeat_interleave(
+                torch.arange(bs, device=q.device),
+                q_ends - starts,
+                output_size=q.shape[0],
+            )
+            positions = torch.arange(q.shape[0], device=q.device)
+            kv_lengths = (kv_lengths[requests] - q_ends[requests] + positions + 1).to(
+                torch.int32
+            )
+            table = table[requests]
+            q_ends = torch.arange(1, q.shape[0] + 1, device=q.device, dtype=torch.int32)
         selection = self._select_indexed(
             q,
             k,
             layer,
             out_cache_loc,
             token_to_kv_pool,
-            metadata.cum_extend_seq_lens[1:].to(torch.int32),
-            metadata.seq_lens.to(torch.int32),
-            metadata.page_table,
+            q_ends,
+            kv_lengths,
+            table,
             kwargs,
+            context_parallel=context_parallel,
         )
         return self._run_indexed_sparse_attention(
             selection,
@@ -910,7 +1014,7 @@ class AscendDSABackend(DSABackend):
             layer,
             out_cache_loc,
             token_to_kv_pool,
-            torch.arange(1, q.shape[0] + 1, dtype=torch.int32, device=q.device),
+            self._decode_query_ends[: q.shape[0]],
             query_lengths,
             query_table,
             kwargs,
