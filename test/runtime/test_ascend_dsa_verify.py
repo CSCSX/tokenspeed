@@ -29,11 +29,11 @@ def test_both_dsa_modules_are_imported():
     assert _BACKEND_REGISTRY["dsa"][1] is DSABackend
 
 
-def test_ascend_mla_prologue_is_limited_to_native_absorbed_kv():
+def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     spec = KernelRegistry.get().get_by_name("ascend_composite_mla_prologue")
     assert spec is not None
     assert spec.capability.vendors == frozenset({"ascend"})
-    assert spec.traits["expanded"] == frozenset({False})
+    assert spec.traits["expanded"] == frozenset({False, True})
     assert spec.traits["kv_format"] == frozenset({"native"})
     assert spec.traits["store"] == frozenset({True})
 

@@ -278,7 +278,7 @@ def _write_latent(
     signatures=format_signatures(("query",), "dense", {torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
-        "expanded": frozenset({False}),
+        "expanded": BOOLS,
         "full_write": BOOLS,
         "kv_format": frozenset({"native"}),
         "kv_convert": frozenset({False}),

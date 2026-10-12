@@ -2011,3 +2011,38 @@ KVStore disabled, using the target router directly. Local offloaded prefill
 and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
 use the same batch, access and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
+
+### Ascend dense MLA over sharded pages
+
+The Ascend `tokenspeed_mla` leaf uses the same `CachePlacement` and
+`CompactDCPLayout` as Ascend DSA. It does not introduce plugin-owned page
+geometry. A verify window publishes one causal endpoint per query; compact
+metadata translates those endpoints into local KV lengths before attention.
+The prologue writes only the owning rank's cache rows.
+
+Ascend MLA and DSA share communication groups and collective wrappers in
+`dcp/ascend.py`. Dense MLA gathers query heads, evaluates packed FIA against
+local pages, exchanges partial outputs and natural-log LSE by head owner,
+and merges the KV shards before value projection. Its native merge currently
+requires eight shards; degree one bypasses exchange and merge. Empty shards
+have zero output and negative-infinite LSE; all-empty requests return zero.
+
+Packed FIA takes host length lists. The NPU kernel adapter binds each captured
+MLA invocation to its own local-length mirror and refreshes it before graph
+update, instead of installing the runner's global sequence lengths. Pool
+rebind discards the backend's old metadata views and length bindings.
+Model-specific projection weights and Lite composition remain in the plugin;
+no plugin attention-backend override or DCP implementation is needed.
+
+Validate on eight Ascend devices with the packed FIA and KVP merge operators
+installed:
+
+```bash
+torchrun --standalone --nproc-per-node=8 test/runtime/distributed/run_ascend_mla_dcp.py
+torchrun --standalone --nproc-per-node=8 test/runtime/distributed/run_ascend_mla_lifecycle.py
+```
+
+The first test checks dense CPU-oracle parity, empty shards, verify causality,
+accepted-prefix continuation and dynamic graph replay. The second checks
+prefill, cached prefill, page reuse, and subsequent projected/gated decode.
+Neither substitutes for end-to-end model accuracy testing.

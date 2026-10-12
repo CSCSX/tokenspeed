@@ -25,6 +25,16 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+
+def ascend_mla_dcp_kernels():
+    """Return the Ascend packed MLA partial/merge and graph-length adapter."""
+    if not current_platform().is_npu:
+        raise RuntimeError("Ascend MLA DCP kernels require an NPU platform")
+    from tokenspeed_kernel_npu.ops import mla_dcp
+
+    return mla_dcp
+
+
 if current_platform().is_npu:
     from tokenspeed_kernel_npu.ops.mla import (
         mla_decode_with_kvcache as _mla_decode_with_kvcache,

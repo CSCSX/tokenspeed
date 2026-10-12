@@ -26,14 +26,10 @@ import dataclasses
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_kernels
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
@@ -41,6 +37,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
+from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPContext
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
     CompactDCPMetadata,
@@ -111,7 +108,7 @@ class _AscendDCPKernelMetadata:
     local_counts: torch.Tensor
 
 
-class _AscendDSAContextParallel:
+class _AscendDSAContextParallel(AscendDCPContext):
     """Ascend DSA metadata and collectives for one context-parallel group."""
 
     def __init__(
@@ -123,18 +120,12 @@ class _AscendDSAContextParallel:
         auxiliary_namespace: str,
         virtual_block_count: int | None,
     ) -> None:
-        if degree <= 0:
-            raise ValueError("DSA CP degree must be positive")
-        if len(ranks) != degree:
-            raise ValueError("DSA CP rank group size does not match its degree")
-        if not 0 <= rank < degree:
-            raise ValueError("DSA CP rank is outside its group")
-
-        self.degree = degree
-        self.rank = rank
-        self.ranks = ranks
-        self.primary_process_group = None
-        self.auxiliary_process_group = None
+        super().__init__(
+            degree=degree,
+            rank=rank,
+            ranks=ranks,
+            auxiliary_namespace=auxiliary_namespace,
+        )
         self.virtual_block_count = virtual_block_count
         self.page_placement: CompactDCPMetadata | None = None
         self.page_table: torch.Tensor | None = None
@@ -145,12 +136,6 @@ class _AscendDSAContextParallel:
         self._decode_rows_capacity: int | None = None
         self._prepared_metadata_key: tuple | None = None
         self._metadata_sources: tuple[torch.Tensor, ...] = ()
-
-        if degree > 1 and dist.is_initialized() and dist.get_world_size() > max(ranks):
-            self.primary_process_group = pg_manager.get_device_process_group(ranks)
-            self.auxiliary_process_group = pg_manager.get_dedicated_device_group(
-                ranks, auxiliary_namespace
-            )
 
     def clear_forward_metadata(self) -> None:
         """Invalidate layer-shared results before the next forward/capture."""
@@ -204,14 +189,6 @@ class _AscendDSAContextParallel:
             self.seq_lens = None
             self.init_counts = None
             self.local_counts = None
-
-    @property
-    def ready(self) -> bool:
-        return self.degree == 1 or self.primary_process_group is not None
-
-    @property
-    def has_auxiliary(self) -> bool:
-        return self.auxiliary_process_group is not None
 
     def allocate_decode_buffers(self, rows: int, columns: int, device) -> None:
         """Keep all decode metadata at stable addresses across batch sizes."""
@@ -324,39 +301,6 @@ class _AscendDSAContextParallel:
             init_counts=init_counts[start:end],
             local_counts=local_counts[start:end],
         )
-
-    def _process_group(self, *, auxiliary: bool):
-        group = self.auxiliary_process_group if auxiliary else None
-        return self.primary_process_group if group is None else group
-
-    def all_gather(self, tensor: torch.Tensor, *, auxiliary: bool) -> torch.Tensor:
-        group = self._process_group(auxiliary=auxiliary)
-        if group is None:
-            if self.degree == 1:
-                return tensor
-            raise RuntimeError("DSA CP process group was not configured")
-        output = torch.empty(
-            (self.degree * tensor.shape[0],) + tensor.shape[1:],
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        dist.all_gather_into_tensor(output, tensor, group=group)
-        return output
-
-    def all_to_all(
-        self,
-        output: torch.Tensor,
-        input_tensor: torch.Tensor,
-        *,
-        auxiliary: bool,
-    ) -> None:
-        group = self._process_group(auxiliary=auxiliary)
-        if group is None:
-            if self.degree == 1:
-                output.copy_(input_tensor)
-                return
-            raise RuntimeError("DSA CP process group was not configured")
-        dist.all_to_all_single(output, input_tensor, group=group)
 
 
 class AscendDSABackend(DSABackend):
