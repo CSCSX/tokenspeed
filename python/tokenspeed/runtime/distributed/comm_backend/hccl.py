@@ -148,7 +148,11 @@ class HcclBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        """Reduce rank-major rows, padding only unequal token counts."""
         max_tokens = max(scattered_num_tokens)
+        # Equal rank-major slices already have the collective's input layout.
+        if all(tokens == max_tokens for tokens in scattered_num_tokens):
+            return self.reduce_scatter(tensor.contiguous(), group)
         padded = tensor.new_zeros(
             len(group) * max_tokens,
             tensor.shape[-1],
