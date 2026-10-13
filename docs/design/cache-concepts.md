@@ -2031,7 +2031,7 @@ Packed FIA takes host length lists. The NPU kernel adapter binds each captured
 MLA invocation to its own local-length mirror and refreshes it before graph
 update, instead of installing the runner's global sequence lengths. Pool
 rebind discards the backend's old metadata views and length bindings.
-Model-specific projection weights and Lite composition remain in the plugin;
+Model-specific projection weights and composition remain with the model;
 no plugin attention-backend override or DCP implementation is needed.
 
 Validate on eight Ascend devices with the packed FIA and KVP merge operators
