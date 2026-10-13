@@ -56,6 +56,13 @@ class IrisBackend(CommBackend):
         )
 
     @property
+    def default_capacities(self) -> tuple[int, int]:
+        return (
+            self._max_numel,
+            self._producer_direct_max_bytes // torch.bfloat16.itemsize,
+        )
+
+    @property
     def producer_direct_max_bytes(self) -> int:
         return self._producer_direct_max_bytes
 

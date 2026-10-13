@@ -468,6 +468,30 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
             dtype=torch.bfloat16,
             backend=None,
         )
+        from tokenspeed_kernel.ops.communication.iris import (
+            IrisAllReduce,
+            configure_iris,
+            iris_heap_bytes,
+        )
+
+        # This test retains BF16, FP16, and FP32 operations in the same heap.
+        configure_iris(
+            heap_size=iris_heap_bytes(
+                sum(
+                    IrisAllReduce.heap_bytes(
+                        min(
+                            capacities["staged_max_numel"],
+                            backend.default_capacities[0],
+                        ),
+                        capacities["producer_direct_max_numel"],
+                        world_size,
+                        dtype,
+                    )
+                    for dtype in DTYPES
+                )
+            ),
+            allocator_type=None,
+        )
         assert prepare_all_reduce_buffers(group, **capacities)
         staged = torch.full((128,), rank + 1, dtype=torch.bfloat16, device=device)
         torch.testing.assert_close(

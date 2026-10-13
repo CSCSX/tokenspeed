@@ -1441,6 +1441,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
         chunked_prefill_size=8192,
+        iris_heap_size=None,
         attention_backend=None,
         drafter_attention_backend=None,
         disable_cudagraph_memory_reserve=not probe,

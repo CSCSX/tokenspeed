@@ -1251,9 +1251,6 @@ def build_device_side(
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
     )
-    with startup_phase("multimodal.init"):
-        if server_args.disaggregation_mode in ("null", "prefill"):
-            target.prepare_multimodal_runtime()
     max_forward_tokens = (
         server_args.chunked_prefill_size
         if server_args.chunked_prefill_size > 0
@@ -1263,6 +1260,14 @@ def build_device_side(
         max_forward_tokens,
         max_batch_size * decode_input_tokens,
     )
+    from tokenspeed.runtime.distributed.iris import plan_iris_buffers
+
+    plan_iris_buffers(
+        (target, draft), max_forward_tokens, heap_size=server_args.iris_heap_size
+    )
+    with startup_phase("multimodal.init"):
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            target.prepare_multimodal_runtime()
     with startup_phase("communication.prepare"):
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:

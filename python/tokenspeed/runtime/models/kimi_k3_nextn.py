@@ -343,6 +343,18 @@ class KimiK3NextNForCausalLM(nn.Module):
             dp_lm_head_tp=False,
         )
 
+    def iris_buffer_requirements(self, max_num_tokens: int) -> dict:
+        from tokenspeed.runtime.models.kimi_k3 import k3_iris_buffer_requirements
+
+        return k3_iris_buffer_requirements(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=(
+                self.config.routed_expert_hidden_size or self.config.hidden_size
+            ),
+            max_num_tokens=max_num_tokens,
+        )
+
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         routed_hidden_size = (
             self.config.routed_expert_hidden_size
@@ -545,6 +557,9 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
         )
         self.logits_processor = self.language_model.logits_processor
         self.lm_head = self.language_model.lm_head
+
+    def iris_buffer_requirements(self, max_num_tokens: int) -> dict:
+        return self.language_model.iris_buffer_requirements(max_num_tokens)
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         return self.language_model.prepare_communication_runtime(max_num_tokens)

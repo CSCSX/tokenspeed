@@ -233,6 +233,7 @@ def test_the_boot_floor_reads_both_knobs(
         all2all_backend="none",
         prefill_graph_max_tokens=ceiling,
         chunked_prefill_size=8192,
+        iris_heap_size=None,
         max_total_tokens=None,
         prefill_graph_capture_batch_sizes=capture_batch_sizes,
         max_num_seqs=max_num_seqs,
@@ -336,6 +337,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     server_args = SimpleNamespace(
         disaggregation_mode="null",
         chunked_prefill_size=8192,
+        iris_heap_size=None,
         attention_backend=None,
         drafter_attention_backend=None,
         disable_cudagraph_memory_reserve=False,

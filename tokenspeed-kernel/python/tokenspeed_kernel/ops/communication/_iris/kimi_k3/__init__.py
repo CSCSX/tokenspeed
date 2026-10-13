@@ -211,6 +211,48 @@ class K3IrisState:
         )
 
 
+def k3_communication_heap_bytes(
+    *,
+    world_size: int,
+    staged_max_numel: int,
+    producer_direct_max_numel: int,
+    attnres_max_numel: int,
+    attnres_max_rows: int,
+    enable_lamport: bool,
+    sharded_max_rows: int,
+    dtype: torch.dtype,
+) -> int:
+    """Return the aligned symmetric storage for one group's K3 operations."""
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+        IrisAllReduceShardedState,
+    )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
+        IrisAttnResState,
+    )
+    from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
+
+    total_bytes = IrisAllReduce.heap_bytes(
+        staged_max_numel, producer_direct_max_numel, world_size, dtype
+    )
+    if attnres_max_numel:
+        total_bytes += IrisAttnResState.heap_bytes(
+            attnres_max_numel, attnres_max_rows, world_size, dtype
+        )
+    if enable_lamport and ProducerLamport.supported(world_size, dtype):
+        lamport_numel = min(producer_direct_max_numel // (3584 + 7168), 6) * (
+            3584 + 7168
+        )
+        if lamport_numel:
+            total_bytes += ProducerLamport.heap_bytes(lamport_numel)
+    sharded_bytes = (
+        IrisAllReduceShardedState.heap_bytes(sharded_max_rows, world_size, dtype)
+        if sharded_max_rows
+        else 0
+    )
+    return total_bytes + sharded_bytes
+
+
 def prepare_k3_communication(
     *,
     group: dist.ProcessGroup,
@@ -232,19 +274,13 @@ def prepare_k3_communication(
     or None creates it. The returned state owns all model-specific storage.
     """
     from tokenspeed_kernel.ops.communication._iris import (
-        HEAP_HEADROOM_BYTES,
-        MIN_HEAP_BYTES,
         IrisGroup,
         get_or_create_context,
     )
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         IrisAllReduceShardedState,
     )
-    from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
-        IrisAttnResState,
-    )
-    from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
+    from tokenspeed_kernel.ops.communication.iris import IrisAllReduce, iris_heap_bytes
 
     world_size = group.size()
     if (
@@ -279,33 +315,17 @@ def prepare_k3_communication(
         IrisAllReduceShardedState.validate_capacity(
             sharded_max_rows, world_size, dtype, producer_direct_max_numel
         )
-    total_bytes = (
-        IrisAllReduce.heap_bytes(
-            staged_max_numel, producer_direct_max_numel, world_size, dtype
-        )
-        if all_reduce is None
-        else 0
+    heap_size = k3_communication_heap_bytes(
+        world_size=world_size,
+        staged_max_numel=staged_max_numel,
+        producer_direct_max_numel=producer_direct_max_numel,
+        attnres_max_numel=attnres_max_numel,
+        attnres_max_rows=attnres_max_rows,
+        enable_lamport=enable_lamport,
+        sharded_max_rows=sharded_max_rows,
+        dtype=dtype,
     )
-    if attnres_max_numel:
-        total_bytes += IrisAttnResState.heap_bytes(
-            attnres_max_numel, attnres_max_rows, world_size, dtype
-        )
-    if enable_lamport and ProducerLamport.supported(world_size, dtype):
-        lamport_numel = min(producer_direct_max_numel // (3584 + 7168), 6) * (
-            3584 + 7168
-        )
-        if lamport_numel:
-            total_bytes += ProducerLamport.heap_bytes(lamport_numel)
-    sharded_bytes = (
-        IrisAllReduceShardedState.heap_bytes(sharded_max_rows, world_size, dtype)
-        if sharded_max_rows
-        else 0
-    )
-    # Preserve the base heap's headroom for other collective operations.
-    ctx = get_or_create_context(
-        heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
-        + sharded_bytes,
-    )
+    ctx = get_or_create_context(heap_size=iris_heap_bytes(heap_size))
     if all_reduce is None:
         all_reduce = IrisAllReduce(
             IrisGroup(ctx, group, rank_in_group, device),

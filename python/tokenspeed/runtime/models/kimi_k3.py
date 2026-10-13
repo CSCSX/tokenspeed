@@ -1656,25 +1656,23 @@ _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
 
 
-def prepare_k3_all_reduce_buffers(
+def k3_iris_buffer_requirements(
     *,
     mapping,
     hidden_size: int,
     routed_hidden_size: int,
     max_num_tokens: int,
-    states: dict[tuple[int, ...], "K3IrisState"],
-) -> bool:
-    """Prepare and retain each node-local group's Iris buffers before capture."""
+) -> dict:
+    """Describe K3 capacities without allocating the shared Iris heap."""
     if not current_platform().is_cdna4:
-        return False
+        return {}
 
     max_num_tokens = min(max_num_tokens, _IRIS_MAX_TOKENS)
     if max_num_tokens <= 0:
-        return False
+        return {}
 
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
         allreduce_residual_attnres_max_tokens,
-        prepare_k3_communication,
     )
     from tokenspeed_kernel.ops.communication.iris import IRIS_ALL_REDUCE_MAX_BYTES
 
@@ -1683,64 +1681,18 @@ def prepare_k3_all_reduce_buffers(
 
     backend = get_global_backend()
     if not isinstance(backend, AutoBackend):
-        return False
+        return {}
 
-    def prepare_group(
-        group,
-        *,
-        staged_max_numel,
-        producer_direct_max_numel,
-        attnres_max_numel,
-        attnres_max_rows,
-        enable_lamport,
-        moe_tail_max_rows,
-    ):
+    requirements = {}
+
+    def add_group(group, **capacities):
         if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
-            return False
-        staged_max_numel = min(
-            staged_max_numel, IRIS_ALL_REDUCE_MAX_BYTES // torch.bfloat16.itemsize
+            return
+        capacities["staged_max_numel"] = min(
+            capacities["staged_max_numel"],
+            IRIS_ALL_REDUCE_MAX_BYTES // torch.bfloat16.itemsize,
         )
-        state = states.get(group)
-        if state is not None:
-            if (
-                state.all_reduce.staged_max_numel < staged_max_numel
-                or state.all_reduce.producer_direct_max_numel
-                < producer_direct_max_numel
-                or state.enable_lamport != enable_lamport
-                or (
-                    attnres_max_rows
-                    and (
-                        state.attnres is None
-                        or state.attnres.max_rows < attnres_max_rows
-                        or state.attnres.max_numel < attnres_max_numel
-                    )
-                )
-                or (
-                    moe_tail_max_rows
-                    and (
-                        state.sharded is None
-                        or state.sharded.output.shape[0] < moe_tail_max_rows
-                    )
-                )
-            ):
-                raise RuntimeError("Cannot grow a prepared K3 Iris state")
-            return True
-        state = prepare_k3_communication(
-            group=_get_process_group(group),
-            rank_in_group=group.index(torch.distributed.get_rank()),
-            staged_max_numel=staged_max_numel,
-            producer_direct_max_numel=producer_direct_max_numel,
-            attnres_max_numel=attnres_max_numel,
-            attnres_max_rows=attnres_max_rows,
-            enable_lamport=enable_lamport,
-            sharded_max_rows=moe_tail_max_rows,
-            dtype=torch.bfloat16,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-            all_reduce=backend.iris.state(group, torch.bfloat16),
-        )
-        backend.iris.install(group, state.all_reduce)
-        states[group] = state
-        return True
+        requirements[group] = capacities
 
     attnres_max_rows = min(
         max_num_tokens,
@@ -1776,9 +1728,8 @@ def prepare_k3_all_reduce_buffers(
         and max_num_tokens >= _IRIS_MOE_ROW_SHARD_MIN_TOKENS
         else 0
     )
-    prepared = False
     if mapping.attn.tp_size > 1:
-        prepared = prepare_group(
+        add_group(
             mapping.attn.tp_group,
             staged_max_numel=max_num_tokens * hidden_size,
             producer_direct_max_numel=(
@@ -1789,23 +1740,108 @@ def prepare_k3_all_reduce_buffers(
             attnres_max_numel=attnres_max_rows * hidden_size,
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
-            moe_tail_max_rows=moe_tail_max_rows,
+            sharded_max_rows=moe_tail_max_rows,
         )
     if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
-        prepared = (
-            prepare_group(
-                mapping.moe.tp_ep_group,
-                staged_max_numel=max_num_tokens * hidden_size,
-                producer_direct_max_numel=producer_direct_max_tokens
-                * (hidden_size + routed_hidden_size),
-                attnres_max_numel=0,
-                attnres_max_rows=0,
-                enable_lamport=False,
-                moe_tail_max_rows=0,
-            )
-            or prepared
+        add_group(
+            mapping.moe.tp_ep_group,
+            staged_max_numel=max_num_tokens * hidden_size,
+            producer_direct_max_numel=producer_direct_max_tokens
+            * (hidden_size + routed_hidden_size),
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            enable_lamport=False,
+            sharded_max_rows=0,
         )
-    return prepared
+    return requirements
+
+
+def prepare_k3_all_reduce_buffers(
+    *,
+    mapping,
+    hidden_size: int,
+    routed_hidden_size: int,
+    max_num_tokens: int,
+    states: dict[tuple[int, ...], "K3IrisState"],
+) -> bool:
+    """Prepare and retain each node-local group's Iris buffers before capture."""
+    requirements = k3_iris_buffer_requirements(
+        mapping=mapping,
+        hidden_size=hidden_size,
+        routed_hidden_size=routed_hidden_size,
+        max_num_tokens=max_num_tokens,
+    )
+    if not requirements:
+        return False
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        prepare_k3_communication,
+    )
+    from tokenspeed_kernel.ops.communication.iris import IRIS_ALL_REDUCE_MAX_BYTES
+
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+
+    backend = get_global_backend()
+
+    def prepare_group(
+        group,
+        *,
+        staged_max_numel,
+        producer_direct_max_numel,
+        attnres_max_numel,
+        attnres_max_rows,
+        enable_lamport,
+        sharded_max_rows,
+    ):
+        if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
+            return False
+        staged_max_numel = min(
+            staged_max_numel, IRIS_ALL_REDUCE_MAX_BYTES // torch.bfloat16.itemsize
+        )
+        state = states.get(group)
+        if state is not None:
+            if (
+                state.all_reduce.staged_max_numel < staged_max_numel
+                or state.all_reduce.producer_direct_max_numel
+                < producer_direct_max_numel
+                or state.enable_lamport != enable_lamport
+                or (
+                    attnres_max_rows
+                    and (
+                        state.attnres is None
+                        or state.attnres.max_rows < attnres_max_rows
+                        or state.attnres.max_numel < attnres_max_numel
+                    )
+                )
+                or (
+                    sharded_max_rows
+                    and (
+                        state.sharded is None
+                        or state.sharded.output.shape[0] < sharded_max_rows
+                    )
+                )
+            ):
+                raise RuntimeError("Cannot grow a prepared K3 Iris state")
+            return True
+        state = prepare_k3_communication(
+            group=_get_process_group(group),
+            rank_in_group=group.index(torch.distributed.get_rank()),
+            staged_max_numel=staged_max_numel,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
+            sharded_max_rows=sharded_max_rows,
+            dtype=torch.bfloat16,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            all_reduce=backend.iris.state(group, torch.bfloat16),
+        )
+        backend.iris.install(group, state.all_reduce)
+        states[group] = state
+        return True
+
+    for group, capacities in requirements.items():
+        prepare_group(group, **capacities)
+    return True
 
 
 # Captured graphs retain each shape's address across later batches and layers.
@@ -3805,6 +3841,16 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
 
+    def iris_buffer_requirements(self, max_num_tokens: int) -> dict:
+        return k3_iris_buffer_requirements(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=(
+                self.config.routed_expert_hidden_size or self.config.hidden_size
+            ),
+            max_num_tokens=max_num_tokens,
+        )
+
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
             layer.block_sparse_moe.shared_experts
@@ -4319,6 +4365,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode does not expose text embeddings."
             )
         return self.language_model.model.get_input_embeddings()
+
+    def iris_buffer_requirements(self, max_num_tokens: int) -> dict:
+        return self.language_model.iris_buffer_requirements(max_num_tokens)
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         if self.language_model is None:

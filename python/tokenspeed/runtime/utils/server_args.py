@@ -648,6 +648,7 @@ class ServerArgs:
 
     # For communication + norm fusion
     comm_fusion_max_num_tokens: int = 2048
+    iris_heap_size: int | None = None
     enable_allreduce_fusion: bool = False
 
     enable_expert_parallel: bool = False
@@ -3655,6 +3656,12 @@ class ServerArgs:
             default="null",
             choices=["null", "prefill", "decode", "encode"],
             help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
+        )
+        parser.add_argument(
+            "--iris-heap-size",
+            type=int,
+            default=ServerArgs.iris_heap_size,
+            help="Iris symmetric heap capacity in bytes; omitted sizes it from all prepared buffers.",
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",

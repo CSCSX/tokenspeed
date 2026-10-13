@@ -107,16 +107,38 @@ def _moe_tail_worker(rank: int, port: int) -> None:
 
 def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        k3_communication_heap_bytes,
         prepare_k3_communication,
     )
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3moe_pull_scatter,
         iris_k3moe_push_gather,
     )
-    from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
+    from tokenspeed_kernel.ops.communication.iris import (
+        IrisAllReduceResidualRMSNorm,
+        configure_iris,
+        create_iris_ar_rmsnorm_state,
+        iris_heap_bytes,
+    )
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 
+    configure_iris(
+        heap_size=iris_heap_bytes(
+            k3_communication_heap_bytes(
+                world_size=8,
+                staged_max_numel=0,
+                producer_direct_max_numel=8192 * 10752,
+                attnres_max_numel=0,
+                attnres_max_rows=0,
+                enable_lamport=True,
+                sharded_max_rows=8192,
+                dtype=torch.bfloat16,
+            )
+            + IrisAllReduceResidualRMSNorm.heap_bytes(2048, 7168, torch.bfloat16)
+        ),
+        allocator_type=None,
+    )
     k3_state = prepare_k3_communication(
         group=group,
         rank_in_group=rank,
@@ -132,7 +154,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     )
     state = k3_state.all_reduce
     sharded = k3_state.sharded
-    # Check that the shared heap still has room for EAGLE3's reduction state.
+    # Budget K3 and EAGLE3 together before either claims the shared heap.
     rmsnorm_state = create_iris_ar_rmsnorm_state(
         group=group,
         rank_in_group=rank,

@@ -220,6 +220,30 @@ def _ar_worker_main(
         attnres_max_rows = 16 if world_size == 8 else 0
         attnres_max_numel = attnres_max_rows * 7168
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+            k3_communication_heap_bytes,
+        )
+        from tokenspeed_kernel.ops.communication.iris import (
+            IrisAllReduce,
+            iris_heap_bytes,
+        )
+
+        other_dtype_max_numel = 16 * (7168 + 3584)
+        heap_size = k3_communication_heap_bytes(
+            world_size=world_size,
+            staged_max_numel=staged_max_numel,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            enable_lamport=False,
+            sharded_max_rows=0,
+            dtype=torch.bfloat16,
+        ) + sum(
+            IrisAllReduce.heap_bytes(0, other_dtype_max_numel, world_size, dtype)
+            for dtype in (torch.float16, torch.float32)
+        )
+        heap_size = iris_heap_bytes(heap_size)
+        configure_iris(heap_size=heap_size, allocator_type=allocator_type)
         state = create_iris_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -229,6 +253,7 @@ def _ar_worker_main(
             heap_size=None,
             device=device,
         )
+        assert state.peers.ctx.heap_size == heap_size < 256 << 20
         if world_size == 4 and current_platform().is_cdna4:
             assert state.tuned_staged.slots.data_ptr() != state.staged.slots.data_ptr()
             assert (
@@ -316,7 +341,6 @@ def _ar_worker_main(
 
         # These dtype checks only use the small shape. Their states share the
         # fixed heap, so do not allocate another full BF16 prefill capacity.
-        other_dtype_max_numel = 16 * (7168 + 3584)
         fp16_state = create_iris_state(
             group=dist.group.WORLD,
             rank_in_group=rank,

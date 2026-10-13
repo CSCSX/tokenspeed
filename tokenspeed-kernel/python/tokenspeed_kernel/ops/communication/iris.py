@@ -50,6 +50,19 @@ _PRODUCER_DIRECT_GL_DTYPES = {
 IRIS_AR_RMSNORM_STATES: dict = {}
 
 
+def iris_heap_bytes(buffer_bytes: int) -> int:
+    """Add the shared device barrier to an operation-buffer budget in bytes."""
+    from tokenspeed_kernel.ops.communication._iris import (
+        allocation_bytes,
+        allocator_name,
+    )
+
+    barrier_bytes = allocation_bytes((dist.get_world_size(),), torch.int32)
+    # Iris VMem reserves a prefix for the initial exported mapping.
+    prefix_bytes = max(2 << 20, barrier_bytes) if allocator_name() == "vmem" else 0
+    return buffer_bytes + barrier_bytes + prefix_bytes
+
+
 def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None:
     """Configure the shared context before preparing any Iris collective.
 
@@ -287,20 +300,16 @@ def create_iris_state(
     if min(staged_max_numel, producer_direct_max_numel) < 0:
         raise ValueError("Iris all-reduce capacities must be non-negative")
     from tokenspeed_kernel.ops.communication._iris import (
-        HEAP_HEADROOM_BYTES,
-        MIN_HEAP_BYTES,
         IrisGroup,
         get_or_create_context,
     )
 
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
     if heap_size is None:
-        heap_size = max(
-            MIN_HEAP_BYTES,
+        heap_size = iris_heap_bytes(
             IrisAllReduce.heap_bytes(
                 staged_max_numel, producer_direct_max_numel, group.size(), dtype
             )
-            + HEAP_HEADROOM_BYTES,
         )
     ctx = get_or_create_context(heap_size=heap_size)
     peers = IrisGroup(ctx, group, rank_in_group, device)
@@ -337,6 +346,13 @@ def iris_all_reduce_symmetric(
 
 class IrisAllReduceResidualRMSNorm(object):
 
+    @staticmethod
+    def heap_bytes(max_token_num: int, hidden_dim: int, dtype: torch.dtype) -> int:
+        """Return the aligned symmetric input storage for the fused reduction."""
+        from tokenspeed_kernel.ops.communication._iris import allocation_bytes
+
+        return allocation_bytes((max_token_num, hidden_dim), dtype)
+
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -369,8 +385,9 @@ class IrisAllReduceResidualRMSNorm(object):
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
         if heap_size is None:
-            buf_bytes = max_token_num * hidden_dim * dtype.itemsize
-            heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
+            heap_size = iris_heap_bytes(
+                self.heap_bytes(max_token_num, hidden_dim, dtype)
+            )
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         from tokenspeed_kernel.ops.communication._iris import get_or_create_context
 

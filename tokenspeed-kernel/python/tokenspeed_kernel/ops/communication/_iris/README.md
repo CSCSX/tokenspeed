@@ -5,8 +5,11 @@ prepared operation retains its buffers; execution never searches for a suitable
 state. Allocate in the same order on participating ranks before graph capture;
 prepared capacities and addresses stay fixed.
 
-The first preparation sizes the shared heap. Later states allocate from that
-same fixed heap; Iris's allocator enforces capacity.
+Serving budgets the shared heap from all target and draft buffer requirements,
+including allocation alignment. There is no minimum heap size or fixed headroom.
+`--iris-heap-size BYTES` overrides the automatic total; an undersized override
+fails before allocation. Standalone callers sharing several operations must pass
+their combined capacity to `configure_iris` before preparing the first state.
 
 - **State:** the persistent buffers and references needed by an operation.
 - **Epoch:** a GPU counter that distinguishes successive uses of synchronization
@@ -40,6 +43,6 @@ from tokenspeed_kernel.ops.communication.iris import configure_iris
 configure_iris(heap_size=None, allocator_type="torch")
 ```
 
-`heap_size=None` sizes the heap automatically. `allocator_type=None` uses Iris's
+`heap_size=None` sizes a standalone heap for its first operation. `allocator_type=None` uses Iris's
 default (`torch` in the pinned version). Names pass through to Iris;
 `IRIS_ALLOCATOR` takes precedence. A live context cannot be reconfigured.
