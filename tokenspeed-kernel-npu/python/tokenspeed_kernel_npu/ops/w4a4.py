@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Post-load preparation for FlatQuant INT4 fused operators (no split fallback)."""
+"""FlatQuant INT4 preparation and explicitly selected expert implementations."""
 
 import math
 from dataclasses import dataclass
@@ -71,6 +71,74 @@ class W4A4MoePlan:
     first: FlatQuantStage
     second: FlatQuantStage
     transposed: bool
+
+
+@dataclass(frozen=True)
+class W4A4GroupedPlan:
+    weights: W4A4MoePlan
+    scale13: torch.Tensor
+    scale2: torch.Tensor
+
+
+def prepare_w4a4_grouped_plan(weights: W4A4MoePlan) -> W4A4GroupedPlan:
+    """Encode official GMM scales once; share the fused path's NZ weights."""
+
+    def encode(scale):
+        bits = scale.cpu().contiguous().view(torch.int32).to(torch.int64)
+        return (bits & 0xFFFFFFFF).view(torch.uint64).unsqueeze(1).to(scale.device)
+
+    return W4A4GroupedPlan(weights, encode(weights.scale13), encode(weights.scale2))
+
+
+def w4a4_grouped_experts(x, counts, *, rows, plan: W4A4GroupedPlan):
+    """Execute sorted, unpadded rows with Cube FlatQuant and two separate GMMs.
+
+    ``counts`` is INT64 [local_experts], containing row counts, not offsets.
+    ``rows`` gathers input tokens into contiguous expert order. FlatQuant13
+    runs once per input token before that gather. No EP communication
+    happens here. NZ-transposed weights are passed as transpose views, not
+    repacked in forward. GMM's BF16 output has the official FP16 intermediate
+    rounding, unlike the fused operator's INT32/vector dequantization.
+    """
+    import flash_ops  # noqa: F401
+    import torch_npu
+
+    if rows.numel() == 0:
+        return x.new_empty((0, x.shape[1]))
+    state = plan.weights
+
+    def quantize(value, stage):
+        packed, scales = torch.ops.custom.flat_quant(
+            value.reshape(value.shape[0], stage.left.shape[0], stage.right.shape[0]),
+            stage.left,
+            stage.right,
+            clip_ratio=stage.clip,
+            dst_dtype=16,
+            group_list_type=1,
+        )
+        return packed.flatten(1), scales.float()
+
+    def matmul(value, scales, weight, weight_scale):
+        if state.transposed:
+            weight = weight.transpose(-1, -2)
+        return torch_npu.npu_grouped_matmul(
+            [value],
+            [weight],
+            scale=[weight_scale],
+            per_token_scale=[scales],
+            group_list=counts,
+            split_item=3,
+            output_dtype=torch.bfloat16,
+            group_type=0,
+            group_list_type=1,
+        )[0]
+
+    packed, scales = quantize(x, state.first)
+    packed, scales = packed[rows], scales[rows]
+    hidden = matmul(packed, scales, state.w13, plan.scale13)
+    hidden = torch_npu.npu_swiglu(hidden, dim=-1)
+    packed, scales = quantize(hidden, state.second)
+    return matmul(packed, scales, state.w2, plan.scale2)
 
 
 def prepare_flatquant_stage(left, right, clip, *, width: int) -> FlatQuantStage:

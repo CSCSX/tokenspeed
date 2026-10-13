@@ -24,10 +24,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tokenspeed_kernel_npu.ops.w4a4 import (
+    FlatQuantStage,
     W4A4MoePlan,
     ascend_int4_precomputed_moe_apply,
     pack_int4,
     prepare_flatquant_stage,
+    prepare_w4a4_grouped_plan,
     prepare_w4a4_moe_weights,
     require_fused_flatquant,
     unpack_int4,
@@ -41,6 +43,28 @@ def test_signed_nibble_order_and_range():
     assert torch.equal(unpack_int4(packed), values)
     with pytest.raises(ValueError, match="range|\\[-8,7\\]"):
         pack_int4(torch.full((8,), 8, dtype=torch.int8))
+
+
+def test_grouped_plan_shares_weights_and_encodes_scales_without_numeric_cast():
+    matrix = torch.eye(8).bfloat16()
+    stage = FlatQuantStage(matrix, matrix, 0.875)
+    scale13 = torch.tensor([[0.004, 0.5], [1.25, 2.0]])
+    scale2 = scale13[:, :1].contiguous()
+    state = W4A4MoePlan(
+        torch.empty(2, 2, 8, dtype=torch.int32),
+        torch.empty(2, 1, 8, dtype=torch.int32),
+        scale13,
+        scale2,
+        stage,
+        stage,
+        True,
+    )
+    plan = prepare_w4a4_grouped_plan(state)
+    assert plan.weights is state
+    for encoded, expected in ((plan.scale13, scale13), (plan.scale2, scale2)):
+        assert encoded.dtype == torch.uint64
+        bits = encoded.view(torch.int64).squeeze(1).to(torch.int32)
+        torch.testing.assert_close(bits.view(torch.float32), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("transposed", (False, True))
