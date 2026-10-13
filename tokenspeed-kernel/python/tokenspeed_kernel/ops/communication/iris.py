@@ -63,6 +63,13 @@ def iris_heap_bytes(buffer_bytes: int) -> int:
     return buffer_bytes + barrier_bytes + prefix_bytes
 
 
+def prepare_iris_heap(*, heap_size: int) -> None:
+    """Create the shared context and barrier at the planned byte capacity."""
+    from tokenspeed_kernel.ops.communication._iris import get_or_create_context
+
+    get_or_create_context(heap_size=heap_size)
+
+
 def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None:
     """Configure the shared context before preparing any Iris collective.
 
@@ -509,6 +516,32 @@ def create_iris_ar_rmsnorm_state(
         device=device,
         persistent=persistent,
     )
+
+
+def prepare_iris_ar_rmsnorm(
+    *,
+    group: dist.ProcessGroup,
+    rank_in_group: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+) -> IrisAllReduceResidualRMSNorm:
+    """Prepare or reuse the fused reduction for a group, row capacity and width."""
+    key = (id(group), max_token_num, hidden_dim, dtype)
+    state = IRIS_AR_RMSNORM_STATES.get(key)
+    if state is None:
+        state = create_iris_ar_rmsnorm_state(
+            group=group,
+            rank_in_group=rank_in_group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            heap_size=None,
+            device=None,
+            persistent=False,
+        )
+        IRIS_AR_RMSNORM_STATES[key] = state
+    return state
 
 
 def iris_allreduce_residual_rmsnorm(

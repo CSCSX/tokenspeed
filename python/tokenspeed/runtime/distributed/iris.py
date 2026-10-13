@@ -148,6 +148,35 @@ class IrisBufferPlan:
             f"Iris heap: {self.heap_size} bytes ({required} required by communication buffers)"
         )
 
+    def prepare(self) -> bool:
+        """Allocate planned states before cache profiling or any model warmup."""
+        if not self.heap_size:
+            return False
+        from tokenspeed_kernel.ops.communication.iris import (
+            prepare_iris_ar_rmsnorm,
+            prepare_iris_heap,
+        )
+
+        prepare_iris_heap(heap_size=self.heap_size)
+        backend = get_global_backend()
+        for group, (staged, producer) in self.all_reduce.items():
+            backend.prepare_all_reduce_buffers(
+                group,
+                staged_max_numel=staged,
+                producer_direct_max_numel=producer,
+                dtype=torch.bfloat16,
+            )
+        for group, rows, width in sorted(self.rmsnorm):
+            process_group = process_group_manager.get_device_process_group(group)
+            prepare_iris_ar_rmsnorm(
+                group=process_group,
+                rank_in_group=group.index(dist.get_rank()),
+                max_token_num=rows,
+                hidden_dim=width,
+                dtype=torch.bfloat16,
+            )
+        return True
+
 
 def plan_iris_buffers(
     runners, max_num_tokens: int, *, heap_size: int | None

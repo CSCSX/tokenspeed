@@ -556,6 +556,72 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
         global_server_args_dict["force_deterministic_rsag"] = previous_force
 
 
+def _test_eager_iris_buffers(rank, world_size, device, group, ref_group):
+    from tokenspeed_kernel.ops.communication.iris import IRIS_AR_RMSNORM_STATES
+
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+    from tokenspeed.runtime.distributed.iris import plan_iris_buffers
+    from tokenspeed.runtime.layers.layernorm import RMSNorm
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    global_server_args_dict["force_deterministic_rsag"] = False
+    global_server_args_dict["comm_fusion_max_num_tokens"] = 64
+    norm = RMSNorm(4096).to(device=device, dtype=torch.bfloat16)
+    runner = SimpleNamespace(
+        model=norm,
+        mapping=global_server_args_dict["mapping"],
+        model_config=SimpleNamespace(hidden_size=4096, dtype=torch.bfloat16),
+        server_args=SimpleNamespace(
+            enable_allreduce_fusion=True, comm_fusion_max_num_tokens=64
+        ),
+    )
+    # Equal target/draft requirements share the same prepared states.
+    plan = plan_iris_buffers((runner, runner), 8192, heap_size=None)
+    assert plan.prepare()
+    state = get_global_backend().iris.state(group, torch.bfloat16)
+    norm_state = IRIS_AR_RMSNORM_STATES[id(ref_group), 64, 4096, torch.bfloat16]
+    assert state.peers.ctx.heap_size == plan.heap_size < 256 << 20
+    pointers = (state.producer.data.data_ptr(), norm_state._input_buf.data_ptr())
+    torch.manual_seed(rank)
+    partial = torch.randint(-8, 8, (16, 4096), dtype=torch.bfloat16, device=device)
+    residual = torch.full_like(partial, 0.25)
+    expected = partial.clone()
+    dist.all_reduce(expected, group=ref_group)
+    expected_residual = expected.float() + residual.float()
+    expected_norm = expected_residual * torch.rsqrt(
+        expected_residual.square().mean(-1, keepdim=True) + 1e-6
+    )
+
+    def forward():
+        reduced = all_reduce(partial.clone(), group)
+        normalized, residual_out, *_ = norm.forward_with_allreduce_fusion(
+            rank, group, partial, residual
+        )
+        return reduced, normalized, residual_out
+
+    # The first forward can be captured: no warmup may allocate missing Iris state.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = forward()
+    for _ in range(3):
+        graph.replay()
+        torch.testing.assert_close(outputs[0], expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            outputs[1], expected_norm.bfloat16(), atol=0.02, rtol=0.01
+        )
+        torch.testing.assert_close(
+            outputs[2], expected_residual.bfloat16(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(forward()[0], expected, atol=0, rtol=0)
+    assert get_global_backend().iris.state(group, torch.bfloat16) is state
+    assert IRIS_AR_RMSNORM_STATES[id(ref_group), 64, 4096, torch.bfloat16] is norm_state
+    assert pointers == (
+        state.producer.data.data_ptr(),
+        norm_state._input_buf.data_ptr(),
+    )
+
+
 def _test_all_gather(rank, world_size, device, group, ref_group):
     from tokenspeed.runtime.distributed.comm_ops import all_gather
 
@@ -979,6 +1045,13 @@ WORLD_SIZES = [
 
 
 class TestCommOps:
+    def test_eager_iris_buffers(self):
+        from tokenspeed_kernel.platform import current_platform
+
+        if not current_platform().is_cdna4 or importlib.util.find_spec("iris") is None:
+            pytest.skip("Iris communication requires CDNA4 and Iris")
+        _run(4, _test_eager_iris_buffers)
+
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_all_reduce(self, world_size):
         _run(world_size, _test_all_reduce)

@@ -1628,12 +1628,12 @@ The contract a model (in tree or a plugin) implements:
   are therefore no longer refused on a pipeline split
   (`supports_prompt_logprobs` depends on the narrowing-model check only).
 * Communication buffers (`prepare_communication_runtime(max_forward_tokens)`)
-  stay sized by the whole chunk under QCP, not `ceil(chunk / qcp)`: the
+  are allocated before cache sizing and model warmup, including generic Iris
+  reductions and fused RMSNorm shared by the target and draft. They stay sized by the whole chunk under QCP, not `ceil(chunk / qcp)`: the
   all-gather / reduce-scatter legs' gathered side is the whole chunk on
   every rank (the dense and MoE legs gather the shard rows to the group), so
-  only buffers of local rows could shrink, and the one model that prepares
-  such buffers today does not shard queries. Revisit with a per-buffer
-  audit when a sharding model allocates them.
+  only buffers of local rows could shrink. Any reduction of their capacities
+  needs a per-buffer audit of the sharded and gathered sides.
 
 **Head TP over the query shards** (`--attn-head-tp-size N` with
 `--prefill-context-parallel-size N`). The query shards hold different rows,

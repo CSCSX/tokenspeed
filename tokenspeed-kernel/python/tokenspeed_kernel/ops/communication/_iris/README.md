@@ -23,9 +23,10 @@ explicit: K3 fusions reuse producer storage and pull scratch, with producers
 finished and consumers ordered on one stream. Sharded activations are borrowed;
 ordinary producer-direct reductions return results in independent storage.
 
-`IrisBackend` retains generic operations by group and dtype. K3 additionally
-prepares `K3IrisState` before cache sizing and binds it to attention, MoE,
-and NextN callers. Other models initialize during warmup. Calls select among
+Serving prepares generic reductions and fused RMSNorm before model warmup,
+cache sizing and graph capture. `IrisBackend` retains generic operations by
+group and dtype. K3 additionally binds `K3IrisState` to attention, MoE, and NextN
+callers. Calls select among
 prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.

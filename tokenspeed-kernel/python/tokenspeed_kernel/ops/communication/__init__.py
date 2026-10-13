@@ -168,17 +168,13 @@ def allreduce_residual_rmsnorm(
             and group.size() > 1
             and token_num <= max_token_num
         ):
-            key = (id(group), max_token_num, hidden_dim, input_tensor.dtype)
-            state = iris_ops.IRIS_AR_RMSNORM_STATES.get(key)
-            if state is None:
-                state = iris_ops.create_iris_ar_rmsnorm_state(
-                    group=group,
-                    rank_in_group=rank,
-                    max_token_num=max_token_num,
-                    hidden_dim=hidden_dim,
-                    dtype=input_tensor.dtype,
-                )
-                iris_ops.IRIS_AR_RMSNORM_STATES[key] = state
+            state = iris_ops.prepare_iris_ar_rmsnorm(
+                group=group,
+                rank_in_group=rank,
+                max_token_num=max_token_num,
+                hidden_dim=hidden_dim,
+                dtype=input_tensor.dtype,
+            )
             norm_out, residual_out = iris_ops.iris_allreduce_residual_rmsnorm(
                 state,
                 input_tensor=input_tensor,

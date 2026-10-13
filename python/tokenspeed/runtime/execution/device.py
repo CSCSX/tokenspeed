@@ -1262,16 +1262,19 @@ def build_device_side(
     )
     from tokenspeed.runtime.distributed.iris import plan_iris_buffers
 
-    plan_iris_buffers(
+    iris_plan = plan_iris_buffers(
         (target, draft), max_forward_tokens, heap_size=server_args.iris_heap_size
     )
-    with startup_phase("multimodal.init"):
-        if server_args.disaggregation_mode in ("null", "prefill"):
-            target.prepare_multimodal_runtime()
     with startup_phase("communication.prepare"):
+        if iris_plan is not None:
+            iris_plan.prepare()
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+
+    with startup_phase("multimodal.init"):
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            target.prepare_multimodal_runtime()
 
     post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
     if post_profile_bytes:
