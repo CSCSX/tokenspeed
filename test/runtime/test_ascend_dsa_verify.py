@@ -38,6 +38,49 @@ def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     assert spec.traits["store"] == frozenset({True})
 
 
+@pytest.mark.parametrize("degree,rank", [(1, 0), (8, 3)])
+def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank):
+    # Mock device initialization, but keep the NPU constructor and its topology
+    # checks. The config deliberately has no legacy dcp_* attributes.
+    def initialize_base(self, config, spec, *, kernel_page_size):
+        self.is_draft = config.is_draft
+        self.spec_num_tokens = 8
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
+
+    monkeypatch.setattr(DSABackend, "__init__", initialize_base)
+    monkeypatch.setattr(ascend_dsa, "new_device_stream", lambda: None)
+    monkeypatch.setattr(ascend_dsa, "StreamFork", lambda stream: None)
+    monkeypatch.setattr(
+        ascend_dsa,
+        "ascend_dsa_kernels",
+        lambda: SimpleNamespace(require_context_parallel=lambda: None),
+    )
+    config = SimpleNamespace(
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method=None,
+        is_draft=False,
+        kvp_size=degree,
+        kvp_rank=rank,
+        kvp_group=tuple(range(degree)),
+    )
+    spec = SimpleNamespace(
+        is_dsa=True,
+        index_k_format="bf16",
+        attn_tp_size=degree,
+        num_attention_heads=2 * degree,
+    )
+    backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+    assert (backend._dcp.degree, backend._dcp.rank, backend._dcp.ranks) == (
+        degree,
+        rank,
+        config.kvp_group,
+    )
+    if degree > 1:
+        spec.attn_tp_size = 1
+        with pytest.raises(ValueError, match="complete head-TP group"):
+            ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+
+
 def test_ascend_write_translation_is_shared_and_refreshed(monkeypatch):
     placement = ascend_dsa._AscendCachePlacement(128, 17, tuple(range(8)), 1)
     slots = torch.tensor([128, 256, 0, 257], dtype=torch.int64)

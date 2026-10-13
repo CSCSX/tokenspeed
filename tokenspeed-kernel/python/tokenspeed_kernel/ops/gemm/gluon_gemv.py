@@ -49,6 +49,8 @@ no workspace, atomics or split-K.
 
 from __future__ import annotations
 
+from functools import cache
+
 import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
 from tokenspeed_kernel.ops.gemm.triton_gemv import _BF16_FP32_SIG
@@ -71,7 +73,6 @@ _WIDE_TILES = ((24, _TILE_8X2), (32, _TILE_8X4), (48, _TILE_4X4))
 _WIDE_LONG_K_TILES = ((32, _TILE_8X4), (48, _TILE_4X4))
 
 
-@gluon.jit
 def _simt_gemm_kernel(
     x_ptr,
     w_ptr,
@@ -150,6 +151,13 @@ def _simt_gemm_kernel(
     gl.store(out_ptrs, total, mask=(orow3 < M) & (ocol3 >= 0))
 
 
+@cache
+def _simt_gemm_jit():
+    # Initialize the GPU frontend only when this NVIDIA kernel is selected.
+    # Triton-Ascend can import the registration without a Gluon installation.
+    return gluon.jit(_simt_gemm_kernel)
+
+
 def _simt_tile(
     m: int, n: int, k: int, x_dtype: torch.dtype
 ) -> tuple[int, int, int, int]:
@@ -226,7 +234,7 @@ def gluon_simt_gemm_fp32(
     if m == 0 or n == 0 or k == 0:
         return out.zero_()
     bm_w, bn_w, wm, wn = _simt_tile(m, n, k, x.dtype)
-    _simt_gemm_kernel[(n // (bn_w * wn), triton.cdiv(m, bm_w * wm))](
+    _simt_gemm_jit()[(n // (bn_w * wn), triton.cdiv(m, bm_w * wm))](
         x,
         weight,
         out,

@@ -365,7 +365,7 @@ class AscendDSABackend(DSABackend):
         self._decode_query_seq_lens: torch.Tensor | None = None
         self._decode_query_ends: torch.Tensor | None = None
         self._ascend_placement: _AscendCachePlacement | None = None
-        dcp_size = int(config.dcp_size)
+        dcp_size = int(config.kvp_size)
         if dcp_size > 1:
             self._indexer_kernels.require_context_parallel()
             if spec.attn_tp_size != dcp_size:
@@ -377,8 +377,8 @@ class AscendDSABackend(DSABackend):
                 raise ValueError("DSA DCP does not reconstruct all query heads")
         self._dcp = _AscendDSAContextParallel(
             degree=dcp_size,
-            rank=int(config.dcp_rank),
-            ranks=tuple(config.dcp_group),
+            rank=int(config.kvp_rank),
+            ranks=tuple(config.kvp_group),
             auxiliary_namespace="dsa_cp_aux",
             virtual_block_count=None,
         )

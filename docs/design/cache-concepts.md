@@ -2014,6 +2014,11 @@ in `unified_path.md`, "Sparse KV offloading".
 
 ### Ascend dense MLA over sharded pages
 
+Ascend MLA and DSA read page ownership from `AttnConfig.kvp_size`,
+`kvp_rank` and `kvp_group`, matching the GPU backends. DCP still names the
+decode computation over those pages; the KVP field rename does not change
+its head gathering, partial attention or LSE merge.
+
 The Ascend `tokenspeed_mla` leaf uses the same `CachePlacement` and
 `CompactDCPLayout` as Ascend DSA. It does not introduce plugin-owned page
 geometry. A verify window publishes one causal endpoint per query; compact

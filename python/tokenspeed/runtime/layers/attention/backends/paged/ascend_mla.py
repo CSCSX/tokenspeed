@@ -63,17 +63,17 @@ class AscendMLABackend(MLAAttnBackend):
             raise ValueError("NPU MLA DCP requires latent512 + auxiliary64")
         if kernel_page_size not in (64, 128):
             raise ValueError("NPU MLA DCP requires kernel pages of 64 or 128 tokens")
-        if config.dcp_size > 1 and config.dcp_size != spec.attn_tp_size:
+        if config.kvp_size > 1 and config.kvp_size != spec.attn_tp_size:
             raise ValueError("NPU MLA DCP must span the full attention TP group")
         super().__init__(
             config, replace(spec, backend_name=None), kernel_page_size=kernel_page_size
         )
-        if config.dcp_size not in (1, 8):
+        if config.kvp_size not in (1, 8):
             raise ValueError("Ascend MLA native merge supports DCP1/8")
         self._dcp = AscendDCPContext(
-            degree=int(config.dcp_size),
-            rank=int(config.dcp_rank),
-            ranks=tuple(config.dcp_group),
+            degree=int(config.kvp_size),
+            rank=int(config.kvp_rank),
+            ranks=tuple(config.kvp_group),
             auxiliary_namespace="mla_dcp_aux",
         )
         self._placement = None

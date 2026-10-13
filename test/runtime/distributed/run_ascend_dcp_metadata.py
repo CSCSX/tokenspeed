@@ -23,8 +23,8 @@
 import torch
 import torch_npu  # noqa: F401
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
-    compact_dcp_pages,
-    dcp_local_visible_lengths,
+    compact_kvp_pages,
+    kvp_local_visible_lengths,
 )
 
 torch.npu.set_device(0)
@@ -55,7 +55,7 @@ for rows, cols in [(1, 3), (8, 64), (64, 64), (2, 4096)]:
             )
 
             def run():
-                compact_dcp_pages(
+                compact_kvp_pages(
                     table_n,
                     lengths_n,
                     out=out,
@@ -64,7 +64,7 @@ for rows, cols in [(1, 3), (8, 64), (64, 64), (2, 4096)]:
                     **kwargs,
                 )
                 if prefix is not None:
-                    dcp_local_visible_lengths(
+                    kvp_local_visible_lengths(
                         prefix,
                         visible_n,
                         page_size=64,
@@ -99,7 +99,7 @@ for rows, cols in [(1, 3), (8, 64), (64, 64), (2, 4096)]:
                     if with_prefix
                     else None
                 )
-                compact_dcp_pages(
+                compact_kvp_pages(
                     table,
                     lengths,
                     out=expected,
@@ -109,7 +109,7 @@ for rows, cols in [(1, 3), (8, 64), (64, 64), (2, 4096)]:
                 )
                 if with_prefix:
                     expected_endpoints = torch.empty_like(visible)
-                    dcp_local_visible_lengths(
+                    kvp_local_visible_lengths(
                         expected_prefix,
                         visible,
                         page_size=64,

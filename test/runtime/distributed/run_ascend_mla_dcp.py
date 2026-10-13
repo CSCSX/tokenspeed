@@ -102,9 +102,9 @@ def run(B, W, L, G, degree, graph_test):
         draft_block_decode=False,
         speculative_num_draft_tokens=W,
         context_len=maxcontext,
-        dcp_size=degree,
-        dcp_rank=rank if degree > 1 else 0,
-        dcp_group=tuple(range(world)) if degree > 1 else (rank,),
+        kvp_size=degree,
+        kvp_rank=rank if degree > 1 else 0,
+        kvp_group=tuple(range(world)) if degree > 1 else (rank,),
     )
     backend = AscendMLABackend(config, spec, kernel_page_size=S)
     backend.configure_runtime(
