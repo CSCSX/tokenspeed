@@ -133,8 +133,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Container format: resolve the routed-expert scheme to a concrete MoE
         # kernel dtype. 4-bit group-32 weight-only: INT -> mxint4
         # (Kimi-K2.5 / K2.6 / K2.7), FLOAT -> mxfp4 (K3).
-        weight_quant = self.target_scheme_map["Linear"].get("weights")
-        input_quant = self.target_scheme_map["Linear"].get("input_activations")
+        # A MoE-specific scheme must not change shared/dense Linear quantization.
+        scheme = (
+            self.target_scheme_map.get("Moe", self.target_scheme_map.get("Linear"))
+            if current_platform().is_npu
+            else self.target_scheme_map.get("Linear")
+        )
+        if scheme is None:
+            raise ValueError("Missing MoE quantization scheme")
+        weight_quant = scheme.get("weights")
+        input_quant = scheme.get("input_activations")
+        if self._is_dynamic_token_int4(weight_quant, input_quant):
+            return "int4"
         if self._is_dynamic_token_int8(weight_quant, input_quant):
             return "int8"
         is_4bit_group32 = (
@@ -169,6 +179,28 @@ class CompressedTensorsConfig(QuantizationConfig):
             and not weight_quant.dynamic
             and input_quant.num_bits == 8
             and input_quant.type == QuantizationType.INT
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            and input_quant.symmetric
+            and input_quant.dynamic
+        )
+
+    def _is_dynamic_token_int4(self, weight_quant, input_quant) -> bool:
+        """Ascend FlatQuant W4A4, distinct from group-wise weight-only INT4."""
+        return (
+            current_platform().is_npu
+            and self.quant_format == CompressionFormat.int_quantized.value
+            and weight_quant is not None
+            and input_quant is not None
+            and weight_quant.num_bits == input_quant.num_bits == 4
+            and weight_quant.type == input_quant.type == QuantizationType.INT
+            and weight_quant.strategy
+            in (
+                QuantizationStrategy.CHANNEL.value,
+                QuantizationStrategy.TENSOR.value,
+            )
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and not weight_quant.actorder
             and input_quant.strategy == QuantizationStrategy.TOKEN.value
             and input_quant.symmetric
             and input_quant.dynamic
