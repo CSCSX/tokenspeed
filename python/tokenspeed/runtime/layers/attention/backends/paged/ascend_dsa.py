@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Ascend implementation of the paged LongCat DSA backend."""
+"""Ascend implementation of the paged DSA backend."""
 
 from __future__ import annotations
 
@@ -304,7 +304,7 @@ class _AscendDSAContextParallel(AscendDCPContext):
 
 
 class AscendDSABackend(DSABackend):
-    """LongCat DSA execution backed by Ascend indexer and sparse-attention ops."""
+    """Ascend DSA execution backed by Ascend indexer and sparse-attention ops."""
 
     # The decode path owns its DCP page placement and query exchange; the
     # generic MLA gate must accept this backend when attn_tp == dcp_size.
@@ -341,23 +341,21 @@ class AscendDSABackend(DSABackend):
         kernel_page_size: int,
     ) -> None:
         if not (spec.is_dsa and spec.index_k_format == "bf16"):
-            raise NotImplementedError(
-                "Ascend DSA currently requires the LongCat BF16 indexer/cache contract"
-            )
+            raise NotImplementedError("Ascend DSA currently requires BF16 index keys")
         if kernel_page_size != ASCEND_SFAD_PAGE_SIZE:
             raise ValueError(
                 "Ascend SparseFlashAttentionDecode requires "
                 f"kernel_page_size={ASCEND_SFAD_PAGE_SIZE}, got {kernel_page_size}"
             )
         if config.kv_cache_dtype != torch.bfloat16:
-            raise ValueError("LongCat DSA currently supports BF16 KV only")
+            raise ValueError("Ascend DSA currently supports BF16 KV only")
         if config.kv_cache_quant_method not in (None, "none"):
-            raise ValueError("LongCat DSA requires unquantized BF16 cache planes")
+            raise ValueError("Ascend DSA requires unquantized BF16 cache planes")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         if self.is_draft:
-            raise ValueError("LongCat DSA draft attention is disabled")
+            raise ValueError("Ascend DSA draft attention is disabled")
         if self.spec_num_tokens > 8:
-            raise ValueError("LongCat DSA verify supports at most 8 tokens")
+            raise ValueError("Ascend DSA verify supports at most 8 tokens")
         self._indexer_spec = spec
         self._indexer_kernels = ascend_dsa_kernels()
         self._stream_fork = StreamFork(new_device_stream())
@@ -562,7 +560,7 @@ class AscendDSABackend(DSABackend):
             )
 
         if not self._dcp.ready:
-            raise RuntimeError("LongCat DSA CP process group was not configured")
+            raise RuntimeError("Ascend DSA CP process group was not configured")
         # Model-owned selection parameters arrive with the indexer inputs.
         # Prepare precisely these query rows, including each verify candidate.
         self._dcp.prepare_metadata(
@@ -707,7 +705,7 @@ class AscendDSABackend(DSABackend):
         expected_width = spec.kv_lora_rank + spec.qk_rope_head_dim
         if selection.query.shape[-1] != expected_width:
             raise ValueError(
-                f"LongCat DSA query width must be {expected_width}, got "
+                f"Ascend DSA query width must be {expected_width}, got "
                 f"{selection.query.shape[-1]}"
             )
         kernels = self._indexer_kernels
@@ -922,16 +920,16 @@ class AscendDSABackend(DSABackend):
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
         if bs <= 0 or q.shape[0] % bs:
-            raise ValueError("LongCat DSA decode tokens must divide by requests")
+            raise ValueError("Ascend DSA decode tokens must divide by requests")
         tokens_per_request = q.shape[0] // bs
         if tokens_per_request not in (1, self.spec_num_tokens):
             raise ValueError(
-                "LongCat DSA decode requires one token or a complete verify "
+                "Ascend DSA decode requires one token or a complete verify "
                 "window per request"
             )
         if topk_indices is not None or topk_lens is not None:
             raise ValueError(
-                "LongCat DSA expects indexer projections, not global-slot TopK"
+                "Ascend DSA expects indexer projections, not global-slot TopK"
             )
         metadata = self.forward_decode_metadata
         start = metadata.num_extends
@@ -974,7 +972,7 @@ class AscendDSABackend(DSABackend):
 
 if current_platform().is_npu:
     register_backend(
-        "longcat_dsa",
+        "dsa",
         {AttentionArch.DSA},
         AscendDSABackend,
     )

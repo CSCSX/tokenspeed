@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
 from tokenspeed.runtime.layers.attention import backends
@@ -26,7 +27,8 @@ def test_ascend_backend_reuses_the_common_dsa_base():
 def test_both_dsa_modules_are_imported():
     assert backends.ascend_dsa is ascend_dsa
     assert backends.dsa.DSABackend is DSABackend
-    assert _BACKEND_REGISTRY["dsa"][1] is DSABackend
+    expected = ascend_dsa.AscendDSABackend if current_platform().is_npu else DSABackend
+    assert _BACKEND_REGISTRY["dsa"][1] is expected
 
 
 def test_ascend_mla_prologue_supports_native_prefill_and_decode():

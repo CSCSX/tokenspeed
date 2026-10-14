@@ -250,15 +250,11 @@ class AttnConfig:
                     raise ValueError("FlashMLA DCP decode requires CUDA")
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
-            elif softmax.is_dsa and softmax.backend_name == "longcat_dsa":
-                if torch.device(self.device).type != "npu":
-                    raise ValueError("LongCat DSA DCP requires Ascend NPU")
-                if self.is_draft:
-                    raise ValueError("LongCat DSA DCP draft attention is unsupported")
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
-                if torch.device(self.device).type != "cuda":
-                    raise ValueError("GPU DSA DCP decode requires CUDA")
-                if self.draft_block_decode:
+                device_type = torch.device(self.device).type
+                if device_type not in ("cuda", "npu"):
+                    raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")
+                if device_type == "cuda" and self.draft_block_decode:
                     raise ValueError(
                         "GPU DSA DCP decode does not yet support non-causal "
                         "block drafts"
@@ -271,7 +267,7 @@ class AttnConfig:
             elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DeepSeek V4, GPU DSA, FlashMLA or CuTe MLA attention"
+                    "DeepSeek V4, DSA, FlashMLA or CuTe MLA attention"
                 )
             else:
                 platform = current_platform()
