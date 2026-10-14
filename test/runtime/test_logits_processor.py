@@ -163,6 +163,48 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
         assert output.argmax(-1).item() == 1
 
 
+@pytest.mark.parametrize("is_nvidia", [False, True])
+def test_tp_logits_gather_queries_cuda_capture_only_for_nvidia(monkeypatch, is_nvidia):
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=6),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        dp_lm_head_tp=False,
+    )
+    hidden = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=torch.bfloat16)
+    peer_logits = torch.tensor([[4.0, 5.0, 6.0]], dtype=torch.bfloat16)
+    capture_calls = []
+
+    def capture_query():
+        assert is_nvidia, "non-CUDA backend must not query CUDA capture"
+        capture_calls.append(True)
+        return True
+
+    def collective(output, local, group):
+        assert group == (0, 1)
+        output.copy_(torch.cat((local, peer_logits), dim=0))
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=is_nvidia, is_amd=False),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capture_query)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    for _ in range(2):
+        actual = processor._get_logits(
+            hidden,
+            SimpleNamespace(weight=weight),
+            logits_metadata=None,
+            require_full_vocab=False,
+        )
+        expected = torch.cat((hidden @ weight.T, peer_logits), dim=-1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(capture_calls) == (2 if is_nvidia else 0)
+
+
 @pytest.mark.parametrize(
     "initializer_name",
     ["_init_all_gather_state", "_init_dist_argmax_state"],

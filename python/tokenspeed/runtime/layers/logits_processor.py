@@ -1019,7 +1019,10 @@ class LogitsProcessor(nn.Module):
             )
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
-                if torch.cuda.is_current_stream_capturing():
+                if (
+                    current_platform().is_nvidia
+                    and torch.cuda.is_current_stream_capturing()
+                ):
                     state = None
                 else:
                     state = self._all_gather_state = self._init_all_gather_state(
