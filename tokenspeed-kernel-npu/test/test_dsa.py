@@ -23,7 +23,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
+from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
 
 def test_full_scan_chunk_hints_are_cached_by_shape():

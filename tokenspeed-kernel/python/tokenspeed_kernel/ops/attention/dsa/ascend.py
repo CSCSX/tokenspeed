@@ -44,7 +44,7 @@ def ascend_dsa_kernels():
     if not platform.is_npu:
         raise RuntimeError("Ascend DSA kernels require an NPU platform")
     if _kernels is None:
-        from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
+        from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
         _kernels = AscendDSAKernels()
     return _kernels

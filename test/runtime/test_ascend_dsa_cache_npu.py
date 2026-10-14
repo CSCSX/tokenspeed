@@ -70,7 +70,7 @@ def test_shared_write_slots_recompute_on_graph_replay():
 @pytest.mark.parametrize("rank", [0, 1, 7])
 @pytest.mark.parametrize("block_size", [128, 256])
 def test_dcp_local_storage_replay(rank, block_size):
-    from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
     degree, virtual_count, page = 8, 17, 128
@@ -182,7 +182,7 @@ def test_dcp_topk_and_lse_match_unsharded_attention(endpoint):
     smoke separately exercises HCCL. Strictly ordered index scores make the
     global selected set independently checkable, including seven empty shards.
     """
-    from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
     torch.manual_seed(981016)
