@@ -607,14 +607,6 @@ request order stay unchanged, they reuse the compact tables and ownership
 prefixes from the full refresh and update local visibility in place. Eager
 execution and CUDA graph replay use the same hooks and persistent buffers.
 
-Ascend DSA target verify expands each request's decode metadata into one row
-per candidate, with that candidate's causal visible length and the request's
-page table. Its DCP adapter compacts each row to locally owned pages, and one
-indexer/attention forward consumes the whole request-major verify window.
-The buffers are allocated for the maximum decode batch before capture and
-refreshed in place for each batch size. A mixed round carrying one decode row
-uses request-shaped metadata instead of the expanded verify window.
-
 One named exception: draft-tree lanes (`docs/design/tree-speculation.md`)
 read `TreeDraftInputs`, which the drafter writes inside the round -- the
 frontier and lane window lengths once, then each step's lane masks, plus
@@ -1248,10 +1240,6 @@ rows and local token chunks. The builder sizes them from the existing host
 length mirror and fills both directly from device query boundaries in one
 Triton launch. Every layer reads the same tensors and block size; the conv
 wrapper neither rebuilds them nor initializes/uploads per-layer scratch.
-The metadata also retains host int64 sequence boundaries for registered
-convolution implementations that plan from host lengths; GPU Triton ignores
-that field. Decode and prefill select a registered convolution implementation
-through the same operator facade, leaving backend scheduling unchanged.
 This is transient execution metadata, not a new cache group or model state.
 
 The same extend/mixed metadata owns a device int64 mirror of the int32

@@ -62,15 +62,13 @@ the logical world neither knows nor cares.
 A fourth quantity lives outside the logical world entirely:
 
 * **`kernel_page_size`** — the token span of one attention-kernel page, a
-  property of the *kernel implementation*, not of the scheduler. Shared kernel
+  property of the *kernel implementation*, not of the scheduler. All kernel
   page geometry is registered in one file
   (`runtime/layers/attention/kernel_page_sizes.py`): fixed-page kernels pin a
   constant (FlashMLA = 64), constrained kernels choose within a supported
   set (trtllm-mla ∈ {32, 64}), and flexible kernels carry a chosen default.
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
-  from `prefix_granularity` is a category error and a bug. A fixed geometry
-  consumed by only one backend, such as Ascend DSA's 128-row pages, may live
-  with that backend; its resolver remains the single source for callers.
+  from `prefix_granularity` is a category error and a bug.
 
   DeepSeek V4's geometry is fully
   registry-sourced: the compressed full-history chains declare
@@ -1447,28 +1445,6 @@ When drafting advances or reanchors to an accepted prefix, the runtime
 translates the global visibility bounds according to page ownership; a change
 in the global token count is not the same change in the local token count.
 
-Ascend DSA uses this same placement contract for both latent KV and Index-K.
-Its placement keeps forward-scoped local write slots: the MLA prolog and
-indexer, across layers sharing that placement, reuse the first translation.
-Every metadata refresh and pool rebind invalidates this scratch. Graph
-capture records the translation once, so replay recomputes it from the
-refreshed virtual slots rather than retaining a previous round's values.
-Compact read metadata is also shared within a forward: the same table and
-length views, page geometry and selection windows reuse the first preparation.
-Different row spans or windows refresh it; a new forward, capture setup or pool
-rebind invalidates it even when input addresses are unchanged. Graph replay
-executes the recorded preparation against refreshed inputs once, not once per
-DSA layer. Per-layer Index-K writes and index scores are never shared.
-Writers resolve virtual slots through `resolve_cache_slots`; the Ascend
-scatter/prolog ABI represents skipped writes with -1. Its indexer and sparse
-attention consume the common `CompactDCPLayout` local page table, including
-the scheduler-block-to-kernel-page ratio. Initial/local selection windows
-are translated through the owned-page prefix, not through a second ownership
-formula. Prefill and verify queries carry their own global causal endpoints.
-The Top-K exchange selects rank/candidate pairs; selected indices remain
-offsets in that rank's compact history, which sparse attention reads through
-the same local table before the LSE merge. They are not global cache slots.
-
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
 size and each group's declared demand: a replicated full-history group holds
@@ -2011,49 +1987,3 @@ KVStore disabled, using the target router directly. Local offloaded prefill
 and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
 use the same batch, access and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
-
-### Ascend dense MLA over sharded pages
-
-Ascend MLA and DSA read page ownership from `AttnConfig.kvp_size`,
-`kvp_rank` and `kvp_group`, matching the GPU backends. DCP still names the
-decode computation over those pages; the KVP field rename does not change
-its head gathering, partial attention or LSE merge.
-
-The Ascend `tokenspeed_mla` leaf uses the same `CachePlacement` and
-`CompactDCPLayout` as Ascend DSA. It does not introduce plugin-owned page
-geometry. A verify window publishes one causal endpoint per query; compact
-metadata translates those endpoints into local KV lengths before attention.
-The prologue writes only the owning rank's cache rows.
-
-Ascend MLA and DSA share communication groups and collective wrappers in
-`dcp/ascend.py`. Dense MLA gathers query heads, evaluates packed FIA against
-local pages, exchanges partial outputs and natural-log LSE by head owner,
-and merges the KV shards before value projection. Its native merge currently
-requires eight shards; degree one bypasses exchange and merge. Empty shards
-have zero output and negative-infinite LSE; all-empty requests return zero.
-
-Packed FIA takes host length lists. The NPU kernel adapter binds each captured
-MLA invocation to its own local-length mirror and refreshes it before graph
-update, instead of installing the runner's global sequence lengths. Pool
-rebind discards the backend's old metadata views and length bindings.
-Model-specific projection weights and composition remain with the model;
-no plugin attention-backend override or DCP implementation is needed.
-
-Validate on eight Ascend devices with the packed FIA and KVP merge operators
-installed:
-
-```bash
-python test/runtime/distributed/run_ascend_dcp_metadata.py
-torchrun --standalone --nproc-per-node=8 test/runtime/distributed/run_ascend_mla_dcp.py
-torchrun --standalone --nproc-per-node=8 test/runtime/distributed/run_ascend_mla_lifecycle.py
-```
-
-The first test checks dense CPU-oracle parity, empty shards, verify causality,
-accepted-prefix continuation and dynamic graph replay. The second checks
-prefill, cached prefill, page reuse, and subsequent projected/gated decode.
-Neither substitutes for end-to-end model accuracy testing.
-
-Ascend page compaction uses native device sorting/gather and prefix counts.
-The Triton compaction launcher can require synchronous lock initialization,
-which is not permitted inside NPU graph capture. This device path also updates
-query endpoints without host transfers; CUDA retains its Triton implementation.
