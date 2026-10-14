@@ -11,6 +11,19 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
 
+## Ascend source installation
+
+Select the NPU dependency set explicitly when installing from source:
+
+```bash
+TOKENSPEED_KERNEL_BACKEND=npu pip install --no-build-isolation ./python
+```
+
+This installs the Python registry and Ascend Triton provider and skips CUDA
+compilation. Install a compatible Torch/TorchNPU stack first. The
+`tokenspeed-kernel-npu` package and its native operator dependencies are separate
+installations.
+
 ## Nightly installation
 
 CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
