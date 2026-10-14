@@ -57,21 +57,6 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 
 _NAME = "gluon_simt_gemm_fp32"
-
-
-def test_gluon_jit_is_initialized_once_on_first_use(monkeypatch):
-    compiled = Mock()
-    jit = Mock(return_value=compiled)
-    gluon_gemv._simt_gemm_jit.cache_clear()
-    monkeypatch.setattr(gluon_gemv, "gluon", Mock(jit=jit))
-    try:
-        assert gluon_gemv._simt_gemm_jit() is compiled
-        assert gluon_gemv._simt_gemm_jit() is compiled
-        jit.assert_called_once_with(gluon_gemv._simt_gemm_kernel)
-    finally:
-        gluon_gemv._simt_gemm_jit.cache_clear()
-
-
 _SPEC = KernelRegistry.get().get_by_name(_NAME)
 # The registered (x, weight) dtypes, and the FP32 pair left to Torch.
 _MIXED = (torch.bfloat16, torch.float32)

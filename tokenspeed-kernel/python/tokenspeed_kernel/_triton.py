@@ -27,6 +27,7 @@ import importlib
 import importlib.abc
 import importlib.util
 import sys
+from functools import partial
 
 import torch
 
@@ -36,12 +37,36 @@ if _IS_NPU:
     from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
 
     # Gluon and tensor descriptors belong to the CUDA/ROCm vendor package.
-    # Their kernels are not registered on Ascend; importing them here would
-    # make an otherwise independent NPU installation require that package.
+    # Keep GPU registrations importable without requiring that package.
     aggregate = None
     TensorDescriptor = None
     gl = None
-    gluon = None
+
+    class _UnavailableGluonKernel:
+        def __init__(self, fn, options):
+            self.fn = fn
+            self.options = options
+
+        def __getitem__(self, grid):
+            raise RuntimeError(
+                f"Gluon kernel {self.fn.__name__} cannot execute on Ascend"
+            )
+
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError(
+                f"Gluon kernel {self.fn.__name__} cannot execute on Ascend"
+            )
+
+    class _UnavailableGluon:
+        """Import-only decorators; capability selection must exclude Ascend."""
+
+        @staticmethod
+        def jit(fn=None, **options):
+            if fn is None:
+                return partial(_UnavailableGluonKernel, options=options)
+            return _UnavailableGluonKernel(fn, options)
+
+    gluon = _UnavailableGluon()
 else:
     import tokenspeed_triton as triton
     import tokenspeed_triton.experimental.gluon.language as gl

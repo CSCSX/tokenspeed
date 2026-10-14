@@ -119,6 +119,11 @@ All of them register through the same decorator, and the same selection
 logic scores them, so adding a backend is one new file in the right family
 folder.
 
+On Ascend, `_triton.py` supplies import-only `gluon.jit` decorators so shared
+registration modules do not require the GPU Gluon package. Calling or launching
+one of these kernels raises an error. Kernel capability declarations still
+exclude Ascend from GPU implementations; CUDA and ROCm use native Gluon.
+
 ### Weight preprocessing
 
 Some kernels need loaded weights converted into a representation suited to their
