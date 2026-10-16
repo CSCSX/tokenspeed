@@ -568,7 +568,7 @@ class ExtendProgram:
         cdna4.buffer_store(part_lse, mid_lse_ptr, lse_off, mask=valid)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["num_seqs"])
 def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -734,7 +734,7 @@ def gluon_mha_extend_gfx950(
     program.store_lse(l_i, m_i)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["num_seqs", "NUM_KV_SPLITS"])
 def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -897,7 +897,7 @@ def gluon_mha_extend_split_gfx950(
     )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["NUM_KV_SPLITS"])
 def gluon_mha_extend_reduce_gfx950(
     mid_o_ptr,
     mid_lse_ptr,

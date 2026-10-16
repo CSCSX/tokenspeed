@@ -997,6 +997,10 @@ and causal/noncausal masks follow the existing registration. CPU tile tests
 and device tests cover padded groups, speculative query blocks, chunk/tail
 prefills, ragged cached extensions and graph replay after metadata changes.
 
+Request and KV split counts are runtime scalars without value or alignment
+specialization. Changing batch composition reuses the warmed binaries for the
+selected tile and rectangular/ragged grid, including split reduction.
+
 ### gfx950 MLA extend
 
 `gluon_mla_extend_gfx950` computes absorbed MLA attention for cached extend

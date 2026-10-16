@@ -303,6 +303,41 @@ def test_changed_metadata_graph_replay_without_recompile(window):
     graph.reset()
 
 
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("window", [-1, 511])
+@pytest.mark.usefixtures("require_gfx950")
+def test_request_and_split_counts_do_not_recompile(ragged, window):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_reduce_gfx950,
+        gluon_mha_extend_split_gfx950,
+    )
+    from utils import assert_no_triton_compile
+
+    def case_for_batch(batch):
+        queries = [16] + [1 if ragged else 16] * (batch - 1)
+        return make_case(
+            queries,
+            [8192 - query for query in queries],
+            heads=6,
+            kv_heads=1,
+            window=window,
+            causal=True,
+            sinks=True,
+        )
+
+    # Warm both LSE signatures. Subsequent batches cross scalar-specialization
+    # boundaries for the request count and the occupancy-selected split count.
+    assert_reference(case_for_batch(3))
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_split_gfx950,
+        gluon_mha_extend_reduce_gfx950,
+    ):
+        for batch in (15, 16, 17):
+            assert_reference(case_for_batch(batch))
+
+
 @pytest.mark.parametrize("query_rows", [848, 896, 8192])
 @pytest.mark.parametrize("window", [-1, 511])
 @pytest.mark.usefixtures("require_gfx950")
