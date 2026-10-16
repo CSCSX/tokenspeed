@@ -895,7 +895,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     """Select direct or route-tiled MFMA with token/slot intermediates.
 
     ``max_m`` bounds direct execution; ``route_tile_max_m`` bounds the measured
-    EP4 route-tiled schedule. Both reuse gdot128-shuffled weights/scales
+    EP4/EP8 route-tiled schedule. Both reuse gdot128-shuffled weights/scales
     and preserve the per-route gate/up, SwiGLU, quantization and W2 order.
     """
     n_tokens, hidden_dim, device, input_dtype = _mxfp4_input_metadata(hidden_states)
