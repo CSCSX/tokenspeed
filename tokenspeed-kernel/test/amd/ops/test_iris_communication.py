@@ -69,7 +69,7 @@ def test_staged_kernels_compile(arch, subgroup_size, arch_major):
             BLOCK_SIZE=4096,
             SLOT_STRIDE=8192,
             NUM_SLOTS=2,
-            NUM_WARPS=4,
+            NUM_WARPS=8,
             ARCH_MAJOR=arch_major,
         )
         if kernel is iris_pull_oneshot_rmsnorm:
@@ -89,7 +89,7 @@ def test_staged_kernels_compile(arch, subgroup_size, arch_major):
         triton.compile(
             gluon._runtime.GluonASTSource(kernel, signature, constexprs=constants),
             target=triton.backends.compiler.GPUTarget("hip", arch, subgroup_size),
-            options={"num_warps": 4},
+            options={"num_warps": 8},
         )
 
 

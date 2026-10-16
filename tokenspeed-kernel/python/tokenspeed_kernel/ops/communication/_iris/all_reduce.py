@@ -102,7 +102,7 @@ class StagedPullOneShot:
     """Own rotating slots and epochs for one staging geometry."""
 
     BLOCK_SIZE = 2048
-    NUM_SUBGROUPS = 4
+    NUM_SUBGROUPS = 8
     INPUT_SLOTS = 2
 
     @staticmethod
