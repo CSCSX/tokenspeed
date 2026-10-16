@@ -168,7 +168,7 @@ def _launch_pull_twoshot(
     partition_words = out.numel() // peers.world_size // elements_per_word
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * triton.runtime.driver.active.get_current_target().warp_size
+        * peers.subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )

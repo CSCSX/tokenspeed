@@ -4,6 +4,8 @@ Collectives share one process-wide Iris context and symmetric heap. Each
 prepared operation retains its buffers; execution never searches for a suitable
 state. Allocate in the same order on participating ranks before graph capture;
 prepared capacities and addresses stay fixed.
+Group preparation also records the device subgroup size for launch geometry;
+launchers reuse that value.
 
 The first preparation sizes the shared heap. Later states allocate from that
 same fixed heap; Iris's allocator enforces capacity.

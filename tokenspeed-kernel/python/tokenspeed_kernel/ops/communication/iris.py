@@ -403,7 +403,7 @@ class IrisAllReduceResidualRMSNorm(object):
         )
 
         self.persistent = persistent
-        self.subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
+        self.subgroup_size = self.peers.subgroup_size
         self.arch_major = _platform.arch_version.major
         self._num_programs = (
             torch.cuda.get_device_properties(self.device).multi_processor_count
