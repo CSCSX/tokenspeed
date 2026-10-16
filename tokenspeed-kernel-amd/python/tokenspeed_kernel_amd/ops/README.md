@@ -1798,9 +1798,25 @@ FP32 accumulation. This is BF16 compute, not native FP8 or scaled-BF16 weights.
 It avoids the unsupported 64-bit vector that a dtype-only activation async-copy
 change would create. Actual compilation/instruction behavior remains a device
 qualification gate.
-The channel FC1 launcher uses an N64 output tile for local width 320, which
-does not divide N128; width 640 keeps its existing tile choices. FC2 retains
-K64, which divides both widths. No projection tail or new kernel is needed.
+The BF16-shared channel FC1 launcher uses an N64 output tile for local width
+320, which does not divide N128; width 640 keeps its existing tile choices.
+FC2 retains K64, which divides both widths. No projection tail is needed.
+
+`fp8/channel_stage1.py` provides an asynchronous compact FC1 launcher. It
+copies raw E4M3 bytes directly to double-buffered shared memory and widens
+them to BF16 immediately before MFMA. Token and channel scaling, SwiGLU,
+BF16 output rounding and original token-slot order are unchanged. Its
+M16 routing tiles use one wave, N16 and K512: narrower output tiles expose
+more independent work when few experts have live rows. M32/M64 retain
+four-wave N64/K128 tiles. All layouts provide at least a 16-byte asynchronous
+vector per participating thread and preserve the established output bytes.
+The launcher requires contiguous code, scale and output tensors, a hidden
+width divisible by its K tile, and an intermediate width divisible by its
+N tile.
+It does not change route grouping or FC2. Isolated qualification is not an
+end-to-end serving speedup claim.
+The channel FC1 dispatcher selects it for contiguous H5120/I320 operands;
+other geometries and layouts retain their established BF16-shared pipeline.
 
 Projection epilogues apply token then channel scales with fusion disabled.
 Gate/up stay FP32 through SiLU and multiplication, then round once to BF16.

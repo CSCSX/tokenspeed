@@ -543,6 +543,41 @@ def launch_gluon_fp8_channel_stage1_gfx950(
     assert (
         out.shape == (num_tokens * topk, intermediate) and out.dtype == torch.bfloat16
     )
+    # Keep other geometries/layouts on their established pipeline. These
+    # compact tiles preserve the existing routing blocks and BF16 arithmetic.
+    if (
+        hidden == 5120
+        and intermediate == 320
+        and all(
+            tensor.is_contiguous()
+            for tensor in (
+                hidden_states,
+                w1,
+                token_scales,
+                channel_scales,
+                sorted_token_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                out,
+            )
+        )
+    ):
+        from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.channel_stage1 import (
+            launch_gluon_fp8_channel_moe_stage1_gfx950,
+        )
+
+        return launch_gluon_fp8_channel_moe_stage1_gfx950(
+            hidden_states,
+            w1,
+            token_scales,
+            channel_scales,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out,
+            topk,
+            block_m=block_m,
+        )
     block_n = 64 if block_m == 16 or intermediate == 320 else 128
     block_k = 64
     assert hidden % block_k == intermediate % block_n == 0
