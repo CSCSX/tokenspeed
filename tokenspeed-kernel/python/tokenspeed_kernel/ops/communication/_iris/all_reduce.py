@@ -1284,7 +1284,9 @@ def iris_pull_twoshot(
         heap_base_7,
     )
     epoch_ptr = ready_flags + block_id * WORLD_SIZE + RANK
-    epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    # Only this rank writes its counter; later phases advance this known epoch.
+    epoch = gl.load(epoch_ptr) + 1
+    gl.atomic_xchg(epoch_ptr, epoch, sem="release", scope="sys")
     _iris_sync_rank_epoch(
         ready_flags,
         block_id,
@@ -1384,7 +1386,8 @@ def iris_pull_twoshot(
         )
         tile_id += NUM_PROGRAMS
 
-    partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    partitions_ready = epoch + 1
+    gl.atomic_xchg(epoch_ptr, partitions_ready, sem="release", scope="sys")
     _iris_sync_rank_epoch(
         ready_flags,
         block_id,
@@ -1433,7 +1436,8 @@ def iris_pull_twoshot(
         # kernel until every peer has finished reading makes a single staging
         # buffer correct by construction, at the price of one more rendezvous.
         # Producer-direct callers own their input and pass False.
-        reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+        reads_done = epoch + 2
+        gl.atomic_xchg(epoch_ptr, reads_done, sem="release", scope="sys")
         _iris_sync_rank_epoch(
             ready_flags,
             block_id,

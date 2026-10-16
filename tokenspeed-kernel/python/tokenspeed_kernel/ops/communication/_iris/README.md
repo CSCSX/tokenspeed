@@ -46,6 +46,11 @@ group-relative peer addresses also support noncontiguous subgroups.
 The row layout aims for one packed word per lane, up to 16 subgroups per
 workgroup, independently of model and row count.
 
+Two-shot rendezvous keep one epoch counter per workgroup and rank. Only its
+owning rank writes that counter, so the kernel reads it once and publishes
+the known values for entry, partition readiness and optional completion with
+release exchanges. Peer waits still compare epochs modulo 32 bits.
+
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
 
