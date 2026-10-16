@@ -122,7 +122,7 @@ def kda_verify_workspace_bytes(
         row_bytes += (
             heads * head_dim * (torch.float32.itemsize + 2 * config.dtype.itemsize)
         )
-    group_count = sum(spec.family == "state" for spec, _ in groups)
+    group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
     metadata_bytes = 0
     if draft_token_num > 1:
         metadata_bytes = len(conv_fields) * (10 * 8 + 4)

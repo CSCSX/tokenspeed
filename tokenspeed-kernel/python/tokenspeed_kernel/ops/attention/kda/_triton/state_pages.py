@@ -246,12 +246,11 @@ def commit_state_pages(
 
 
 @triton.jit(
-    do_not_specialize=["bs", "draft_tokens", "granularity", "out_stride"],
+    do_not_specialize=["bs", "draft_tokens", "out_stride"],
     do_not_specialize_on_alignment=["table_base"],
 )
 def _commit_state_groups_kernel(
     accepted,
-    committed,
     table_base,
     tables,
     pages_out,
@@ -259,7 +258,6 @@ def _commit_state_groups_kernel(
     steps_out,
     bs,
     draft_tokens,
-    granularity,
     out_stride,
     BLOCK: tl.constexpr,
 ):
@@ -271,15 +269,14 @@ def _commit_state_groups_kernel(
     source = tl.load(reads + row, mask=live, other=-1)
     tl.store(reads_out + group * out_stride + row, source, mask=live)
     table_stride = tl.load(tables + group * 4 + 1)
-    num_slots = tl.load(tables + group * 4 + 2)
     # Accepted length includes the target token, as in commit_state_pages.
     steps = tl.minimum(
         tl.maximum(tl.load(accepted + row, mask=live, other=1).to(tl.int64), 1),
         draft_tokens,
     )
-    last = tl.load(committed + row, mask=live, other=0) + steps - 1
-    slot = tl.minimum(tl.maximum(last, 0) // granularity, num_slots - 1)
-    page = tl.load(table + row * table_stride + slot, mask=live, other=0)
+    # Latest scheduler ABI: commit always writes the live slot, even when
+    # verify read a different immutable prefix checkpoint from slot 0.
+    page = tl.load(table + row * table_stride + 1, mask=live, other=0)
     tl.store(pages_out + group * out_stride + row, page, mask=live)
     if group == 0:
         tl.store(steps_out + row, steps.to(tl.int32), mask=live)
@@ -287,22 +284,19 @@ def _commit_state_groups_kernel(
 
 def commit_state_groups(
     accepted_length: torch.Tensor,
-    committed: torch.Tensor,
     table_base: torch.Tensor,
     tables: torch.Tensor,
     *,
     batch_size: int,
     draft_tokens: int,
-    granularity: int,
     pages_out: torch.Tensor,
     reads_out: torch.Tensor,
     steps_out: torch.Tensor,
 ) -> None:
-    """Resolve accepted endpoints for all state groups in one GPU launch.
+    """Resolve live write slots for all state groups in one GPU launch.
 
     Args:
         accepted_length: Contiguous accepted counts, including the target token.
-        committed: Contiguous INT64 checkpoint positions before verification.
         table_base: INT32 tensor anchoring the current packed page tables.
             Its address can change between eager launches without changing
             the descriptors. A captured launch retains this tensor address.
@@ -312,7 +306,6 @@ def commit_state_groups(
             The caller keeps the referenced tables alive through completion.
         batch_size: Number of live request rows.
         draft_tokens: Maximum accepted count for the current window.
-        granularity: Tokens per state checkpoint block.
         pages_out: INT32 [groups, batch_size] destination block indices.
         reads_out: INT32 [groups, batch_size] copied source block indices.
         steps_out: INT32 [batch_size] clamped accepted counts.
@@ -322,8 +315,8 @@ def commit_state_groups(
     """
     if tables.ndim != 2 or tables.shape[1] != 4 or not tables.is_contiguous():
         raise ValueError("state table descriptors must be contiguous [groups, 4]")
-    if tables.dtype != torch.int64 or committed.dtype != torch.int64:
-        raise ValueError("state table descriptors and positions must use INT64")
+    if tables.dtype != torch.int64:
+        raise ValueError("state table descriptors must use INT64")
     if (
         pages_out.shape != (tables.shape[0], batch_size)
         or reads_out.shape != pages_out.shape
@@ -333,20 +326,19 @@ def commit_state_groups(
         x.dtype != torch.int32 for x in (table_base, pages_out, reads_out, steps_out)
     ):
         raise ValueError("page tables, blocks and accepted counts must use INT32")
-    if min(accepted_length.numel(), committed.numel(), steps_out.numel()) < batch_size:
+    if min(accepted_length.numel(), steps_out.numel()) < batch_size:
         raise ValueError("commit metadata does not cover the live batch")
-    if granularity < 1 or draft_tokens < 1:
-        raise ValueError("checkpoint granularity and verify width must be positive")
+    if draft_tokens < 1:
+        raise ValueError("verify width must be positive")
     if any(
         not x.is_contiguous()
-        for x in (accepted_length, committed, pages_out, reads_out, steps_out)
+        for x in (accepted_length, pages_out, reads_out, steps_out)
     ):
         raise ValueError("commit metadata must be contiguous")
     if any(
         x.device != tables.device
         for x in (
             accepted_length,
-            committed,
             table_base,
             pages_out,
             reads_out,
@@ -358,7 +350,6 @@ def commit_state_groups(
         return
     _commit_state_groups_kernel[(triton.cdiv(batch_size, 256), tables.shape[0])](
         accepted_length,
-        committed,
         table_base,
         tables,
         pages_out,
@@ -366,7 +357,6 @@ def commit_state_groups(
         steps_out,
         batch_size,
         draft_tokens,
-        granularity,
         pages_out.stride(0),
         BLOCK=256,
     )

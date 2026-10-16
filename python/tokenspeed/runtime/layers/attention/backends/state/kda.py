@@ -396,18 +396,16 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _verify_state_blocks(
         self,
         bs: int,
-        seq_lens: torch.Tensor,
-        draft_token_num: int,
         block_tables: Mapping[str, torch.Tensor],
         *,
         pages_out: Mapping[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        # Resolve each group's source checkpoint pages into pages_out and
-        # retain the committed positions and tables for post-acceptance commit.
-        committed, tables = super()._verify_state_blocks(
-            bs, seq_lens, draft_token_num, block_tables, pages_out=pages_out
-        )
-        if self._replay_commit_tables is not None and seq_lens.is_cuda:
+    ) -> dict[str, torch.Tensor]:
+        # The scheduler names input and live pages in fixed table slots.
+        tables = super()._verify_state_blocks(bs, block_tables, pages_out=pages_out)
+        if (
+            self._replay_commit_tables is not None
+            and self._replay_commit_tables.is_cuda
+        ):
             rows = [tables[group] for group in self._replay_group_ids]
             if any(
                 table.dtype != torch.int32 or table.stride(1) != 1 for table in rows
@@ -437,6 +435,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     )
                 )
                 self._replay_commit_table_descriptors_host = table_descriptors
+        return tables
+
+    @override
+    def _prepare_verify_records(
+        self, bs: int, seq_lens: torch.Tensor, draft_token_num: int
+    ) -> None:
         if self._replay_record_metadata is not None and seq_lens.is_cuda:
             from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
                 prepare_recoverssm_metadata,
@@ -447,12 +451,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
             # round's records when the same workspace slots are reused.
             self._replay_record_generation += 1
             prepare_recoverssm_metadata(
-                committed,
+                seq_lens[:bs].to(torch.int64) - draft_token_num,
                 self._replay_record_metadata,
                 batch=bs,
                 generation=self._replay_record_generation,
             )
-        return committed, tables
 
     @override
     def _resolve_verify_commit_pages(
@@ -474,7 +477,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         assert self._replay_commit_reads is not None
         assert self._replay_commit_pages is not None
         assert self._replay_commit_steps is not None
-        committed, tables, width, _ = self._verify_commit_ctx
+        tables, width, _ = self._verify_commit_ctx
         batch = accepted_length.shape[0]
         # Reuse fixed-capacity storage, packed for the current batch size.
         # Returned views remain valid until the next planner call overwrites them.
@@ -483,16 +486,14 @@ class KdaAttnBackend(CapacityPrefillBackend):
         )
         steps = self._replay_commit_steps[:batch]
         # Preserve source page IDs for recovery and select destination pages
-        # from the accepted endpoint. Counts include the target token and are
+        # from each group's live slot. Counts include the target token and are
         # clamped to [1, width]. This plans the commit; it does not write states.
         commit_state_groups(
             accepted_length,
-            committed,
             tables[self._replay_group_ids[0]],
             self._replay_commit_tables,
             batch_size=batch,
             draft_tokens=width,
-            granularity=self._checkpoint_granularity,
             pages_out=pages,
             reads_out=self._replay_commit_reads[: len(group_ids) * batch].view(
                 len(group_ids), batch
@@ -504,7 +505,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Return one layer's views in the shared descriptor order.
 
-        Split producers store raw QKV, FP32 U, FP32 K/decay and empty gate
+        Split producers store raw QKV, FP32 U, BF16 K/raw gate and empty gate
         scratch. Other backends retain raw QKV, f_a, beta and gate scratch.
         The tuple order stays stable across backend-specific payload formats.
         """

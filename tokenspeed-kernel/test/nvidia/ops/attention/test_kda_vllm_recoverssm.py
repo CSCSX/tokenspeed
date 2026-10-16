@@ -558,7 +558,7 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
 
 
 @pytest.mark.parametrize("batch", [1, 7, 33])
-def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
+def test_commit_state_groups_live_slots_strides_and_graph(batch: int) -> None:
     from tokenspeed_kernel.ops.attention.kda.triton import commit_state_groups
 
     tables = [
@@ -566,7 +566,7 @@ def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
             batch, columns + 3
         )[:, :columns]
         + group * 1000
-        for group, columns in enumerate((1, 3, 5))
+        for group, columns in enumerate((2, 3, 5))
     ]
     tables = [torch.nn.functional.pad(table, (0, 2))[:, :-2] for table in tables]
     sources = [
@@ -586,7 +586,6 @@ def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
         dtype=torch.int64,
         device="cuda",
     )
-    committed = torch.arange(batch, device="cuda", dtype=torch.int64) * 127 + 126
     accepted = torch.arange(batch, device="cuda", dtype=torch.int32) % 6
     pages = torch.empty((3, batch), device="cuda", dtype=torch.int32)
     reads = torch.empty_like(pages)
@@ -595,12 +594,10 @@ def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
     def launch() -> None:
         commit_state_groups(
             accepted,
-            committed,
             tables[0],
             descriptors,
             batch_size=batch,
             draft_tokens=4,
-            granularity=128,
             pages_out=pages,
             reads_out=reads,
             steps_out=steps,
@@ -615,17 +612,13 @@ def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
             accepted.add_(1)
             for source in sources:
                 source.add_(7)
-            committed.add_(128)
             tables[1].add_(23)
         graph.replay()
         torch.testing.assert_close(reads, torch.stack(sources), atol=0, rtol=0)
         expected_steps = accepted.clamp(1, 4)
         torch.testing.assert_close(steps, expected_steps, atol=0, rtol=0)
         for group, table in enumerate(tables):
-            slots = ((committed + expected_steps - 1) // 128).clamp(
-                0, table.shape[1] - 1
-            )
-            expected = table.gather(1, slots[:, None]).squeeze(1)
+            expected = table[:, 1]
             torch.testing.assert_close(pages[group], expected, atol=0, rtol=0)
 
 
