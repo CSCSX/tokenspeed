@@ -5,14 +5,40 @@ Beam calls two of its norm kernels directly (`tokenspeed/runtime/models/beam.py`
 - the residual boundary: `triton.rmsnorm(x, weight, eps, residual=residual,
   round_residual_sum_bf16=True, x_scale=..., residual_scale=...)`, one launch of
   the shared kernel's residual arm with the sum (and, with the depth-scale pair,
-  both products) rounded to BF16 as Torch's BF16 statements round them, on NVIDIA
-  SM100 to SM103 where its guard admits the call (the Torch statements elsewhere);
+  both products) rounded to BF16 as Torch's BF16 statements round them.
+  `rmsnorm_bf16_residual_available` owns backend/layout admission: NVIDIA SM100
+  to SM103 retains its existing implementation; qualified gfx950 BF16 rows use
+  Gluon. Other calls retain the Torch statements;
 - the sliding layers' Q/K norm: `triton.fused_qk_rmsnorm_rope(...)`, the per-head
   RMSNorm rounded to the input dtype, then full NeoX RoPE in FP32, on every GPU,
   with `dequant` for an unscaled FP8 GEMM's output.
 
 The NoPE layers' Q/K norm is a registered operator because its selection
 chooses by shape.
+
+## gfx950 BF16 residual norm and token-FP8 producer
+
+The existing `triton.rmsnorm` and `quantization.rmsnorm_quantize_fp8` entries
+dispatch qualified BF16 `[M,5120]` rows to `gluon_rmsnorm_bf16_gfx950`.
+Inputs have contiguous columns, disjoint eight-element-aligned row strides and
+16-byte-aligned pointers; weights are dense BF16 `[5120]`. A residual requires
+`round_residual_sum_bf16=True`. Caller-provided norm output and PDL retain their
+previous implementation. NVIDIA and unsupported input layouts are unchanged.
+
+Each scaled product and the residual sum round to BF16 before FP32 RMSNorm.
+Four wave64s with eight contiguous elements per lane preserve the existing
+portable norm's reduction order. Smaller wave counts are not interchangeable:
+they changed finite output bits in qualification. Optional token-FP8 output
+quantizes the stored BF16 norm with the existing E4M3 token-min-scaling recipe,
+including independent round-to-nearest FP32 divisions for multiplier and scale.
+Rows, strides and residual coefficients remain runtime data under graph replay.
+
+`fp8_token_quantizer_matches_rmsnorm` keeps quantizer-recipe compatibility at the
+kernel boundary. It additionally admits gfx950's portable per-token quantizer,
+which delegates to that same recipe; NVIDIA selection does not broaden. This
+does not enable unscaled FP8 GEMM or move dequantization across normalization.
+Device tests compare norm/residual/FP8 bytes, depth coefficients, nonfinite and
+extreme inputs, strided rows and changed-input graph replay without compilation.
 
 ## `layernorm.qk_rmsnorm_ssmax` operator
 

@@ -12,7 +12,7 @@ from tokenspeed_kernel.ops.quantization.triton import (
     fp8_token_multiplier,
     fp8_token_scale,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
 
@@ -231,6 +231,48 @@ def _rmsnorm_fused_parallel_kernel(
     tl.store(output2_ptr + output2_offsets, output2, mask=mask2)
 
 
+def rmsnorm_bf16_residual_available(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None,
+) -> bool:
+    """Whether a qualified kernel fuses these scaled, BF16-rounded residual rows.
+
+    This checks input layout and backend capability without launching work.
+    Other inputs retain their caller's eager scaled-products/add fallback.
+
+    Args:
+        x, residual: Contiguous BF16 [M,5120] rows on one GPU, M > 0.
+        weight: Contiguous BF16 [5120] affine weight on that GPU.
+        out: Requested output destination; only None admits the fusion.
+
+    Returns:
+        True for the qualified NVIDIA or gfx950 implementation, False otherwise.
+    """
+    if not (
+        out is None
+        and x.is_cuda
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] == 5120
+        and residual.shape == x.shape
+        and weight.shape == (5120,)
+        and residual.device == weight.device == x.device
+        and x.dtype == residual.dtype == weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        return False
+    platform = current_platform()
+    if platform.is_nvidia:
+        return platform.is_blackwell and platform.arch_version <= ArchVersion(10, 3)
+    from tokenspeed_kernel.ops.layernorm.gluon import gluon_rmsnorm_bf16_supported
+
+    return gluon_rmsnorm_bf16_supported(x, weight, residual, out, True, False)
+
+
 def rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -265,7 +307,8 @@ def rmsnorm(
             and ``residual``; a missing one is 1.0. Each product is rounded to
             BF16 before the add, as an eager BF16 tensor times a Python float
             is. They are runtime arguments, so new values do not recompile.
-            Need ``round_residual_sum_bf16=True`` and an NVIDIA GPU.
+            Need ``round_residual_sum_bf16=True`` and an NVIDIA GPU or a
+            qualified gfx950 BF16 layout.
         token_fp8_out: Optional ``(codes, scales)`` buffers, contiguous FP8
             E4M3 ``[rows, hidden_size]`` and FP32 ``[rows, 1]``: the same
             launch also writes the output quantized per token, as
@@ -285,13 +328,23 @@ def rmsnorm(
     scale_inputs = x_scale is not None or residual_scale is not None
     x_scale = 1.0 if x_scale is None else x_scale
     residual_scale = 1.0 if residual_scale is None else residual_scale
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
+    use_gluon = False
+    if x.is_cuda and current_platform().is_amd:
+        from tokenspeed_kernel.ops.layernorm.gluon import gluon_rmsnorm_bf16_supported
+
+        use_gluon = gluon_rmsnorm_bf16_supported(
+            x, weight, residual, out, round_residual_sum_bf16, enable_pdl
+        )
     if scale_inputs:
         if not round_residual_sum_bf16:
             raise ValueError(
                 "x_scale and residual_scale need round_residual_sum_bf16=True"
             )
-        if not current_platform().is_nvidia:
-            raise ValueError("x_scale and residual_scale need an NVIDIA GPU")
+        if not current_platform().is_nvidia and not use_gluon:
+            raise ValueError(
+                "x_scale and residual_scale need an NVIDIA GPU or a supported gfx950 BF16 layout"
+            )
         for name, value in (("x_scale", x_scale), ("residual_scale", residual_scale)):
             if not isinstance(value, float) or not math.isfinite(value):
                 raise ValueError(f"{name} must be a finite float, got {value!r}")
@@ -345,31 +398,45 @@ def rmsnorm(
     else:
         codes, scales = None, None
     block = triton.next_power_of_2(hidden_size)
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     launch_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
-    _rmsnorm_kernel[(x_2d.shape[0],)](
-        x_2d,
-        residual,
-        weight,
-        out_2d,
-        residual_out,
-        x_scale,
-        residual_scale,
-        x_2d.stride(0),
-        hidden_size,
-        eps,
-        BLOCK=block,
-        HAS_RESIDUAL=residual is not None,
-        ROUND_RESIDUAL_SUM_BF16=round_residual_sum_bf16,
-        SCALE_INPUTS_BF16=scale_inputs,
-        ENABLE_PDL=enable_pdl,
-        fp8_out_ptr=codes,
-        fp8_scale_ptr=scales,
-        TOKEN_FP8_OUT=token_fp8_out is not None,
-        **launch_kwargs,
-    )
+    if use_gluon:
+        from tokenspeed_kernel.ops.layernorm.gluon import gluon_rmsnorm_bf16_gfx950
+
+        gluon_rmsnorm_bf16_gfx950(
+            x_2d,
+            weight,
+            eps,
+            residual=residual,
+            output=out_2d,
+            residual_output=residual_out,
+            x_scale=x_scale,
+            residual_scale=residual_scale,
+            token_fp8_out=token_fp8_out,
+        )
+    else:
+        _rmsnorm_kernel[(x_2d.shape[0],)](
+            x_2d,
+            residual,
+            weight,
+            out_2d,
+            residual_out,
+            x_scale,
+            residual_scale,
+            x_2d.stride(0),
+            hidden_size,
+            eps,
+            BLOCK=block,
+            HAS_RESIDUAL=residual is not None,
+            ROUND_RESIDUAL_SUM_BF16=round_residual_sum_bf16,
+            SCALE_INPUTS_BF16=scale_inputs,
+            ENABLE_PDL=enable_pdl,
+            fp8_out_ptr=codes,
+            fp8_scale_ptr=scales,
+            TOKEN_FP8_OUT=token_fp8_out is not None,
+            **launch_kwargs,
+        )
     if residual is None:
         return out
     return out, residual_out

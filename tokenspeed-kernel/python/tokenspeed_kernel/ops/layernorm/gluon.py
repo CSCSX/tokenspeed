@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Narrow gfx950 producer fusion for Beam's existing SSMax norm operation."""
+"""gfx950 normalization producers with the shared operators' rounding order."""
 
 import torch
 from tokenspeed_kernel.ops.layernorm.qk_rmsnorm_ssmax import (
@@ -47,6 +47,91 @@ TRAITS = {
     "unit_stride": frozenset({True}),
     "weights_contiguous": frozenset({True}),
 }
+
+
+def gluon_rmsnorm_bf16_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor | None,
+    out: torch.Tensor | None,
+    round_residual_sum_bf16: bool,
+    enable_pdl: bool,
+) -> bool:
+    """Return whether the gfx950 kernel serves these BF16 [M,5120] rows.
+
+    Weight is dense BF16 [5120]. A residual needs BF16-sum rounding;
+    caller-provided norm output and PDL retain the existing implementation.
+    """
+
+    def rows_supported(value):
+        return (
+            value.is_cuda
+            and value.dtype == torch.bfloat16
+            and value.ndim == 2
+            and value.shape[1] == 5120
+            and value.stride(1) == 1
+            and value.stride(0) >= 5120
+            and value.stride(0) % 8 == 0
+            and value.data_ptr() % 16 == 0
+        )
+
+    return (
+        out is None
+        and not enable_pdl
+        and rows_supported(x)
+        and weight.dtype == x.dtype
+        and weight.device == x.device
+        and weight.shape == (5120,)
+        and weight.is_contiguous()
+        and weight.data_ptr() % 16 == 0
+        and (
+            residual is None
+            or (
+                round_residual_sum_bf16
+                and rows_supported(residual)
+                and residual.shape == x.shape
+                and residual.device == x.device
+            )
+        )
+        and current_platform().is_cdna4
+    )
+
+
+def gluon_rmsnorm_bf16_gfx950(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: torch.Tensor | None,
+    output: torch.Tensor,
+    residual_output: torch.Tensor | None,
+    x_scale: float,
+    residual_scale: float,
+    token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None,
+) -> None:
+    """Write the qualified BF16 norm, rounded residual and optional FP8 outputs.
+
+    Arguments follow ``rmsnorm``; ``output`` and optional ``residual_output``
+    are its caller-owned contiguous destinations. FP8 buffers hold E4M3 codes
+    and FP32 per-token scales. This entry does not support PDL. Return None.
+    """
+    if not current_platform().is_cdna4:
+        raise ValueError("gluon_rmsnorm_bf16_gfx950 requires AMD gfx950")
+    from tokenspeed_kernel_amd.ops.gfx950.layernorm.rmsnorm import (
+        launch_gluon_rmsnorm_bf16_gfx950,
+    )
+
+    launch_gluon_rmsnorm_bf16_gfx950(
+        x,
+        weight,
+        eps,
+        residual=residual,
+        output=output,
+        residual_output=residual_output,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+        token_fp8_out=token_fp8_out,
+    )
 
 
 @register_kernel(

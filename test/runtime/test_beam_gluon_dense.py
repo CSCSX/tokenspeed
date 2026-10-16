@@ -46,6 +46,42 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 FAMILIES = [(1792, 5120), (5120, 768), (5120, 5120), (5120, 2560)]
 
 
+@pytest.mark.parametrize("has_output", [False, True])
+def test_beam_scaled_norm_preserves_bf16_boundaries(has_output):
+    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+
+    from tokenspeed.runtime.models.beam import BeamRMSNorm, depth_scale_coefficients
+
+    if not current_platform().is_cdna4:
+        pytest.skip(
+            "gfx950 validates the new norm backend; NVIDIA selection is unchanged"
+        )
+    torch.manual_seed(9261)
+    norm = BeamRMSNorm(5120, 1e-6, torch.bfloat16).cuda()
+    x = torch.randn(17, 5120, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    xs, rs = depth_scale_coefficients(17, True)
+    expected_sum = x * xs + residual * rs
+    expected = rmsnorm(
+        expected_sum,
+        norm.weight.data,
+        1e-6,
+        residual=None,
+        out=None,
+        enable_pdl=False,
+        round_residual_sum_bf16=False,
+        x_scale=None,
+        residual_scale=None,
+        token_fp8_out=None,
+    )
+    destination = torch.empty_like(x) if has_output else None
+    actual, summed = norm(x, residual, out=destination, x_scale=xs, residual_scale=rs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(summed, expected_sum, rtol=0, atol=0)
+    if has_output:
+        assert actual is destination
+
+
 @pytest.mark.parametrize("n,k", FAMILIES)
 @pytest.mark.parametrize("m", [1, 16, 32, 64, 128, 256, 8192])
 def test_channel_registry_selects_platform_implementation(m, n, k):

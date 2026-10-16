@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     UnscaledFP8QKVGate,
     fused_qk_rmsnorm_rope,
     rmsnorm,
+    rmsnorm_bf16_residual_available,
 )
 from tokenspeed_kernel.ops.moe._triton.router_select import (
     router_route_rejection,
@@ -53,9 +54,9 @@ from tokenspeed_kernel.ops.moe._triton.router_select import (
 )
 from tokenspeed_kernel.ops.moe.grouped_route import torch_grouped_route
 from tokenspeed_kernel.ops.quantization import (
+    fp8_token_quantizer_matches_rmsnorm,
     quantize_fp8,
     rmsnorm_quantize_fp8,
-    select_fp8_token_quantizer,
     silu_and_mul_quantize_fp8,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
@@ -142,10 +143,6 @@ def beam_kernels() -> bool:
     return not beam_default_platform()
 
 
-# The hidden size the residual boundary's one-launch kernel was checked at.
-BEAM_HIDDEN = 5120
-
-
 def scale_pair_rejection(x_scale: object, residual_scale: object) -> str:
     """Why a depth-scale pair cannot be taken; empty when it can: both ``None``
     (the unscaled call) or both finite Python floats."""
@@ -160,30 +157,6 @@ def scale_pair_rejection(x_scale: object, residual_scale: object) -> str:
         ):
             return f"{name} must be a finite Python float, got {value!r}"
     return ""
-
-
-def _round_residual_admits(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor | None,
-) -> bool:
-    """Whether the shared kernel's residual arm with the BF16 sum rounding serves
-    the residual boundary in one launch: BF16 contiguous ``[rows, 5120]`` inputs
-    with at least one row on one CUDA device, Beam's platforms, no ``out``."""
-    return (
-        out is None
-        and x.is_cuda
-        and x.ndim == 2
-        and x.shape[0] > 0
-        and x.shape[1] == BEAM_HIDDEN
-        and residual.shape == x.shape
-        and x.dtype == residual.dtype == weight.dtype == torch.bfloat16
-        and x.is_contiguous()
-        and residual.is_contiguous()
-        and weight.is_contiguous()
-        and beam_kernels()
-    )
 
 
 def depth_scale_coefficients(
@@ -208,7 +181,7 @@ class BeamRMSNorm(RMSNorm):
 
     An input norm whose attention runs its Q/K/V and gate projections as one
     FP8 GEMM (``BeamDecoderLayer`` sets ``_token_fp8_consumer``) normalizes
-    that attention's decode rows with ``rmsnorm_quantize_fp8``
+    that attention's eligible rows with ``rmsnorm_quantize_fp8``
     (``quantization.rmsnorm_fp8``), whose launch also writes them quantized per
     token, and offers the codes to the attention, which then skips its own
     quantization of the rows.
@@ -243,7 +216,7 @@ class BeamRMSNorm(RMSNorm):
             if rejection:
                 raise ValueError(f"x_scale / residual_scale: {rejection}")
             weight = self.weight.data
-            if _round_residual_admits(x, residual, weight, out):
+            if rmsnorm_bf16_residual_available(x, residual, weight, out):
                 # The statements below in one launch, byte for byte.
                 return rmsnorm(
                     x,
@@ -449,21 +422,9 @@ class BeamRotaryEmbedding(RotaryEmbedding):
         return self
 
 
-# The per-token FP8 quantizer whose codes the input norm's per-token FP8 output
-# reproduces bit for bit (``rmsnorm_quantize_fp8``).
-_TOKEN_FP8_QUANTIZER = "triton_quantize_fp8_per_token"
-
-
 def _token_fp8_rows(rows: int, dtype: torch.dtype) -> bool:
-    """Whether ``rows`` rows of ``dtype`` take Beam's FP8 decode paths: those
-    ``quantize_fp8(granularity="token")`` quantizes with the one-launch
-    per-token quantizer (NVIDIA SM100 and newer, up to its row bound), so the
-    input norm's codes and the quantizer's are the same bytes."""
-    return (
-        rows > 0
-        and select_fp8_token_quantizer(rows, dtype, solution=None, override=None).name
-        == _TOKEN_FP8_QUANTIZER
-    )
+    """Whether the norm's token-FP8 output matches these rows' quantizer bytes."""
+    return rows > 0 and fp8_token_quantizer_matches_rmsnorm(rows, dtype)
 
 
 def _fp8_swiglu_available(intermediate_size: int) -> bool:
@@ -612,7 +573,7 @@ class BeamAttention(Qwen3Attention):
 
     def takes_token_fp8(self, x: torch.Tensor) -> bool:
         """Whether the input norm writes ``x``'s rows quantized per token for
-        this attention: decode rows of a layer whose Q/K/V and gate run as one
+        this attention: eligible rows of a layer whose Q/K/V and gate run as one
         FP8 GEMM."""
         return self.qkv_gate_weight is not None and (
             x.ndim == 2

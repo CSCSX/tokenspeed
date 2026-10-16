@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -27,6 +28,7 @@ __all__ = [
     "quantize_fp8",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
+    "fp8_token_quantizer_matches_rmsnorm",
     "rmsnorm_quantize_fp8",
     "silu_and_mul_quantize_fp8",
     "quantize_mxfp8",
@@ -342,6 +344,21 @@ def select_fp8_token_quantizer(
     )
 
 
+def fp8_token_quantizer_matches_rmsnorm(rows: int, dtype: torch.dtype) -> bool:
+    """Whether the selected token-FP8 recipe matches the fused norm's bytes.
+
+    This checks the quantizer's recipe, not the norm's input-layout admission.
+    Retain NVIDIA selection unchanged; gfx950's portable quantizer delegates
+    to the same token-min-scaling implementation. No quantization is launched.
+    """
+    selected = select_fp8_token_quantizer(rows, dtype, solution=None, override=None)
+    return selected.name == "triton_quantize_fp8_per_token" or (
+        selected.name == "triton_quantize_fp8_per_token_portable"
+        and dtype == torch.bfloat16
+        and current_platform().is_cdna4
+    )
+
+
 def quantize_fp8_with_scale(
     x: torch.Tensor,
     *,
@@ -396,8 +413,9 @@ def rmsnorm_quantize_fp8(
 
     The codes and scales are bit for bit those the Triton per-token quantizer
     (``quantize_fp8(granularity="token")`` up to 64 rows on SM100 and newer)
-    writes for the stored output, for an FP8 GEMM that reads it. One Triton
-    kernel implements it, so it is called directly, without kernel selection.
+    writes for the stored output, for an FP8 GEMM that reads it. The shared
+    RMSNorm entry selects Gluon for qualified gfx950 BF16 rows and retains
+    its existing Triton implementation elsewhere.
 
     Args:
         x: ``[..., hidden_size]`` BF16 or FP16 input.

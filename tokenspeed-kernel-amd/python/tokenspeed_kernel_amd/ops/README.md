@@ -56,6 +56,21 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can potentially increase cross-rank
 skew and regress perf even when the generated kernel remains correct.
 
+## BF16 normalization
+
+`gluon_rmsnorm_bf16_gfx950` normalizes BF16 `[M,5120]` rows and optionally
+combines a scaled residual and writes token-FP8 output. Each FP32 scaled product
+rounds to BF16, then the sum rounds to BF16, before FP32 RMSNorm and the final
+BF16 affine result. Optional E4M3 codes and FP32 per-token scales quantize that
+stored BF16 result with the existing token-min-scaling recipe.
+
+One workgroup uses four wave64s and eight contiguous elements per lane, matching
+the portable norm's sum-of-squares order. Row strides and residual coefficients
+are runtime inputs. Column stride is one; disjoint row strides are multiples of
+eight. Destinations are caller-owned contiguous buffers. The shared norm API
+keeps previous implementations for unsupported layouts, explicit norm outputs,
+other dtypes/widths, PDL and other architectures. No native FP8 GEMM is enabled.
+
 ## Activations
 
 `gluon_attention_output_gate_gfx950` computes
