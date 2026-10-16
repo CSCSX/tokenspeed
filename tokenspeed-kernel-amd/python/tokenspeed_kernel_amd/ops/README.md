@@ -56,6 +56,17 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can potentially increase cross-rank
 skew and regress perf even when the generated kernel remains correct.
 
+## Activations
+
+`gluon_attention_output_gate_gfx950` computes
+`output * sigmoid(gate + per_head_bias)` in one launch, using FP32 bias addition,
+libdevice exponential and round-to-nearest division before one output cast.
+Inputs are not mutated. BF16, FP16 and FP32 operands may be mixed; row and head
+strides remain runtime data and only the width must be contiguous. One wave
+handles 256 elements, from decode through prefill, with no row-count JIT variants.
+The shared `attention_output_gate` entry keeps its Torch expression for other
+architectures, unsupported layouts, nonzero gate floors or nonunit temperatures.
+
 ## GEMM
 
 ### gfx950 channel-scaled FP8 projections

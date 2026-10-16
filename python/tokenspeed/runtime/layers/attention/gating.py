@@ -18,42 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Sigmoid gating of attention outputs."""
+"""Compatibility import for shared attention-output gating."""
 
-from __future__ import annotations
+from tokenspeed_kernel.ops.activation import (
+    attention_output_gate as apply_attention_output_gate,
+)
 
-import torch
-
-
-def apply_attention_output_gate(
-    output: torch.Tensor,
-    gate: torch.Tensor,
-    gate_bias: torch.Tensor,
-    floor: float,
-    temperature: float,
-) -> torch.Tensor:
-    """Apply a biased sigmoid gate with a floor and temperature.
-
-    Args:
-        output: Attention output shaped ``[..., heads, head_dim]``.
-        gate: Projected gate logits with the same shape as output.
-        gate_bias: One learned scalar per head, broadcast over head_dim.
-        floor: Lower bound in ``floor + (1 - floor) * sigmoid(logits)``.
-        temperature: Positive divisor of the gate logits after adding bias.
-
-    Returns:
-        A new tensor with the output's shape and dtype. Bias addition, sigmoid,
-        and multiplication use FP32; the result is cast once to the output dtype.
-    """
-    if gate.ndim < 2 or output.shape != gate.shape:
-        raise ValueError("attention output and gate must share head and width axes")
-    if gate_bias.ndim != 1 or gate_bias.shape[0] != gate.shape[-2]:
-        raise ValueError("gate_bias must contain one scalar per attention head")
-    if temperature <= 0:
-        raise ValueError(
-            f"attention gate temperature must be positive, got {temperature}"
-        )
-    bias_shape = (1,) * (gate.ndim - 2) + (gate.shape[-2], 1)
-    logits = (gate.float() + gate_bias.float().reshape(bias_shape)) / float(temperature)
-    multiplier = float(floor) + (1.0 - float(floor)) * torch.sigmoid(logits)
-    return (output.float() * multiplier).to(output.dtype)
+__all__ = ["apply_attention_output_gate"]
