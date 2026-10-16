@@ -531,8 +531,8 @@ def _muse_collective_policy_worker(rank, world_size, device):
                 rtol=0,
                 atol=0,
             )
-    for numel, offset in ((512, 0), (44 * 4096, 0), (129 * 8192, rank % 2)):
-        storage = torch.full((numel + 2,), -19, dtype=torch.bfloat16, device=device)
+    for numel, offset in ((512, 0), (44 * 4096, 0), (129 * 8192, 4 * (rank % 2))):
+        storage = torch.full((numel + 8,), -19, dtype=torch.bfloat16, device=device)
         ordinary = storage[offset : offset + numel]
         ordinary.fill_(rank + 1)
         result = state.reduce(ordinary)

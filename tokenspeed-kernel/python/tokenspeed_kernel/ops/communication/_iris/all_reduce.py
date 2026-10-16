@@ -174,14 +174,10 @@ def _launch_pull_twoshot(
     )
     num_tiles = triton.cdiv(partition_words, block_words)
     num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
-    # Packed stores require an aligned destination on every caller's path.
-    aligned_output = (
-        torch.empty_like(out) if out.data_ptr() % _PACKED_WORD_BYTES else out
-    )
     iris_pull_twoshot[(num_programs,)](
         inputs,
         scratch,
-        aligned_output,
+        out,
         ready_flags,
         *peers.addresses,
         RANK=peers.rank,
@@ -198,8 +194,6 @@ def _launch_pull_twoshot(
         FLAG_ROW_STRIDE=ready_flags.stride(0),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
-    if aligned_output is not out:
-        out.copy_(aligned_output)
 
 
 class StagedPullTwoShot:
@@ -247,15 +241,22 @@ class StagedPullTwoShot:
 
     def run(self, tensor: torch.Tensor, out: torch.Tensor) -> None:
         self.input[: tensor.numel()].copy_(tensor.view(-1))
+        # Packed stores require an aligned destination; ranks keep the same
+        # collective when a caller supplies an element-aligned tensor view.
+        aligned_output = (
+            torch.empty_like(out) if out.data_ptr() % _PACKED_WORD_BYTES else out
+        )
         # Graph replay reuses this staging address; peers must finish reading it.
         _launch_pull_twoshot(
             self.peers,
             self.input,
             self.scratch,
             self.ready_flags,
-            out,
+            aligned_output,
             exit_barrier=True,
         )
+        if aligned_output is not out:
+            out.copy_(aligned_output)
 
 
 class ProducerPull:
@@ -293,6 +294,7 @@ class ProducerPull:
         )
 
     def run(self, out: torch.Tensor) -> None:
+        assert out.data_ptr() % _PACKED_WORD_BYTES == 0
         peers = self.producer.peers
         inputs = self.producer.data
         if _use_two_stage_producer_direct(peers.world_size, out.numel(), inputs.dtype):
