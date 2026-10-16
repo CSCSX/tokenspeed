@@ -36,12 +36,15 @@ General all-reduce implementations remain in `all_reduce.py`, separate from
 K3's shapes and fusion policies.
 
 Ordinary tensors use a Gluon one-shot that stages, publishes each workgroup's
-epoch, and pulls peers in rank order. On gfx950, BF16 staged two-shot starts at
+epoch, and pulls peers in rank order. All payloads share its staging geometry.
+On gfx950, BF16 staged two-shot starts at
 1 MiB for TP4 and 448 KiB for TP8; smaller payloads avoid its extra rendezvous.
 Producer-direct thresholds are independent. Fused all-reduce/residual/RMSNorm
 uses the same two-slot staging mechanism per row, avoiding a second peer wait
 before reuse. Its persistent grid strides rows with independent row epochs;
 group-relative peer addresses also support noncontiguous subgroups.
+The row layout aims for one packed word per lane, up to 16 subgroups per
+workgroup, independently of model and row count.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:

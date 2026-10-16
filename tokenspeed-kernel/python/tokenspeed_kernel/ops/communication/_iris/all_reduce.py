@@ -386,21 +386,6 @@ class ProducerLamport:
         )
 
 
-def staged_tuning(
-    max_numel: int, world_size: int, dtype: torch.dtype
-) -> tuple[int, int, int] | None:
-    """Return the measured TP4 geometry when this state can serve its payload."""
-    # This exact CDNA4 TP4 payload is faster with the one-shot geometry.
-    if (
-        current_platform().is_cdna4
-        and world_size == 4
-        and dtype == torch.bfloat16
-        and max_numel >= 16 * 4096
-    ):
-        return 16 * 4096, 512, 1
-    return None
-
-
 def all_reduce_heap_bytes(
     staged_max_numel: int,
     producer_max_numel: int,
@@ -415,10 +400,6 @@ def all_reduce_heap_bytes(
         size += StagedPullOneShot.heap_bytes(
             staged_max_numel, world_size, dtype, StagedPullOneShot.BLOCK_SIZE
         )
-        tuning = staged_tuning(staged_max_numel, world_size, dtype)
-        if tuning is not None:
-            numel, block_size, _ = tuning
-            size += StagedPullOneShot.heap_bytes(numel, world_size, dtype, block_size)
         if StagedPullTwoShot.supported(world_size, dtype):
             size += StagedPullTwoShot.heap_bytes(staged_max_numel, world_size, dtype)
     return size

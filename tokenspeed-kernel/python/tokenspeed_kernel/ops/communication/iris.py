@@ -162,7 +162,6 @@ class IrisAllReduce:
             ProducerPull,
             StagedPullOneShot,
             StagedPullTwoShot,
-            staged_tuning,
         )
 
         if min(staged_max_numel, producer_direct_max_numel) < 0:
@@ -194,14 +193,6 @@ class IrisAllReduce:
             if staged_max_numel
             else None
         )
-        tuning = staged_tuning(staged_max_numel, peers.world_size, dtype)
-        self.tuned_staged = (
-            StagedPullOneShot(
-                peers, tuning[0], dtype, block_size=tuning[1], num_subgroups=tuning[2]
-            )
-            if tuning is not None
-            else None
-        )
         self.staged_two_shot = (
             StagedPullTwoShot(peers, staged_max_numel, dtype)
             if staged_max_numel and StagedPullTwoShot.supported(peers.world_size, dtype)
@@ -218,12 +209,7 @@ class IrisAllReduce:
         assert not async_op, "Iris all-reduce does not support async_op"
         assert tensor.dtype == self.dtype
         assert 0 < tensor.numel() <= self.staged_max_numel
-        if (
-            self.tuned_staged is not None
-            and tensor.numel() == self.tuned_staged.slots.shape[1]
-        ):
-            self.tuned_staged.run(tensor, tensor)
-        elif self.staged_two_shot is not None and self.staged_two_shot.can_run(
+        if self.staged_two_shot is not None and self.staged_two_shot.can_run(
             tensor.numel()
         ):
             self.staged_two_shot.run(tensor, tensor)
@@ -343,7 +329,7 @@ class IrisAllReduceResidualRMSNorm(object):
 
     # Rotate rows between slots so reuse needs only the next entry rendezvous.
     INPUT_SLOTS = 2
-    # Each row is reduced by one workgroup; aim for 16-byte lanes per subgroup.
+    # Each row is reduced by one workgroup; aim for one packed word per lane.
     MAX_SUBGROUPS = 16
 
     def __init__(
@@ -456,7 +442,7 @@ class IrisAllReduceResidualRMSNorm(object):
             residual_out = torch.empty_like(residual)
 
         block_size = max(triton.next_power_of_2(self.hidden_dim), self.subgroup_size)
-        lane_elements = 16 // input_tensor.element_size()
+        lane_elements = _PACKED_WORD_BYTES // input_tensor.element_size()
         subgroups = max(
             1,
             min(self.MAX_SUBGROUPS, block_size // (self.subgroup_size * lane_elements)),

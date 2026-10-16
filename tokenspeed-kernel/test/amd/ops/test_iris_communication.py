@@ -198,7 +198,7 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
 
 
 def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
-    # The tuned one-shot geometry, then a payload past the TP4 two-shot minimum.
+    # A one-shot payload, then a payload past the TP4 two-shot minimum.
     return [(16, 4096), (128, 4096)]
 
 
@@ -279,12 +279,6 @@ def _ar_worker_main(
             heap_size=None,
             device=device,
         )
-        if world_size == 4 and current_platform().is_cdna4:
-            assert state.tuned_staged.slots.data_ptr() != state.staged.slots.data_ptr()
-            assert (
-                state.tuned_staged.ready_flags.data_ptr()
-                != state.staged.ready_flags.data_ptr()
-            )
         k3 = None
         if attnres_max_numel:
             from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
@@ -320,11 +314,11 @@ def _ar_worker_main(
                     )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
-                verify_tuning = current_platform().is_cdna4
-                if verify_tuning:
+                verify_protocols = current_platform().is_cdna4
+                if verify_protocols:
                     torch.cuda.synchronize()
                     dist.barrier()
-                    tuned_before = state.tuned_staged.ready_flags.clone()
+                    staged_before = state.staged.ready_flags.clone()
                     twoshot_before = state.staged_two_shot.ready_flags.clone()
                     torch.cuda.synchronize()
                     dist.barrier()
@@ -337,20 +331,20 @@ def _ar_worker_main(
                     storage_offset=0,
                     safe=False,
                 )
-                if verify_tuning:
+                if verify_protocols:
                     torch.cuda.synchronize()
                     dist.barrier()
-                    tuned_changed = not torch.equal(
-                        state.tuned_staged.ready_flags, tuned_before
+                    staged_changed = not torch.equal(
+                        state.staged.ready_flags, staged_before
                     )
                     twoshot_changed = not torch.equal(
                         state.staged_two_shot.ready_flags, twoshot_before
                     )
-                    assert tuned_changed == (math.prod(shape) == 65536)
+                    assert staged_changed == (math.prod(shape) == 65536)
                     assert twoshot_changed == (math.prod(shape) != 65536)
                     dist.barrier()
             if current_platform().is_cdna4:
-                _check_mixed_geometry_graph_replay(
+                _check_partial_tile_graph_replay(
                     state,
                     rank,
                     world_size,
@@ -502,7 +496,7 @@ def _check_all_reduce_graph_replay(
         assert storage[0].item() == -1
 
 
-def _check_mixed_geometry_graph_replay(
+def _check_partial_tile_graph_replay(
     state,
     rank: int,
     world_size: int,
