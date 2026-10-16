@@ -36,6 +36,7 @@ from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
     format_signature,
+    format_signatures,
     tensor_format,
 )
 from tokenspeed_kernel.workspace import zeroed_state
@@ -57,6 +58,72 @@ _GFX950_CAPABILITY = CapabilityRequirement(
     max_arch_version=ArchVersion(9, 5),
     vendors=frozenset({"amd"}),
 )
+
+
+# ===-----------------------------------------------------------------------===#
+# Channel-scaled FP8 storage, exact BF16 operands (AMD gfx950)
+# ===-----------------------------------------------------------------------===#
+
+
+if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.channel import (
+        launch_gluon_mm_fp8_channel_gfx950 as _mm_fp8_channel_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.channel import (
+        supports_gluon_mm_fp8_channel_gfx950 as _supports_mm_fp8_channel,
+    )
+
+    _FP8_CHANNEL_SIGNATURES = format_signatures(
+        ("a", "b"),
+        "scaled-fp8",
+        {_FP8_DTYPE},
+        scale=ScaleFormat(storage_dtype=torch.float32, granularity="channel"),
+    )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_channel_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_FP8_CHANNEL_SIGNATURES,
+        priority=Priority.PERFORMANT + 3,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mm_fp8_channel}),
+            "b_layout": frozenset({"KN"}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16, torch.float32}),
+            "out_inner_stride_one": frozenset({True}),
+            "pdl_enabled": frozenset({False}),
+        },
+    )
+    def gluon_mm_fp8_channel_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply row/column FP32 scales to FP8-code GEMM before output rounding.
+
+        Args:
+            A, B: E4M3 matrices ``[M, K]`` and ``[K, N]``.
+            A_scales, B_scales: FP32 row/column scale vectors or scalars.
+            out_dtype: BF16, FP16 or FP32 destination dtype.
+            alpha, block_size: Must be None for row/column scaling.
+            out: Optional caller-owned ``[M, N]`` destination.
+
+        Returns:
+            The scaled matrix product, using exact BF16 operand widening.
+        """
+        if alpha is not None or block_size is not None:
+            raise ValueError("channel FP8 MM takes no alpha or block_size")
+        if A_scales is None or B_scales is None:
+            raise ValueError("channel FP8 MM requires both operand scales")
+        return _mm_fp8_channel_impl(A, B, A_scales, B_scales, out_dtype, out=out)
 
 
 # ===-----------------------------------------------------------------------===#

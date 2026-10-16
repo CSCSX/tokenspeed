@@ -58,6 +58,29 @@ skew and regress perf even when the generated kernel remains correct.
 
 ## GEMM
 
+### gfx950 channel-scaled FP8 projections
+
+`gluon_mm_fp8_channel_gfx950` computes `A @ B` from E4M3 matrices with FP32
+per-row/per-column or scalar scales. It accepts strided operands and caller
+outputs, and writes BF16, FP16 or FP32. Automatic selection is limited to
+measured projection geometries with up to 8192 rows. Other geometries and
+other architectures keep their existing kernels.
+Only the channel-scale signature is registered: adding this kernel does not
+enable model consumers that move dequantization after an unscaled FP8 GEMM.
+
+Raw E4M3 values widen exactly to BF16 for MFMA, avoiding gfx950 native FP8
+MFMA's reduced internal accumulation precision without partitioning every
+dot into eight sparse dots. Accumulation is FP32. Decode-sized grids split
+K to expose parallelism; a second kernel sums FP32 partials in fixed split
+order. Larger grids store directly. The epilogue multiplies the token scale,
+then the channel scale, in FP32 before one output conversion. Explicit FP32
+multiply instructions keep both rounding points even at FP16 tie cases.
+
+The result follows a conventional FP32 dot-product error bound, not bitwise
+identity with a different accumulation order. Tests cover all finite E4M3
+products, mixed-magnitude products, FP32 error bounds, scaling/strides/output
+guards and changed-input graph replay without row-count recompilation.
+
 ### gfx950 dense BF16 projections
 
 The gfx950 package provides dense BF16 projection kernels: an eight-wave

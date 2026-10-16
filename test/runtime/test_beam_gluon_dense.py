@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Portable dense dispatch remains independent of Gluon attention and experts."""
+"""Dense FP8 selection remains independent of attention and expert backends."""
 
 import argparse
 import sys
@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
 
@@ -47,15 +48,23 @@ FAMILIES = [(1792, 5120), (5120, 768), (5120, 5120), (5120, 2560)]
 
 @pytest.mark.parametrize("n,k", FAMILIES)
 @pytest.mark.parametrize("m", [1, 16, 32, 64, 128, 256, 8192])
-def test_channel_registry_selects_original_portable_implementation(m, n, k):
+def test_channel_registry_selects_platform_implementation(m, n, k):
     scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
     operand = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=scale)
     signature = format_signature(a=operand, b=operand)
     traits = {"m": m, "n": n, "k": k, "b_layout": "KN", "out_dtype": torch.bfloat16}
     selected = select_kernel("gemm", "mm", signature, traits=traits)
-    assert selected.name == "triton_mm_fp8_scaled"
-    with pytest.raises(NoKernelFoundError):
-        select_kernel("gemm", "mm", signature, traits=traits, solution="gluon")
+    platform = current_platform()
+    if platform.is_amd and platform.arch_version == ArchVersion(9, 5):
+        assert selected.name == "gluon_mm_fp8_channel_gfx950"
+        assert (
+            select_kernel("gemm", "mm", signature, traits=traits, solution="gluon").name
+            == selected.name
+        )
+    else:
+        assert selected.name == "triton_mm_fp8_scaled"
+        with pytest.raises(NoKernelFoundError):
+            select_kernel("gemm", "mm", signature, traits=traits, solution="gluon")
 
 
 @pytest.mark.parametrize("n,k", FAMILIES)
