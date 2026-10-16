@@ -78,13 +78,17 @@ def _reference(
 
 @pytest.mark.parametrize(
     "width,accepted",
-    [(width, accepted) for width in (1, 2, 3, 4, 8) for accepted in range(width + 1)],
+    [
+        (width, accepted)
+        for width in (1, 2, 3, 4, 8, 16)
+        for accepted in range(width + 1)
+    ],
 )
 @pytest.mark.parametrize("dim", [64, 128])
 def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int, dim: int) -> None:
     torch.manual_seed(7331)
     device = "cuda"
-    batch, heads = (4, 12)
+    batch, heads = (8 if width == 16 else 4, 12)
     q = torch.randn(batch, width, heads, dim, device=device).bfloat16()
     k = torch.randn_like(q)
     v = torch.randn_like(q).mul_(0.2)
@@ -443,19 +447,25 @@ def test_recoverssm_ragged_prefix_and_null_rows(batch: int, captured: bool) -> N
 
 
 @pytest.mark.parametrize("captured", [False, True])
-def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> None:
-    """Exercise the production two-kernel commit, not the single-layer adapter."""
+@pytest.mark.parametrize(
+    "width,capacity", [(4, 4), (4, 32), (16, 16), (16, 19), (16, 32), (32, 32)]
+)
+@pytest.mark.parametrize("heads", [2, 8])
+def test_batched_recoverssm_commit_groups_alias_and_padding(
+    captured: bool, width: int, capacity: int, heads: int
+) -> None:
+    """Replay both recovery variants with changing lengths and wrapped records."""
     from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
         batched_recoverssm_commit,
     )
 
     torch.manual_seed(982)
-    layers, batch, width, heads, dim, pages = (3, 6, 4, 2, 128, 12)
+    layers, batch, dim, pages = (3, 6, 128, 12)
     channels = heads * dim
     groups_cpu = [1, 0, 1]
     read_cpu = [[1, 2, 3, 4, 5, -1], [5, 4, 3, 2, 1, -1]]
     write_cpu = [[6, 2, 7, 4, 8, -1], [6, 4, 7, 2, 8, -1]]
-    accepted_cpu = [0, 1, 2, 3, 4, 0]
+    accepted_cpu = [0, 1, 2, width - 1, width, 0]
     groups = torch.tensor(groups_cpu, device="cuda", dtype=torch.int32)
     reads = torch.tensor(read_cpu, device="cuda", dtype=torch.int32)
     writes = torch.tensor(write_cpu, device="cuda", dtype=torch.int32)
@@ -468,24 +478,27 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
         layers, batch * width, 3 * channels + 16, device="cuda", dtype=torch.bfloat16
     )
     corrections = (
-        torch.randn(layers, batch * width, channels + 16, device="cuda") * 0.01
+        torch.randn(layers, batch * capacity, channels + 16, device="cuda") * 0.01
     )
-    kd = torch.randn(layers, batch * width, 2 * channels + 16, device="cuda") * 0.02
-    kd[:, :, : 2 * channels].view(layers, batch * width, heads, 2, dim)[
+    kd = torch.randn(layers, batch * capacity, 2 * channels + 16, device="cuda") * 0.02
+    kd[:, :, : 2 * channels].view(layers, batch * capacity, heads, 2, dim)[
         :, :, :, 1
     ].sigmoid_()
     a_log = torch.randn(layers, heads, device="cuda") * 0.1
     dt_bias = torch.randn(layers, heads, dim, device="cuda") * 0.1
     kd = kd.bfloat16()
+    record_start = 2**32 + capacity - 2
     metadata = torch.tensor(
-        [[request, 7, 0] for request in range(batch)], device="cuda", dtype=torch.int64
+        [[request, 7, record_start] for request in range(batch)],
+        device="cuda",
+        dtype=torch.int64,
     )
-    stamps = torch.empty(layers, batch, width, 2, device="cuda", dtype=torch.int64)
-    stamps[..., 0] = torch.arange(width, device="cuda")
+    stamps = torch.empty(layers, batch, capacity, 2, device="cuda", dtype=torch.int64)
+    positions = record_start + torch.arange(capacity, device="cuda", dtype=torch.int64)
+    stamps[:, :, positions % capacity, 0] = positions
     stamps[..., 1] = 7
     stamps[:, -1].fill_(-1)
     seed_state, seed_conv = (states.clone(), conv.clone())
-    expected_state, expected_conv = (states.clone(), conv.clone())
     descriptors = torch.zeros(layers, 10, device="cuda", dtype=torch.int64)
     for column, storage in (
         (0, raw),
@@ -497,32 +510,6 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
         (7, dt_bias),
     ):
         descriptors[:, column] = _device_addresses(tuple(storage.unbind()))
-    for layer, group in enumerate(groups_cpu):
-        for request, count in enumerate(accepted_cpu[:-1]):
-            source, dest = (read_cpu[group][request], write_cpu[group][request])
-            state = seed_state[layer, source].clone()
-            history = seed_conv[layer, source].clone()
-            for token in range(count):
-                row = request * width + token
-                key, decay = (
-                    kd[layer, row, : 2 * channels].view(heads, 2, dim).unbind(1)
-                )
-                correction = corrections[layer, row, :channels].view(heads, dim)
-                key = key.float()
-                key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-06)
-                decay = torch.exp(
-                    -5.0
-                    * torch.sigmoid(
-                        a_log[layer].exp()[:, None] * (decay.float() + dt_bias[layer])
-                    )
-                )
-                state = state * decay[:, None, :]
-                state = state + correction[:, :, None] * key[:, None, :]
-                history = torch.cat(
-                    (history[:, 1:], raw[layer, row, : 3 * channels, None]), dim=1
-                )
-            expected_state[layer, dest] = state
-            expected_conv[layer, dest] = history
 
     def launch() -> None:
         batched_recoverssm_commit(
@@ -552,14 +539,51 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch()
-    for _ in range(2):
+    for accepted_cpu in (
+        accepted_cpu,
+        [width, 0, width - 1, 1, 2, 0],
+        [1, 3, 0, width, 4, 0],
+    ):
+        accepted.copy_(torch.tensor(accepted_cpu, device="cuda", dtype=torch.int32))
+        expected_state, expected_conv = (seed_state.clone(), seed_conv.clone())
+        for layer, group in enumerate(groups_cpu):
+            for request, count in enumerate(accepted_cpu[:-1]):
+                source, dest = (read_cpu[group][request], write_cpu[group][request])
+                state = seed_state[layer, source].clone()
+                history = seed_conv[layer, source].clone()
+                for token in range(count):
+                    row = request * capacity + (record_start + token) % capacity
+                    key, decay = (
+                        kd[layer, row, : 2 * channels].view(heads, 2, dim).unbind(1)
+                    )
+                    correction = corrections[layer, row, :channels].view(heads, dim)
+                    key = key.float()
+                    key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-06)
+                    decay = torch.exp(
+                        -5.0
+                        * torch.sigmoid(
+                            a_log[layer].exp()[:, None]
+                            * (decay.float() + dt_bias[layer])
+                        )
+                    )
+                    state = state * decay[:, None, :]
+                    state = state + correction[:, :, None] * key[:, None, :]
+                    history = torch.cat(
+                        (
+                            history[:, 1:],
+                            raw[layer, request * width + token, : 3 * channels, None],
+                        ),
+                        dim=1,
+                    )
+                expected_state[layer, dest] = state
+                expected_conv[layer, dest] = history
         states.copy_(seed_state)
         conv.copy_(seed_conv)
         if graph is None:
             launch()
         else:
             graph.replay()
-        torch.testing.assert_close(states, expected_state, atol=1e-05, rtol=0.001)
+        torch.testing.assert_close(states, expected_state, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(conv, expected_conv, atol=0, rtol=0)
         states = torch.empty_like(states)
         conv = torch.empty_like(conv)
@@ -904,5 +928,75 @@ def _check_gate_recovery(
         record_metadata=None,
         record_stamps=None,
         lower_bound=lower_bound,
+    )
+    torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("width", [4, 16, 32])
+@pytest.mark.parametrize("raw_gate", [-20.0, 20.0])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+def test_recoverssm_parallel_recovery_extreme_decays(
+    width: int, raw_gate: float, lower_bound: float | None
+) -> None:
+    """Recover every prefix with near-unit or underflowing total decay."""
+    torch.manual_seed(1893)
+    batch, heads, dim = width + 1, 8, 128
+    state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
+    expected = state.clone()
+    u = torch.randn(batch, heads, width, dim, device="cuda") * 0.2
+    kg = torch.empty(batch, heads, width, 2 * dim, device="cuda", dtype=torch.bfloat16)
+    kg[..., :dim].normal_()
+    kg[..., dim:].fill_(raw_gate)
+    a = torch.zeros(heads, device="cuda")
+    bias = torch.zeros(heads, dim, device="cuda")
+    indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    counts = torch.arange(batch, device="cuda", dtype=torch.int32)
+    starts = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * width
+    gate_input = torch.tensor(raw_gate, device="cuda")
+    gate = (
+        -torch.nn.functional.softplus(gate_input)
+        if lower_bound is None
+        else lower_bound * torch.sigmoid(gate_input)
+    )
+    decay = gate.exp()
+    for token in range(width):
+        key = kg[:, :, token, :dim].float()
+        key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+        update = u[:, :, token, :, None] * key[:, :, None, :]
+        expected[1:] = torch.where(
+            (counts > token)[:, None, None, None],
+            expected[1:] * decay + update,
+            expected[1:],
+        )
+    # Unaccepted records may contain stale or undefined values.
+    invalid = (
+        torch.arange(width, device="cuda")[None, None, :, None]
+        >= counts[:, None, None, None]
+    )
+    u.masked_fill_(invalid, float("nan"))
+    kg.masked_fill_(invalid, float("nan"))
+    placeholder = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+    plan = [torch.empty_like(indices) for _ in range(4)]
+    vllm_triton_kda_recoverssm_commit(
+        placeholder,
+        placeholder,
+        placeholder,
+        checkpoint_state=state,
+        correction_cache=u,
+        kg_cache=kg,
+        state_indices=indices,
+        query_start_loc=starts,
+        num_accepted_tokens=counts,
+        commit_lens=plan[0],
+        final_state_indices=plan[1],
+        boundary_state_indices=plan[2],
+        boundary_recovery_lens=plan[3],
+        state_base_addrs=_device_addresses((state,)),
+        correction_cache_base_addrs=_device_addresses((u,)),
+        kg_cache_base_addrs=_device_addresses((kg,)),
+        spec_query_len=width,
+        record_metadata=None,
+        record_stamps=None,
+        gate_parameters=(a, bias, lower_bound),
     )
     torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)

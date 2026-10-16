@@ -37,6 +37,19 @@ from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
 
+def _use_tensor_cores_for_commit(
+    max_commit_tokens: int, key_dim: int, value_dim: int, num_states: int
+) -> bool:
+    # Use the configured recovery window, not the ring buffer's capacity or
+    # a GPU-to-host read of accepted lengths. GB300 measurements favor CUDA
+    # cores for short windows and small grids. Keep other shapes on that path.
+    return (
+        16 <= max_commit_tokens <= 32
+        and key_dim == value_dim == 128
+        and num_states >= 96
+    )
+
+
 @register_kernel(
     "attention",
     "kda_recoverssm_verify",
@@ -169,6 +182,8 @@ def vllm_triton_kda_recoverssm_commit(
 
     gate_parameters supplies (A_log, dt_bias, lower_bound). Weight parameters
     use FP32; lower_bound=None selects softplus instead of the bounded gate.
+    The configured window and head dimensions select CUDA-core or TF32x3
+    Tensor Core recovery. Accepted lengths stay runtime GPU inputs.
     Return None after updating checkpoint_state.
     """
     del q, k, v
@@ -270,11 +285,16 @@ def vllm_triton_kda_recoverssm_commit(
         K=key_dim,
         V=value_dim,
         BK=block_k,
+        BT=max(8, triton.next_power_of_2(spec_query_len)),
+        USE_TENSOR_CORES=_use_tensor_cores_for_commit(
+            spec_query_len, key_dim, value_dim, batch * num_heads
+        ),
         NUM_HEADS=num_heads,
         ALIGN_MODE=False,
         BATCH=batch,
         LAUNCH_DEPENDENT_KERNELS=False,
         debug=True,
+        sanitize_overflow=False,
         num_stages=2,
     )
 
@@ -328,6 +348,12 @@ def batched_recoverssm_commit(
     Each recurrent layer validates its accepted interval before reading records.
     Both may be None only for standalone unstamped kernel diagnostics.
 
+    For 16--32-token windows with 128-by-128 state and at least 96 independent
+    states (layers * batch * heads), recovery uses one TF32x3 Tensor Core
+    product. Other shapes use CUDA-core updates. The matrix product multiplies
+    FP32 U by normalized keys weighted by subsequent decays, then adds the
+    decayed checkpoint. Buffer capacity does not select the implementation;
+    accepted lengths remain GPU inputs. Selection is fixed during graph capture.
     Return None after recurrent and convolution commits on the caller stream.
     """
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
@@ -430,11 +456,16 @@ def batched_recoverssm_commit(
         K=head_dim,
         V=head_dim,
         BK=triton.next_power_of_2(head_dim),
+        BT=max(8, triton.next_power_of_2(draft_token_num)),
+        USE_TENSOR_CORES=_use_tensor_cores_for_commit(
+            draft_token_num, head_dim, head_dim, batch * layers * num_heads
+        ),
         NUM_HEADS=num_heads,
         ALIGN_MODE=False,
         BATCH=batch,
         LAUNCH_DEPENDENT_KERNELS=False,
         debug=True,
+        sanitize_overflow=False,
         num_stages=2,
     )
     batched_kda_commit_conv_window_kernel[
