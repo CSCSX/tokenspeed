@@ -68,7 +68,7 @@ def test_staged_kernels_compile(arch, subgroup_size, arch_major):
             WORLD_SIZE=2,
             BLOCK_SIZE=4096,
             SLOT_STRIDE=8192,
-            NUM_SLOTS=2 if kernel is iris_pull_oneshot_staged else 1,
+            NUM_SLOTS=2,
             NUM_WARPS=4,
             ARCH_MAJOR=arch_major,
         )

@@ -39,7 +39,7 @@ Ordinary tensors use a Gluon one-shot that stages, publishes each workgroup's
 epoch, and pulls peers in rank order. On gfx950, BF16 staged two-shot starts at
 1 MiB for TP4 and 448 KiB for TP8; smaller payloads avoid its extra rendezvous.
 Producer-direct thresholds are independent. Fused all-reduce/residual/RMSNorm
-uses the same staging mechanism per row, with one slot and a completion wait
+uses the same two-slot staging mechanism per row, avoiding a second peer wait
 before reuse. Its persistent grid strides rows with independent row epochs;
 group-relative peer addresses also support noncontiguous subgroups.
 

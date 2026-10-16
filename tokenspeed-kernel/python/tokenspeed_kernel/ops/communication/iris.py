@@ -341,8 +341,8 @@ def iris_all_reduce_symmetric(
 class IrisAllReduceResidualRMSNorm(object):
     """Fuse a staged all-reduce, residual addition, and RMSNorm per token row."""
 
-    # Keep one payload slot, with a completion wait before it can be restaged.
-    INPUT_SLOTS = 1
+    # Rotate rows between slots so reuse needs only the next entry rendezvous.
+    INPUT_SLOTS = 2
     # Each row is reduced by one workgroup; aim for 16-byte lanes per subgroup.
     MAX_SUBGROUPS = 16
 
