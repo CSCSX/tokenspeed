@@ -42,6 +42,9 @@ IRIS_ALL_REDUCE_MAX_BYTES = 512 << 10
 _PACKED_WORD_BYTES = 8
 _TWO_SHOT_WORLD_SIZES = (4, 8)
 _PRODUCER_TWO_SHOT_MIN_BYTES = {4: 160 << 10, 8: 96 << 10}
+# Ordinary tensors use the staged one-shot below these sizes; measured on
+# gfx950 with BF16 against the Gluon one-shot's single rendezvous.
+_STAGED_TWO_SHOT_MIN_BYTES = {4: 1 << 20, 8: 448 << 10}
 _PRODUCER_DIRECT_GL_DTYPES = {
     torch.bfloat16: gl.bfloat16,
     torch.float16: gl.float16,
@@ -336,6 +339,12 @@ def iris_all_reduce_symmetric(
 
 
 class IrisAllReduceResidualRMSNorm(object):
+    """Fuse a staged all-reduce, residual addition, and RMSNorm per token row."""
+
+    # Keep one payload slot, with a completion wait before it can be restaged.
+    INPUT_SLOTS = 1
+    # Each row is reduced by one workgroup; aim for 16-byte lanes per subgroup.
+    MAX_SUBGROUPS = 16
 
     def __init__(
         self,
@@ -370,28 +379,38 @@ class IrisAllReduceResidualRMSNorm(object):
 
         if heap_size is None:
             buf_bytes = max_token_num * hidden_dim * dtype.itemsize
-            heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
+            flag_bytes = max_token_num * self.world_size * torch.int32.itemsize
+            heap_size = max(1 << 28, 4 * buf_bytes + flag_bytes + (16 << 20))
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
-        from tokenspeed_kernel.ops.communication._iris import get_or_create_context
+        from tokenspeed_kernel.ops.communication._iris import (
+            IrisGroup,
+            get_or_create_context,
+        )
 
         self._ctx = get_or_create_context(heap_size=heap_size)
-        self._input_buf = self._ctx.zeros((max_token_num, hidden_dim), dtype=dtype)
+        self.peers = IrisGroup(self._ctx, group, rank_in_group, self.device)
+        self._input_buf = self._ctx.zeros(
+            (self.INPUT_SLOTS, max_token_num * hidden_dim), dtype=dtype
+        )
+        assert self._input_buf.data_ptr() % 16 == 0
+        self._ready_flags = self._ctx.zeros(
+            (max_token_num, self.world_size), dtype=torch.int32
+        )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
             "Iris AR+RMSNorm symmetric-heap buffer allocated: "
             f"{free_gpu_memory_begin - free_gpu_memory_after!s} GB",
         )
 
-        self._rank_start = 0
-        self._rank_stride = 1
-        self._iris_rank = dist.get_rank()
-
         self.persistent = persistent
+        self.subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
+        self.arch_major = _platform.arch_version.major
         self._num_programs = (
             torch.cuda.get_device_properties(self.device).multi_processor_count
             if persistent
             else 0
         )
+        self.peers.finish_prepare()
 
     def fused(
         self,
@@ -429,46 +448,43 @@ class IrisAllReduceResidualRMSNorm(object):
 
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
             iris_pull_oneshot_rmsnorm,
-            iris_pull_oneshot_rmsnorm_persistent,
         )
-
-        in_view = self._input_buf[:num_tokens, :]
-        in_view.copy_(input_tensor)
 
         if norm_out is None:
             norm_out = torch.empty_like(input_tensor)
         if residual_out is None:
             residual_out = torch.empty_like(residual)
 
-        self._ctx.device_barrier()
-
-        heap_bases = self._ctx.get_heap_bases()
-        BLOCK_SIZE = triton.next_power_of_2(self.hidden_dim)
-        if self.persistent:
-            kernel = iris_pull_oneshot_rmsnorm_persistent
-            grid = (min(num_tokens, self._num_programs),)
-        else:
-            kernel = iris_pull_oneshot_rmsnorm
-            grid = (num_tokens,)
-        kernel[grid](
-            in_view,
+        block_size = max(triton.next_power_of_2(self.hidden_dim), self.subgroup_size)
+        lane_elements = 16 // input_tensor.element_size()
+        subgroups = max(
+            1,
+            min(self.MAX_SUBGROUPS, block_size // (self.subgroup_size * lane_elements)),
+        )
+        programs = (
+            min(num_tokens, self._num_programs) if self.persistent else num_tokens
+        )
+        iris_pull_oneshot_rmsnorm[(programs,)](
+            input_tensor,
             residual,
             weight,
             norm_out,
             residual_out,
+            self._input_buf,
+            self._ready_flags,
+            *self.peers.addresses,
             num_tokens,
-            heap_bases,
-            iris_rank=self._iris_rank,
-            world_size=self.world_size,
-            rank_start=self._rank_start,
-            rank_stride=self._rank_stride,
+            RANK=self.peers.rank,
+            WORLD_SIZE=self.world_size,
             HIDDEN_SIZE=self.hidden_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=block_size,
+            SLOT_STRIDE=self._input_buf.shape[1],
+            NUM_SLOTS=self.INPUT_SLOTS,
             EPS=eps,
-            num_warps=8,
+            NUM_WARPS=subgroups,
+            ARCH_MAJOR=self.arch_major,
+            num_warps=subgroups,
         )
-        # Ensure all peer loads finish before the next call reuses _input_buf.
-        self._ctx.device_barrier()
         return norm_out, residual_out
 
 

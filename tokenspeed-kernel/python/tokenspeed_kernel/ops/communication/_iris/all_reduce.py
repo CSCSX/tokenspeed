@@ -23,11 +23,12 @@
 import math
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl, triton
-from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
+from tokenspeed_kernel._triton import gl, gluon, hip_utils, tl, triton
+from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication.iris import (
     _PACKED_WORD_BYTES,
     _PRODUCER_DIRECT_GL_DTYPES,
+    _STAGED_TWO_SHOT_MIN_BYTES,
     _TWO_SHOT_WORLD_SIZES,
     _use_two_stage_plain,
     _use_two_stage_producer_direct,
@@ -35,7 +36,6 @@ from tokenspeed_kernel.ops.communication.iris import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-_SUBGROUP_SIZE = 64
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
@@ -127,7 +127,10 @@ class StagedPullOneShot:
         self.peers = peers
         self.block_size = block_size
         self.num_subgroups = num_subgroups
+        self.arch_major = current_platform().arch_version.major
         self.slots = peers.ctx.zeros((self.INPUT_SLOTS, max_numel), dtype=dtype)
+        # Kernels mark peer slot bases as 16-byte aligned.
+        assert self.slots.data_ptr() % 16 == 0
         self.ready_flags = peers.ctx.zeros(
             (triton.cdiv(max_numel, self.block_size), peers.world_size),
             dtype=torch.int32,
@@ -139,13 +142,15 @@ class StagedPullOneShot:
             self.slots.view(-1),
             out.view(-1),
             self.ready_flags,
-            self.peers.bases,
+            *self.peers.addresses,
             tensor.numel(),
             RANK=self.peers.rank,
             WORLD_SIZE=self.peers.world_size,
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
+            NUM_WARPS=self.num_subgroups,
+            ARCH_MAJOR=self.arch_major,
             num_warps=self.num_subgroups,
         )
 
@@ -163,7 +168,7 @@ def _launch_pull_twoshot(
     partition_words = out.numel() // peers.world_size // elements_per_word
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * _SUBGROUP_SIZE
+        * triton.runtime.driver.active.get_current_target().warp_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -182,7 +187,6 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
@@ -221,8 +225,12 @@ class StagedPullTwoShot:
         )
 
     def can_run(self, numel: int) -> bool:
-        return 0 < numel <= self.input.numel() and _use_two_stage_plain(
-            self.peers.world_size, numel, self.input.dtype
+        world_size = self.peers.world_size
+        return (
+            0 < numel <= self.input.numel()
+            and numel * self.input.element_size()
+            >= _STAGED_TWO_SHOT_MIN_BYTES[world_size]
+            and _use_two_stage_plain(world_size, numel, self.input.dtype)
         )
 
     def run(self, tensor: torch.Tensor, out: torch.Tensor) -> None:
@@ -302,7 +310,6 @@ class ProducerPull:
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=_SUBGROUP_SIZE,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
@@ -429,92 +436,293 @@ def _iris_drain_subgroup_vmem():
     )
 
 
-@triton.jit
-def iris_pull_oneshot_staged(
+@gluon.jit
+def _iris_staged_drain_vmem(ARCH_MAJOR: gl.constexpr):
+    if ARCH_MAJOR >= 12:
+        gl.inline_asm_elementwise(
+            "s_wait_loadcnt 0; s_wait_storecnt 0",
+            "=r,~{memory}",
+            [],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        _iris_drain_subgroup_vmem()
+
+
+@gluon.jit
+def _iris_staged_pull_reduce(
     input_ptr,
-    input_sym_ptr,
-    output_ptr,
+    slots_ptr,
     ready_flags,
-    heap_bases,
-    NUMEL,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    SLOT_STRIDE: tl.constexpr,
-    NUM_SLOTS: tl.constexpr,
+    flag_row,
+    offsets,
+    mask,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SLOT_STRIDE: gl.constexpr,
+    NUM_SLOTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ARCH_MAJOR: gl.constexpr,
 ):
-    """One-shot all-reduce over rotating staging slots.
+    """Stage local values, pull every peer's copy, and return the FP32 sum.
 
-    A single staging slot is not safe across calls. Each rank stages, publishes
-    a ready epoch, waits for its peers, sums their slots and returns -- but the
-    store happens *before* the wait, so a rank called straight back overwrites
-    the slot a slower peer is still summing, and that peer silently sums the
-    next collective's data. No error, no hang, just wrong numbers on whichever
-    ranks lagged.
+    Staging precedes the entry wait, so a rank called straight back would
+    overwrite a slot a slower peer is still reading. With two or more rotating
+    slots, the entry wait is sufficient: before a rank returns to epoch E's
+    slot it must pass the wait at E+1, and a peer publishes E+1 only after it
+    has finished reading E. A single slot instead needs a completion
+    rendezvous before returning, trading heap for one more peer wait.
 
-    Rotating over at least two slots closes it, and the existing entry barrier
-    makes two sufficient. Writing epoch E+1 lands on a different slot. Before a
-    rank can wrap back to E's slot, it must pass the entry wait at E+1; a peer
-    publishes ready(E+1) only after it has finished reading E. By the time a
-    slot is reused, every peer is provably done with it, and no consumption flag
-    or exit barrier has to be paid for.
-
-    Epochs are per-block, so a grid that shrinks between calls leaves the higher
-    blocks' counters where they were. That is consistent across ranks -- every
-    rank launches the same grid for the same collective -- and blocks never read
-    each other's slots, so they may sit on different slots at once.
-
-    Epochs are int32 and wrap after 2**31 calls per block. The slot index is
-    taken from the unsigned epoch, so with a power-of-two slot count the
-    rotation continues across the wrap, and the wait compares modulo 2**32,
-    so an epoch just past the wrap still counts as newer.
+    Each ``flag_row`` is an independent epoch domain; every rank launches the
+    same rows for a collective, so a shrinking grid leaves unused rows' epochs
+    consistent. Epochs are int32 and wrap: the slot comes from the low bits
+    and the wait compares modulo 2**32.
     """
-    # 2**32 must be a multiple of the slot count for the rotation to survive
-    # the wrap.
-    tl.static_assert(NUM_SLOTS & (NUM_SLOTS - 1) == 0)
-    block_id = tl.program_id(0)
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < NUMEL
+    gl.static_assert(NUM_SLOTS & (NUM_SLOTS - 1) == 0)
+    local_heap = _iris_heap_base(
+        RANK,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    epoch_ptr = ready_flags + flag_row * WORLD_SIZE + RANK
+    # Only this rank writes its own counter, and the previous launch finished.
+    epoch = gl.load(epoch_ptr) + 1
+    slot = (epoch & (NUM_SLOTS - 1)) * SLOT_STRIDE
 
-    flag_offset = block_id * WORLD_SIZE
-    local_ready = ready_flags + flag_offset + RANK
-    epoch = tl.load(local_ready).to(tl.int32) + 1
-    slot = (epoch.to(tl.uint32, bitcast=True) % NUM_SLOTS).to(tl.int32) * SLOT_STRIDE
+    local = gl.load(input_ptr + offsets, mask=mask, other=0.0)
+    gl.store(slots_ptr + slot + offsets, local, mask=mask, cache_modifier=".wt")
+    # Join every subgroup's staging stores before peers can observe the epoch.
+    _iris_staged_drain_vmem(ARCH_MAJOR)
+    gl.barrier()
+    gl.atomic_xchg(epoch_ptr, epoch, sem="release", scope="sys")
+    # Pushing epochs lets each rank poll local memory for all peers at once.
+    _iris_sync_rank_epoch(
+        ready_flags,
+        flag_row,
+        epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+        PUBLISH=True,
+    )
 
-    local = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    tl.store(input_sym_ptr + slot + offsets, local, mask=mask, cache_modifier=".wt")
-    tl.debug_barrier()
-
-    tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
-    for peer in tl.static_range(0, WORLD_SIZE):
-        if peer != RANK:
-            # Start one behind so the first poll always happens, then compare
-            # modulo 2**32: a peer may already have passed the wrap.
-            seen = epoch - 1
-            while (seen - epoch) < 0:
-                seen = iris.load(
-                    ready_flags + flag_offset + peer,
-                    RANK,
+    # Every rank adds in rank order so all ranks hold bitwise-equal results.
+    for peer in gl.static_range(0, WORLD_SIZE):
+        if peer == RANK:
+            term = local
+        else:
+            peer_slots = _iris_translate(
+                slots_ptr,
+                local_heap,
+                _iris_heap_base(
                     peer,
-                    heap_bases,
-                    cache_modifier=".cv",
-                    volatile=True,
-                )
-
-    acc = local.to(tl.float32)
-    for peer in tl.static_range(0, WORLD_SIZE):
-        if peer != RANK:
-            acc += iris.load(
-                input_sym_ptr + slot + offsets,
-                RANK,
-                peer,
-                heap_bases,
+                    heap_base_0,
+                    heap_base_1,
+                    heap_base_2,
+                    heap_base_3,
+                    heap_base_4,
+                    heap_base_5,
+                    heap_base_6,
+                    heap_base_7,
+                ),
+            )
+            term = gl.load(
+                peer_slots + slot + offsets,
                 mask=mask,
                 other=0.0,
                 cache_modifier=".cg",
-                hint=BLOCK_SIZE,
-            ).to(tl.float32)
-    tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
+            )
+        if peer == 0:
+            acc = term.to(gl.float32)
+        else:
+            acc += term.to(gl.float32)
+
+    if NUM_SLOTS == 1:
+        # Peers must finish reading this slot before the next call restages it.
+        _iris_staged_drain_vmem(ARCH_MAJOR)
+        gl.barrier()
+        gl.atomic_xchg(epoch_ptr, epoch + 1, sem="release", scope="sys")
+        _iris_sync_rank_epoch(
+            ready_flags,
+            flag_row,
+            epoch + 1,
+            local_heap,
+            heap_base_0,
+            heap_base_1,
+            heap_base_2,
+            heap_base_3,
+            heap_base_4,
+            heap_base_5,
+            heap_base_6,
+            heap_base_7,
+            RANK,
+            WORLD_SIZE,
+            NUM_WARPS,
+            PUBLISH=True,
+        )
+    return acc
+
+
+@gluon.jit
+def iris_pull_oneshot_staged(
+    input_ptr,
+    slots_ptr,
+    output_ptr,
+    ready_flags,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    NUMEL,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    SLOT_STRIDE: gl.constexpr,
+    NUM_SLOTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ARCH_MAJOR: gl.constexpr,
+):
+    """Reduce an ordinary tensor through rotating symmetric staging slots."""
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
+    gl.static_assert(BLOCK_SIZE % (SUBGROUP_SIZE * NUM_WARPS) == 0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK_SIZE // (SUBGROUP_SIZE * NUM_WARPS)], [SUBGROUP_SIZE], [NUM_WARPS], [0]
+    )
+    block_id = gl.program_id(0)
+    offsets = block_id * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
+    mask = offsets < NUMEL
+    acc = _iris_staged_pull_reduce(
+        input_ptr,
+        slots_ptr,
+        ready_flags,
+        block_id,
+        offsets,
+        mask,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        SLOT_STRIDE,
+        NUM_SLOTS,
+        NUM_WARPS,
+        ARCH_MAJOR,
+    )
+    gl.store(output_ptr + offsets, acc.to(output_ptr.dtype.element_ty), mask=mask)
+
+
+@gluon.jit
+def iris_pull_oneshot_rmsnorm(
+    input_ptr,
+    residual_ptr,
+    weight_ptr,
+    norm_out_ptr,
+    residual_out_ptr,
+    slots_ptr,
+    ready_flags,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    NUM_ROWS,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    HIDDEN_SIZE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    SLOT_STRIDE: gl.constexpr,
+    NUM_SLOTS: gl.constexpr,
+    EPS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ARCH_MAJOR: gl.constexpr,
+):
+    """Reduce rows, add their residuals, and RMS-normalize them in one launch.
+
+    Each row is its own epoch domain, so a persistent grid may stride rows.
+    """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
+    gl.static_assert(BLOCK_SIZE % (SUBGROUP_SIZE * NUM_WARPS) == 0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK_SIZE // (SUBGROUP_SIZE * NUM_WARPS)], [SUBGROUP_SIZE], [NUM_WARPS], [0]
+    )
+    columns = gl.arange(0, BLOCK_SIZE, layout=layout)
+    mask = columns < HIDDEN_SIZE
+    weight = gl.load(weight_ptr + columns, mask=mask, other=0.0).to(gl.float32)
+    for row in range(gl.program_id(0), NUM_ROWS, gl.num_programs(0)):
+        offsets = row * HIDDEN_SIZE + columns
+        acc = _iris_staged_pull_reduce(
+            input_ptr,
+            slots_ptr,
+            ready_flags,
+            row,
+            offsets,
+            mask,
+            heap_base_0,
+            heap_base_1,
+            heap_base_2,
+            heap_base_3,
+            heap_base_4,
+            heap_base_5,
+            heap_base_6,
+            heap_base_7,
+            RANK,
+            WORLD_SIZE,
+            SLOT_STRIDE,
+            NUM_SLOTS,
+            NUM_WARPS,
+            ARCH_MAJOR,
+        )
+        residual = gl.load(residual_ptr + offsets, mask=mask, other=0.0)
+        residual_out = acc + residual.to(gl.float32)
+        gl.store(
+            residual_out_ptr + offsets,
+            residual_out.to(residual_out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        variance = gl.sum(residual_out * residual_out, axis=0) / HIDDEN_SIZE
+        norm = residual_out * gl.rsqrt(variance + EPS) * weight
+        gl.store(
+            norm_out_ptr + offsets,
+            norm.to(norm_out_ptr.dtype.element_ty),
+            mask=mask,
+        )
 
 
 @gluon.jit
@@ -696,6 +904,13 @@ def _iris_heap_base(
 
 
 @gluon.jit
+def _iris_translate(pointer, local_heap, peer_heap):
+    """Map a 16-byte-aligned symmetric pointer from this heap to a peer's."""
+    offset = tl.cast(pointer, gl.uint64) - local_heap
+    return gl.multiple_of(tl.cast(peer_heap + offset, pointer.dtype), 16)
+
+
+@gluon.jit
 def _iris_sync_rank_token(
     flags,
     row,
@@ -712,8 +927,8 @@ def _iris_sync_rank_token(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
 ):
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
     peer_mask = peers != RANK
@@ -766,6 +981,11 @@ def _iris_sync_rank_token(
     gl.barrier()
 
 
+@triton.constexpr_function
+def _peer_lanes(world_size):
+    return triton.next_power_of_2(world_size)
+
+
 @gluon.jit
 def _iris_sync_rank_epoch(
     ready_flags,
@@ -783,14 +1003,14 @@ def _iris_sync_rank_epoch(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
 ):
     """Synchronize by polling peer epochs or publishing them locally."""
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     ready_layout: gl.constexpr = gl.BlockedLayout(
         [1], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
-    peer_ids = gl.arange(0, WORLD_SIZE, layout=ready_layout)
+    peer_ids = gl.arange(0, _peer_lanes(WORLD_SIZE), layout=ready_layout)
     peer_heaps = gl.where(peer_ids == 0, heap_base_0, heap_base_7)
     peer_heaps = gl.where(peer_ids == 1, heap_base_1, peer_heaps)
     peer_heaps = gl.where(peer_ids == 2, heap_base_2, peer_heaps)
@@ -799,7 +1019,7 @@ def _iris_sync_rank_epoch(
     peer_heaps = gl.where(peer_ids == 5, heap_base_5, peer_heaps)
     peer_heaps = gl.where(peer_ids == 6, heap_base_6, peer_heaps)
     flags_heap_offset = tl.cast(ready_flags, gl.uint64) - local_heap
-    peer_mask = peer_ids != RANK
+    peer_mask = (peer_ids != RANK) & (peer_ids < WORLD_SIZE)
     if PUBLISH:
         remote_flags = tl.cast(
             peer_heaps + flags_heap_offset,
@@ -912,7 +1132,6 @@ def iris_pull_oneshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
@@ -949,11 +1168,11 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     layout: gl.constexpr = gl.BlockedLayout(
         [WORDS_PER_LANE], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
@@ -1038,7 +1257,6 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
     )
 
@@ -1066,7 +1284,6 @@ def iris_pull_twoshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
@@ -1103,12 +1320,12 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=True,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
     scratch_heap_offset = tl.cast(scratch_sym_ptr, gl.uint64) - local_heap
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     load_layout: gl.constexpr = gl.BlockedLayout(
         [1, WORDS_PER_LANE],
         [1, SUBGROUP_SIZE],
@@ -1203,7 +1420,6 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=True,
     )
 
@@ -1253,132 +1469,5 @@ def iris_pull_twoshot(
             RANK,
             WORLD_SIZE,
             NUM_WARPS,
-            SUBGROUP_SIZE,
             PUBLISH=True,
-        )
-
-
-@triton.jit
-def iris_pull_oneshot_rmsnorm(
-    input_sym_ptr,  # base of symmetric (M, HIDDEN_SIZE) input buffer
-    residual_ptr,  # local (M, HIDDEN_SIZE)
-    weight_ptr,  # local (HIDDEN_SIZE,)
-    norm_out_ptr,  # local (M, HIDDEN_SIZE)
-    residual_out_ptr,  # local (M, HIDDEN_SIZE)
-    M,
-    heap_bases,
-    iris_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    rank_start: tl.constexpr,
-    rank_stride: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= M:
-        return
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < HIDDEN_SIZE
-    row_offsets = row * HIDDEN_SIZE + offsets
-    in_row_ptr = input_sym_ptr + row_offsets
-
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for i in tl.static_range(0, world_size):
-        remote_rank = rank_start + i * rank_stride
-        acc += iris.load(
-            in_row_ptr,
-            iris_rank,
-            remote_rank,
-            heap_bases,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-
-    residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
-    residual_out = acc + residual
-
-    res_out_dtype = residual_out_ptr.type.element_ty
-    tl.store(
-        residual_out_ptr + row_offsets,
-        residual_out.to(res_out_dtype),
-        mask=mask,
-    )
-
-    variance = tl.sum(residual_out * residual_out, axis=0) / HIDDEN_SIZE
-    scale = tl.rsqrt(variance + EPS)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    norm = residual_out * scale * weight
-
-    norm_dtype = norm_out_ptr.type.element_ty
-    tl.store(
-        norm_out_ptr + row_offsets,
-        norm.to(norm_dtype),
-        mask=mask,
-    )
-
-
-@triton.jit
-def iris_pull_oneshot_rmsnorm_persistent(
-    input_sym_ptr,
-    residual_ptr,
-    weight_ptr,
-    norm_out_ptr,
-    residual_out_ptr,
-    M,
-    heap_bases,
-    iris_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    rank_start: tl.constexpr,
-    rank_stride: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_programs = tl.num_programs(0)
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < HIDDEN_SIZE
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    res_out_dtype = residual_out_ptr.type.element_ty
-    norm_dtype = norm_out_ptr.type.element_ty
-
-    for row in range(pid, M, num_programs):
-        row_offsets = row * HIDDEN_SIZE + offsets
-        in_row_ptr = input_sym_ptr + row_offsets
-
-        acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for i in tl.static_range(0, world_size):
-            remote_rank = rank_start + i * rank_stride
-            acc += iris.load(
-                in_row_ptr,
-                iris_rank,
-                remote_rank,
-                heap_bases,
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-
-        residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
-            tl.float32
-        )
-        residual_out = acc + residual
-
-        tl.store(
-            residual_out_ptr + row_offsets,
-            residual_out.to(res_out_dtype),
-            mask=mask,
-        )
-
-        variance = tl.sum(residual_out * residual_out, axis=0) / HIDDEN_SIZE
-        scale = tl.rsqrt(variance + EPS)
-        norm = residual_out * scale * weight
-
-        tl.store(
-            norm_out_ptr + row_offsets,
-            norm.to(norm_dtype),
-            mask=mask,
         )

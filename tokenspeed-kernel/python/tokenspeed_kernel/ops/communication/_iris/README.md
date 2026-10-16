@@ -33,6 +33,14 @@ K3 preparation, dispatch, and fused implementations live in `kimi_k3/`.
 General all-reduce implementations remain in `all_reduce.py`, separate from
 K3's shapes and fusion policies.
 
+Ordinary tensors use a Gluon one-shot that stages, publishes each workgroup's
+epoch, and pulls peers in rank order. On gfx950, BF16 staged two-shot starts at
+1 MiB for TP4 and 448 KiB for TP8; smaller payloads avoid its extra rendezvous.
+Producer-direct thresholds are independent. Fused all-reduce/residual/RMSNorm
+uses the same staging mechanism per row, with one slot and a completion wait
+before reuse. Its persistent grid strides rows with independent row epochs;
+group-relative peer addresses also support noncontiguous subgroups.
+
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
 

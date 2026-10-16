@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_amd,
@@ -47,6 +48,49 @@ def _require_iris():
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "arch,subgroup_size,arch_major",
+    [("gfx950", 64, 9), ("gfx1201", 32, 12), ("gfx1250", 32, 12)],
+)
+def test_staged_kernels_compile(arch, subgroup_size, arch_major):
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_pull_oneshot_rmsnorm,
+        iris_pull_oneshot_staged,
+    )
+
+    # The staged path also serves RDNA, whose subgroup and wait ISA differ.
+    for kernel in (iris_pull_oneshot_staged, iris_pull_oneshot_rmsnorm):
+        constants = dict(
+            RANK=0,
+            WORLD_SIZE=2,
+            BLOCK_SIZE=4096,
+            SLOT_STRIDE=8192,
+            NUM_SLOTS=2 if kernel is iris_pull_oneshot_staged else 1,
+            NUM_WARPS=4,
+            ARCH_MAJOR=arch_major,
+        )
+        if kernel is iris_pull_oneshot_rmsnorm:
+            constants.update(HIDDEN_SIZE=2880, EPS=_ARRMS_EPS)
+        signature = {}
+        for name in kernel.arg_names:
+            if name in constants:
+                continue
+            if name.startswith("heap_base_"):
+                signature[name] = "i64"
+            elif name in ("NUMEL", "NUM_ROWS"):
+                signature[name] = "i32"
+            elif name == "ready_flags":
+                signature[name] = "*i32"
+            else:
+                signature[name] = "*bf16"
+        triton.compile(
+            gluon._runtime.GluonASTSource(kernel, signature, constexprs=constants),
+            target=triton.backends.compiler.GPUTarget("hip", arch, subgroup_size),
+            options={"num_warps": 4},
+        )
 
 
 def _get_open_port() -> int:
@@ -114,9 +158,8 @@ def test_plain_two_stage_admits_partitionable_shapes(dtype):
         pytest.skip("iris is not installed")
 
     elements_per_word = 8 // dtype.itemsize
-    # The plain path carries no minimum size -- two-stage measured faster than
-    # one-shot at every shape down to 14 KB -- so the predicate is purely the
-    # kernel's partitioning requirement.
+    # This is the kernel's partitioning requirement; the staged two-shot state
+    # applies its payload minimum separately.
     aligned = 8 * elements_per_word
     assert _use_two_stage_plain(8, aligned, dtype)
     assert _use_two_stage_plain(8, aligned * 4096, dtype)
@@ -155,7 +198,13 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
 
 
 def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
-    return [(16, 4096), (64, 4096)]
+    # The tuned one-shot geometry, then a payload past the TP4 two-shot minimum.
+    return [(16, 4096), (128, 4096)]
+
+
+def _ar_offset_shape_cases() -> List[Tuple[int, ...]]:
+    # Staged one-shot, then two-shot, with element-offset storage.
+    return [(1024,), (1 << 19,)]
 
 
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
@@ -212,6 +261,7 @@ def _ar_worker_main(
         staged_max_numel = max(
             max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),
             max(int(torch.tensor(shape).prod()) for shape in _ar_graph_shape_cases()),
+            max(int(torch.tensor(shape).prod()) for shape in _ar_offset_shape_cases()),
         )
         producer_direct_max_numel = max(
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
@@ -257,16 +307,17 @@ def _ar_worker_main(
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
         if state.staged_two_shot is not None:
-            for safe in (False, True):
-                _check_all_reduce_graph_replay(
-                    state,
-                    rank,
-                    world_size,
-                    (1024,),
-                    device,
-                    storage_offset=rank % 2,
-                    safe=safe,
-                )
+            for shape in _ar_offset_shape_cases():
+                for safe in (False, True):
+                    _check_all_reduce_graph_replay(
+                        state,
+                        rank,
+                        world_size,
+                        shape,
+                        device,
+                        storage_offset=rank % 2,
+                        safe=safe,
+                    )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
                 verify_tuning = current_platform().is_cdna4
@@ -736,7 +787,7 @@ def _ar_epoch_worker_main(rank, world_size, port, path, rows):
         state = create_iris_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
-            staged_max_numel=16 * 7168,
+            staged_max_numel=max(rows, 16) * 7168,
             producer_direct_max_numel=16 * 7168,
             dtype=torch.bfloat16,
             heap_size=None,
@@ -768,14 +819,18 @@ def _ar_epoch_worker_main(rank, world_size, port, path, rows):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = reduce()
-        if path == "staged_one_shot":
+        if not producer_direct:
             # Guard against the dispatcher silently picking another path.
             before = flags.clone()
             graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-            used = math.ceil(rows * 7168 / state.staged.block_size)
-            assert torch.equal(flags[:used, rank], before[:used, rank] + 1)
+            if path == "staged_one_shot":
+                used = math.ceil(rows * 7168 / state.staged.block_size)
+                assert torch.equal(flags[:used, rank], before[:used, rank] + 1)
+            else:
+                # Entry, partition and exit rendezvous each advance the epoch.
+                assert flags[0, rank] == before[0, rank] + 3
 
         for replay in (False, True):
             # Include entry and intermediate-stage wraps, plus a normal epoch.
@@ -819,7 +874,7 @@ def _ar_epoch_worker_main(rank, world_size, port, path, rows):
     [
         (8, "producer_direct", 1),
         (8, "producer_direct", 16),
-        (8, "staged_two_shot", 16),
+        (8, "staged_two_shot", 64),
         (2, "staged_one_shot", 1),
         (2, "staged_one_shot", 16),
     ],
@@ -886,6 +941,29 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
             ((8, 7168), (8, 3584)),
             device,
         )
+
+        from tokenspeed_kernel.ops.communication.iris import (
+            create_iris_ar_rmsnorm_state,
+            iris_allreduce_residual_rmsnorm,
+        )
+
+        # Values differ by group, so reading the other group's peers fails.
+        rms_state = create_iris_ar_rmsnorm_state(
+            group=group,
+            rank_in_group=group_rank,
+            max_token_num=4,
+            hidden_dim=_ARRMS_HIDDEN_DIM,
+            device=device,
+        )
+        x = torch.full(
+            (4, _ARRMS_HIDDEN_DIM), rank + 1, dtype=torch.bfloat16, device=device
+        )
+        weight = torch.ones(_ARRMS_HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+        _, residual_out = iris_allreduce_residual_rmsnorm(
+            rms_state, x, torch.zeros_like(x), weight, eps=_ARRMS_EPS
+        )
+        expected = sum(peer + 1 for peer in groups[group_index])
+        assert torch.all(residual_out == expected)
     except Exception:
         error_dict[rank] = traceback.format_exc()
     finally:
@@ -963,8 +1041,87 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
                 weight=weight,
                 device=device,
             )
+        if world_size == 2:
+            _check_arrms_reuse(state, rank, world_size, weight, device)
     finally:
         dist.destroy_process_group()
+
+
+def _check_arrms_reuse(state, rank, world_size, weight, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_pull_oneshot_rmsnorm,
+    )
+
+    # Cross the persistent grid's row stride, then shrink and grow again.
+    programs = torch.cuda.get_device_properties(device).multi_processor_count
+    rows = (1, 3, 16, programs + 3, 5)
+    inputs = {
+        n: torch.empty((n, state.hidden_dim), dtype=state.dtype, device=device)
+        for n in rows
+    }
+    residuals = {n: torch.empty_like(x) for n, x in inputs.items()}
+
+    def run(n):
+        return state.fused(
+            inputs[n],
+            residuals[n],
+            weight,
+            _ARRMS_EPS,
+            norm_out=inputs[n],
+            residual_out=residuals[n],
+        )
+
+    # Warm the runtime integer classes (one, divisible by 16, and other).
+    for n in (1, 16, 3):
+        inputs[n].fill_(rank + 1)
+        residuals[n].zero_()
+        run(n)
+    torch.cuda.synchronize()
+    graphs = {}
+    with assert_no_triton_compile(iris_pull_oneshot_rmsnorm):
+        for n in rows:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(n)
+            graphs[n] = graph
+
+        for replay in (False, True):
+            for epoch in (17, 2**31 - 1, -1):
+                torch.cuda.synchronize()
+                dist.barrier()
+                state._ready_flags.fill_(epoch)
+                torch.cuda.synchronize()
+                dist.barrier()
+                for step, n in enumerate(rows * 2):
+                    if rank == world_size - 1:
+                        time.sleep(0.01)
+                    scale = (step + 1) * (-1 if step % 2 else 1)
+                    inputs[n].fill_(scale * (rank + 1))
+                    residuals[n].fill_(0.25 * (rank + 1))
+                    if replay:
+                        graphs[n].replay()
+                    else:
+                        run(n)
+                    expected = scale * world_size * (world_size + 1) / 2 + 0.25 * (
+                        rank + 1
+                    )
+                    expected_norm = (
+                        weight.float()
+                        * expected
+                        / math.sqrt(expected * expected + _ARRMS_EPS)
+                    )
+                    torch.testing.assert_close(
+                        residuals[n],
+                        torch.full_like(residuals[n], expected),
+                        atol=0,
+                        rtol=0,
+                    )
+                    torch.testing.assert_close(
+                        inputs[n],
+                        expected_norm.to(state.dtype).expand_as(inputs[n]),
+                        atol=0,
+                        rtol=1e-2,
+                    )
 
 
 def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
@@ -1020,8 +1177,7 @@ def _run_arrms_test(world_size: int, persistent: bool) -> None:
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
 def test_iris_allreduce_residual_rmsnorm_world1(persistent: bool):
-    # Single-rank smoke test: exercises the inline-barrier self-signal/wait
-    # path (rank sends to itself) and the v1 device_barrier no-op case.
+    # Single rank: the staged protocol has no peer to publish to or wait on.
     _run_arrms_test(world_size=1, persistent=persistent)
 
 
