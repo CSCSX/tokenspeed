@@ -189,6 +189,10 @@ def _kda_recoverssm_verify_kernel(
     ).to(tl.float32)
     state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
 
+    # Load the candidate window before the recurrence stores its outputs and
+    # replay records. This lets independent token loads overlap instead of
+    # waiting behind each preceding token's stores.
+    inputs = ()
     for token_offset in tl.static_range(SPEC_QUERY_LEN):
         token_valid = token_offset < query_len
         token = bos + token_offset
@@ -223,6 +227,12 @@ def _kda_recoverssm_verify_kernel(
             eviction_policy="evict_last",
         ).to(tl.float32)
 
+        inputs += ((q, k, v, raw_g, raw_beta),)
+
+    for token_offset in tl.static_range(SPEC_QUERY_LEN):
+        token_valid = token_offset < query_len
+        token = bos + token_offset
+        q, k, v, raw_g, raw_beta = inputs[token_offset]
         q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
         updated_state, correction = _kda_recurrent_step(
             state,
@@ -753,7 +763,12 @@ def kda_recoverssm_verify(
         USE_LOWER_BOUND=lower_bound is not None,
         BATCH=triton.next_power_of_2(batch),
         num_warps=1,
+        # Keep explicit replay metadata assertions without instrumenting every
+        # integer operation. Limit registers after preloading the token window
+        # so the one-warp CTAs retain enough occupancy.
         debug=True,
+        sanitize_overflow=False,
+        maxnreg=168,
         num_stages=2,
     )
     return out

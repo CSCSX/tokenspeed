@@ -77,7 +77,8 @@ def _reference(
 
 
 @pytest.mark.parametrize(
-    "width,accepted", [(1, 0), (1, 1), (4, 0), (4, 1), (4, 2), (4, 3), (4, 4)]
+    "width,accepted",
+    [(width, accepted) for width in (1, 2, 3, 4, 8) for accepted in range(width + 1)],
 )
 @pytest.mark.parametrize("dim", [64, 128])
 def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int, dim: int) -> None:
@@ -251,7 +252,16 @@ def test_recoverssm_raw_records_over_rounds(
     batch: int, width: int, capacity: int
 ) -> None:
     """Check raw records across wraps, slot reuse and retained prefixes."""
-    _check_raw_ring_rounds(batch, width, capacity)
+    _check_raw_ring_rounds(batch, width, capacity, capacity - 1)
+
+
+@pytest.mark.parametrize("batch,width", [(4, 2), (8, 3), (16, 4), (32, 4)])
+@pytest.mark.parametrize("start_position", [2**31 - 2, 2**32 - 2])
+def test_recoverssm_records_with_large_positions(
+    batch: int, width: int, start_position: int
+) -> None:
+    """Recover accepted prefixes across INT32 boundaries and ring wraps."""
+    _check_raw_ring_rounds(batch, width, 7, start_position)
 
 
 def test_record_chain_uses_verify_inputs() -> None:
@@ -703,7 +713,9 @@ def test_verify_derived_records_with_serving_producers(batch: int) -> None:
         )
 
 
-def _check_raw_ring_rounds(batch: int, width: int, capacity: int) -> None:
+def _check_raw_ring_rounds(
+    batch: int, width: int, capacity: int, start_position: int
+) -> None:
     torch.manual_seed(781)
     heads, dim = 2, 128
     device = "cuda"
@@ -721,7 +733,7 @@ def _check_raw_ring_rounds(batch: int, width: int, capacity: int) -> None:
     )
     stamps = torch.full((batch, capacity, 2), -1, device=device, dtype=torch.int64)
     slots = [(i + 1) % batch for i in range(batch)]
-    positions = [capacity - 1 for _ in range(batch)]
+    positions = [start_position for _ in range(batch)]
     checkpoint_positions = positions.copy()
     generations = [1] * batch
     a = torch.randn(heads, device=device) * 0.1
