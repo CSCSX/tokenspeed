@@ -50,6 +50,9 @@ Two-shot rendezvous keep one epoch counter per workgroup and rank. Only its
 owning rank writes that counter, so the kernel reads it once and publishes
 the known values for entry, partition readiness and optional completion with
 release exchanges. Peer waits still compare epochs modulo 32 bits.
+Staged two-shot gives each workgroup a 128-byte flag row to avoid sharing
+cache lines between independent workgroups. Its prepared row stride stays
+fixed across payload sizes; producer-direct retains its separate flag layout.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:

@@ -269,6 +269,7 @@ def test_iris_allreduce_sizes():
             NUM_TILES=tiles,
             NUM_WARPS=8,
             EXIT_BARRIER=True,
+            FLAG_ROW_STRIDE=32,
             num_warps=8,
             grid=(1,),
             **common,

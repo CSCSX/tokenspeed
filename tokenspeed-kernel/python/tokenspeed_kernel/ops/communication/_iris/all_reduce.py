@@ -191,12 +191,16 @@ def _launch_pull_twoshot(
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        FLAG_ROW_STRIDE=ready_flags.stride(0),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
 
 
 class StagedPullTwoShot:
     """Own stable staging, partition scratch, and completion epochs."""
+
+    # Keep independent workgroups on separate 128-byte cache lines.
+    FLAG_ROW_STRIDE = 32
 
     @staticmethod
     def supported(world_size: int, dtype: torch.dtype) -> bool:
@@ -211,7 +215,9 @@ class StagedPullTwoShot:
         return (
             allocation_bytes((max_numel,), dtype)
             + allocation_bytes((_pull_scratch_numel(max_numel, world_size),), dtype)
-            + allocation_bytes((_PULL_MAX_PROGRAMS, world_size), torch.int32)
+            + allocation_bytes(
+                (_PULL_MAX_PROGRAMS, StagedPullTwoShot.FLAG_ROW_STRIDE), torch.int32
+            )
         )
 
     def __init__(self, peers: IrisGroup, max_numel: int, dtype: torch.dtype):
@@ -221,7 +227,7 @@ class StagedPullTwoShot:
             (_pull_scratch_numel(max_numel, peers.world_size),), dtype=dtype
         )
         self.ready_flags = peers.ctx.zeros(
-            (_PULL_MAX_PROGRAMS, peers.world_size), dtype=torch.int32
+            (_PULL_MAX_PROGRAMS, self.FLAG_ROW_STRIDE), dtype=torch.int32
         )
 
     def can_run(self, numel: int) -> bool:
@@ -509,6 +515,7 @@ def _iris_staged_pull_reduce(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=True,
     )
 
@@ -564,6 +571,7 @@ def _iris_staged_pull_reduce(
             RANK,
             WORLD_SIZE,
             NUM_WARPS,
+            FLAG_ROW_STRIDE=WORLD_SIZE,
             PUBLISH=True,
         )
     return acc
@@ -984,6 +992,7 @@ def _iris_sync_rank_epoch(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    FLAG_ROW_STRIDE: gl.constexpr,
     PUBLISH: gl.constexpr,
 ):
     """Synchronize by polling peer epochs or publishing them locally."""
@@ -1006,20 +1015,20 @@ def _iris_sync_rank_epoch(
             peer_heaps + flags_heap_offset,
             gl.pointer_type(gl.int32),
         )
-        remote_flags += block_id * WORLD_SIZE + RANK
+        remote_flags += block_id * FLAG_ROW_STRIDE + RANK
         gl.store(
             remote_flags,
             epoch,
             mask=peer_mask,
             cache_modifier=".wt",
         )
-        wait_flags = ready_flags + block_id * WORLD_SIZE + peer_ids
+        wait_flags = ready_flags + block_id * FLAG_ROW_STRIDE + peer_ids
     else:
         wait_flags = tl.cast(
             peer_heaps + flags_heap_offset,
             gl.pointer_type(gl.int32),
         )
-        wait_flags += block_id * WORLD_SIZE + peer_ids
+        wait_flags += block_id * FLAG_ROW_STRIDE + peer_ids
     seen = gl.load(
         wait_flags,
         mask=peer_mask,
@@ -1149,6 +1158,7 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=PUBLISH_READY,
     )
 
@@ -1238,6 +1248,7 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=PUBLISH_READY,
     )
 
@@ -1269,6 +1280,7 @@ def iris_pull_twoshot(
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    FLAG_ROW_STRIDE: gl.constexpr,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions."""
     block_id = gl.program_id(0)
@@ -1283,7 +1295,7 @@ def iris_pull_twoshot(
         heap_base_6,
         heap_base_7,
     )
-    epoch_ptr = ready_flags + block_id * WORLD_SIZE + RANK
+    epoch_ptr = ready_flags + block_id * FLAG_ROW_STRIDE + RANK
     # Only this rank writes its counter; later phases advance this known epoch.
     epoch = gl.load(epoch_ptr) + 1
     gl.atomic_xchg(epoch_ptr, epoch, sem="release", scope="sys")
@@ -1303,6 +1315,7 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
+        FLAG_ROW_STRIDE=FLAG_ROW_STRIDE,
         PUBLISH=True,
     )
 
@@ -1404,6 +1417,7 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
+        FLAG_ROW_STRIDE=FLAG_ROW_STRIDE,
         PUBLISH=True,
     )
 
@@ -1454,5 +1468,6 @@ def iris_pull_twoshot(
             RANK,
             WORLD_SIZE,
             NUM_WARPS,
+            FLAG_ROW_STRIDE=FLAG_ROW_STRIDE,
             PUBLISH=True,
         )
