@@ -745,8 +745,7 @@ Its responsibilities:
   request says what the request has done since the coordinator's previous
   transaction for it: what it completed (`CompletedPages`, present only when
   there is something to publish -- newly hashed pages, a tail, or at a final
-  point the frontier's state -- so "new hashes without a boundary kind"
-  cannot be expressed) and its computed-token count for retention.
+  point the frontier's state) and its computed-token count for retention.
   Publication fields are request-scoped and therefore live on the progress,
   not replicated onto every group's demand.
 
@@ -824,8 +823,8 @@ Its responsibilities:
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are
-  published entries (with the key, logical index and boundary kind each was
-  published under), `TierTransferManager::StartRetractionStores` gives those
+  published entries (with the key and logical index each was published
+  under), `TierTransferManager::StartRetractionStores` gives those
   their Host blocks — keys already Host-cached, or carried by a store in
   flight, are pinned; the rest become one stream-ordered write-back whose
   Host entries the image pins — and `CacheCoordinator::TakeImage` places only
@@ -1063,8 +1062,8 @@ once; each cache group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
 request reclaim. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+then tier (uncached request-only block → established boundary of a non-closed
+group → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
 

@@ -135,8 +135,6 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             .tail = tail,
             .owner_continues = point == PublicationPoint::kOwnerContinues,
             .publish_state = publish_state,
-            .boundary_kind =
-                point == PublicationPoint::kChunk ? CacheBoundaryKind::kChunk : CacheBoundaryKind::kEndpoint,
             .stream_completed_to_host = stream_completed_to_host,
         };
     }
@@ -416,8 +414,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         const std::int32_t first_extension_slot = match.probe.device.full_page_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
             coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
-                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
-                                         CacheBoundaryKind::kChunk);
+                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i));
         }
     }
     fsm::CacheProgress cache_progress{
