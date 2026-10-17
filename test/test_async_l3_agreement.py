@@ -140,12 +140,12 @@ class IdleDevice:
         return StoragePoll((), 0, 0, 0)
 
 
-def idle_worker(rank, path):
+def idle_worker(rank, path, world_size):
     dist.init_process_group(
         "gloo",
         init_method=f"file://{path}",
         rank=rank,
-        world_size=2,
+        world_size=world_size,
         timeout=timedelta(seconds=20),
     )
     original = dist.all_gather_object
@@ -161,7 +161,7 @@ def idle_worker(rank, path):
             SimpleNamespace(),
             IdleDevice(),
             config=config.scheduler,
-            attn_tp_size=2,
+            attn_tp_size=world_size,
             attn_tp_cpu_group=dist.group.WORLD,
             pp_size=1,
             pp_cpu_group=None,
@@ -191,16 +191,43 @@ def idle_worker(rank, path):
                 assert tick.now_us >= previous
                 assert not tick.allow_forward and not tick.allow_storage
                 previous = tick.now_us
+        reports = hooks._exchange_reports(
+            (
+                1000 + rank,
+                rank == 0,
+                rank == 1,
+                [],
+                None,
+                (rank + 1, 2**33 + rank, rank * 100),
+            )
+        )
+        assert reports == [
+            (
+                1000 + peer,
+                peer == 0,
+                peer == 1,
+                [],
+                None,
+                (peer + 1, 2**33 + peer, peer * 100),
+            )
+            for peer in range(world_size)
+        ]
     finally:
         dist.all_gather_object = original
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("world_size", [2, 3])
 def test_idle_gloo_round_agrees_clock_and_permissions_without_objects(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, world_size
 ):
     monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo")
-    mp.spawn(idle_worker, args=(str(tmp_path / "idle"),), nprocs=2, join=True)
+    mp.spawn(
+        idle_worker,
+        args=(str(tmp_path / "idle"), world_size),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 class PressureDevice:

@@ -30,9 +30,12 @@ Runtime QUERY/GET/PUT use its bounded queues and explicit
 completion/retirement protocol. Idle administrative namespace
 purge remains a synchronous management call.
 
-Device construction returns a complete DeviceHandle and a startup-only
-`L3CacheInputs` record defined beside the L3 factory: shared Host storage, owner translation and immutable
-layout/partition/producer facts, with no Device buffers or L2 executor.
+Device construction returns a complete DeviceHandle and startup-only
+`HostCacheResources` from `cache/host_storage.py`: shared Host storage, owner
+translation, the immutable memory/group layouts and resolved attention choices.
+This neutral record holds no Device buffers, L2 executor, L3 schema or namespace.
+The L3 factory compiles transfer partition semantics and resolves EAGLE capture
+identity only after L3 is selected; device construction imports no L3 module.
 The startup caller constructs L3 separately through
 `create_l3_executor` in `cache/l3/factory.py`. Its lower-level
 `create_storage_backend` selects only the byte-storage client.
@@ -329,6 +332,11 @@ page owner must not change what bytes an object means. The producer namespace
 also includes KVP, QCP and linear-attention TP geometry.
 
 The TP leader supplies the common monotonic clock; permissions are intersected.
+The CPU header is a named record of time, forward/storage permissions, completion
+count, an error flag and the three pressure counters. Buffer width follows that
+record, independently of model attention heads and the number of cache owners.
+Idle rounds exchange only headers; completion/error payloads are gathered only
+when an owner reports them.
 The head advance applies that tick and cancellation before completion records,
 so an already expired/detached read cannot publish a late result. The scheduler
 emits storage commands beside cache and forward operations. Storage dispatch

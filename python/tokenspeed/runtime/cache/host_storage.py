@@ -22,7 +22,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.transfer.layout import CacheGroupLayout
+    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheMemoryPlan,
+    )
 
 
 def _compute_host_layout(
@@ -129,3 +139,19 @@ class HostCacheStorage:
                 f"unknown field {field_index} for cache group {group_index}"
             ) from exc
         return self.host_block_offset(group_index, block_id) + host_field_offset
+
+
+@dataclass(frozen=True, slots=True)
+class HostCacheResources:
+    """Startup-only Host resources and resolved CPU cache facts.
+
+    The memory plan and group descriptors carry no Device buffers. Consumers
+    derive their own compatibility schema without retaining a Device executor.
+    """
+
+    storage: HostCacheStorage
+    ownership: BlockOwnerTranslation
+    groups: tuple[CacheGroupLayout, ...]
+    memory_plan: CacheMemoryPlan
+    attention_backend_name: str
+    draft_attention_backend_name: str

@@ -23,12 +23,29 @@
 from __future__ import annotations
 
 import time
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
 from tokenspeed_scheduler import Cache, ForwardEvent, StorageConfig, StoragePressure
 
 from tokenspeed.runtime.cache.l3.metrics import L3Metrics
+
+
+class _ReportHeader(NamedTuple):
+    """Fixed CPU control fields exchanged before optional completion payloads."""
+
+    now_us: int
+    allow_forward: int
+    allow_storage: int
+    completion_count: int
+    has_error: int
+    queued_operations: int
+    queued_bytes: int
+    oldest_operation_us: int
+
+
+_HEADER_WIDTH = len(_ReportHeader._fields)
 
 
 class L3CacheHooks:
@@ -69,9 +86,9 @@ class L3CacheHooks:
         self._header: torch.Tensor | None = None
         self._headers: torch.Tensor | None = None
         if l3 is not None:
-            self._header = torch.empty(8, dtype=torch.int64, device="cpu")
+            self._header = torch.empty(_HEADER_WIDTH, dtype=torch.int64, device="cpu")
             self._headers = torch.empty(
-                8 * attn_tp_size, dtype=torch.int64, device="cpu"
+                _HEADER_WIDTH * attn_tp_size, dtype=torch.int64, device="cpu"
             )
 
     def _exchange_reports(self, report):
@@ -79,30 +96,40 @@ class L3CacheHooks:
             return [report]
         assert self._header is not None and self._headers is not None
         now_us, allow_forward, allow_storage, completions, error, pressure = report
-        self._header[0] = now_us
-        self._header[1] = int(allow_forward)
-        self._header[2] = int(allow_storage)
-        self._header[3] = len(completions)
-        self._header[4] = int(error is not None)
-        for index, value in enumerate(pressure, start=5):
+        local = _ReportHeader(
+            now_us,
+            int(allow_forward),
+            int(allow_storage),
+            len(completions),
+            int(error is not None),
+            *pressure,
+        )
+        for index, value in enumerate(local):
             self._header[index] = value
         dist.all_gather_into_tensor(self._headers, self._header, group=self._group)
-        headers = self._headers.view(self._size, 8).tolist()
+        headers = [
+            _ReportHeader(*row)
+            for row in self._headers.view(self._size, _HEADER_WIDTH).tolist()
+        ]
         # Every owner still agrees the clock and permissions in idle rounds.
         # Only completion/error facts require a variable-size object exchange.
-        if any(header[3] or header[4] for header in headers):
+        if any(header.completion_count or header.has_error for header in headers):
             payloads = [None] * self._size
             dist.all_gather_object(payloads, (completions, error), group=self._group)
         else:
             payloads = [([], None) for _ in headers]
         return [
             (
-                header[0],
-                bool(header[1]),
-                bool(header[2]),
+                header.now_us,
+                bool(header.allow_forward),
+                bool(header.allow_storage),
                 payload[0],
                 payload[1],
-                tuple(header[5:8]),
+                (
+                    header.queued_operations,
+                    header.queued_bytes,
+                    header.oldest_operation_us,
+                ),
             )
             for header, payload in zip(headers, payloads)
         ]

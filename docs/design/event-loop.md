@@ -33,7 +33,7 @@ how long the caller may hold each piece:
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
-| `l3_cache_inputs` | L3 construction inputs referencing shared Host storage plus CPU ownership and compatibility facts; no Device buffers or executor | consumed by Host-storage construction at startup |
+| `host_cache` | Shared Host resources, CPU cache layout and resolved attention choices; no Device buffers or executor | consumed at startup |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 Encoder facts describe the transferred tensor, independently of the language
@@ -103,7 +103,9 @@ Consequences:
   user does not join it — it gets its own name.
   L3 is constructed separately at startup by `cache/l3/factory.py`, using
   the builder's Host resource and CPU-only payload facts. `DeviceBuild` does
-  not create a backend or workers, and `DeviceSpecs` carries no L3 settings.
+  not create an L3 schema, namespace, backend or workers, and `DeviceSpecs`
+  carries no L3 settings. The L3 factory derives its schema and EAGLE identity
+  from the neutral Host resources and model configuration.
   The L3 hooks and request handler hold the resulting Host-only capability;
   its CPU workers cannot reach the device handle. The loop submits the
   storage subset of `plan.cache` independently from device work;
@@ -442,6 +444,10 @@ admission permissions across cache owners. It returns scheduler events at the
 head feedback point. It neither probes storage on ingress nor decides a prefix.
 The separate Host-only executor owns queues and backend health; C++ owns the
 request transaction. Namespace changes stay in `RequestHandler`.
+A named CPU report header carries time, forward/storage permissions, completion
+count, an error flag and pressure counters. Its width derives from the record
+fields, independently of attention head count or replica size. Idle rounds
+exchange only this header; completions and errors add a bounded payload exchange.
 
 Per-round dispatch needs no hooks class at all: the loop hands
 `DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
