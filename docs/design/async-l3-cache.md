@@ -50,8 +50,13 @@ passes its Device-copy subset explicitly to DeviceHandle from the same plan,
 including frozen-round cleanup. L3 hooks poll the L3 executor directly
 and return agreed facts to the existing head feedback point. RequestHandler
 coordinates namespace/version changes through that same L3 capability.
-The factory snapshots checkpoint and producer identity, validates page-sharded
-payloads and constructs the backend,
+The factory collects static checkpoint, layout and producer facts once into an
+immutable deployment identity. Producer options are structured fields; target
+compute dtype is already in the packed-cache signature. The weight-version
+callback only combines that identity with explicit target/draft generations.
+It retains no mutable launch configuration. This consolidation changes namespace
+hashes, so earlier objects remain cold; the compatibility epoch stays unchanged.
+The factory validates page-sharded payloads and constructs the backend,
 Host store and asynchronous executor. It retains no L2 executor or device
 capability. The device builder only extracts resolved facts; it neither selects
 an L3 backend nor starts storage work. L2 copies remain inside device construction

@@ -850,8 +850,8 @@ Its responsibilities:
   (as is the `cp_size: 1` entry of the hashed namespace) so objects written
   before its removal stay addressable until the next deliberate key-format
   bump.
-  The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
-  (`model` + resolved immutable revision + `--weight-version`), the packed
+  The static deployment identity (`storage_deployment_id`) covers the loaded checkpoint
+  (`model` + resolved immutable revision), the packed
   Host CacheBlock layout (dtype and field payload geometry, not device
   arena offsets that follow GPU cache capacity), the effective
   cache-quantization config (`quantization` plus the
@@ -875,6 +875,11 @@ Its responsibilities:
   KV without touching checkpoint, layout, or listed options). A git SHA
   or package version is not used: those would split L3 on unrelated
   rolling upgrades while remaining `0.1.0` across cache-affecting edits.
+  Static facts are collected once; producer options remain structured and
+  target compute dtype is recorded only in the packed-cache signature.
+  `storage_key_prefix` combines the immutable deployment digest with explicit
+  target and draft weight versions. Updating a version never re-reads mutable
+  launch options or recomputes checkpoint fingerprints.
   An unpinned
   Hugging Face branch or local path is identified from a Hugging Face
   hub cache snapshot

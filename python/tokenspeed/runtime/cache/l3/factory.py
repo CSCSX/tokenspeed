@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import copy
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, MemoryKvStore
@@ -69,6 +68,52 @@ def create_storage_backend(
             pp_size=pp_size,
         )
     raise ValueError(f"unsupported KVStore storage backend {backend_name!r}")
+
+
+def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any]:
+    """Snapshot numerical and partition choices for the deployment identity.
+
+    Target dtype is already part of the packed-cache signature. An empty
+    draft dtype means this stage has no draft. Storage admission knobs and
+    output-only options do not change the KV produced for fixed tokens.
+    """
+    mapping = args.mapping
+    assert mapping is not None
+    return {
+        "draft_dtype": draft_dtype,
+        "numerics": args.numerics,
+        "yarn_ramp_mask_device": args.yarn_ramp_mask_device,
+        "mla_lora_scale": args.mla_lora_scale,
+        "layer_boundary_norm": args.layer_boundary_norm,
+        "router_topk": args.router_topk,
+        "moe_combine_order": args.moe_combine_order,
+        "dsa_slot_order": args.dsa_slot_order,
+        "disable_autotune": args.disable_autotune,
+        "disable_tf32": args.disable_tf32,
+        "disable_pdl": args.disable_pdl,
+        "force_deterministic_rsag": args.force_deterministic_rsag,
+        "batch_invariant_collectives": args.batch_invariant_collectives,
+        "tp_batch_invariant": args.tp_batch_invariant,
+        "enable_allreduce_fusion": args.enable_allreduce_fusion,
+        "comm_fusion_max_num_tokens": args.comm_fusion_max_num_tokens,
+        "disable_nccl_nvls": args.disable_nccl_nvls,
+        "disable_symm_mem": args.disable_symm_mem,
+        "dense_gemm_backend": args.dense_gemm_backend,
+        "moe_backend": args.moe_backend,
+        "draft_moe_backend": (
+            (args.draft_moe_backend or args.moe_backend) if draft_dtype else ""
+        ),
+        "moe_mxfp4_fp8_activation": args.moe_mxfp4_fp8_activation,
+        "all2all_backend": args.all2all_backend,
+        "deepep_mode": args.deepep_mode,
+        "attn_head_tp_size": mapping.attn.head_tp_size,
+        "attn_kvp_size": mapping.attn.kvp_size,
+        "attn_qcp_size": mapping.attn.qcp_size,
+        "linear_attn_tp_size": mapping.linear_attn.tp_size,
+        "dense_tp_size": mapping.dense.tp_size,
+        "moe_tp_size": mapping.moe.tp_size,
+        "moe_ep_size": mapping.moe.ep_size,
+    }
 
 
 def create_l3_executor(
@@ -138,8 +183,8 @@ def create_l3_executor(
         L3_RUNTIME_COMPAT,
         l3_cache_quantization_id,
         l3_checkpoint_id,
-        l3_kv_producer_id,
         share_l3_checkpoint_ids,
+        storage_deployment_id,
         storage_key_prefix,
     )
 
@@ -198,38 +243,34 @@ def create_l3_executor(
         quantization_param_path=str(server_args.quantization_param_path or ""),
         draft_quantization=draft_quantization,
     )
-    attn_tp_size = int(server_args.mapping.attn.tp_size)
-    kv_producer = l3_kv_producer_id(
-        server_args,
-        dtype=str(model_config.dtype),
-        draft_dtype=(
-            str(draft_model_config.dtype) if draft_model_config is not None else ""
+    deployment_id = storage_deployment_id(
+        str(server_args.model),
+        revision=checkpoint_id,
+        model_overrides=model_config.model_override_args,
+        cache_signature=cache_signature,
+        pipeline_rank=pipeline_rank,
+        attn_tp_size=int(server_args.mapping.attn.tp_size),
+        draft_model=draft_model,
+        draft_revision=draft_revision,
+        cache_quantization=cache_quantization,
+        runtime_compat=L3_RUNTIME_COMPAT,
+        attention_backend=attention_backend_name,
+        draft_attention_backend=draft_attention_backend_name,
+        skip_softmax_threshold=float(server_args.skip_softmax_threshold),
+        eagle3_layers_to_capture=eagle3_layers_to_capture,
+        kv_producer=_kv_producer_options(
+            server_args,
+            draft_dtype=(
+                str(draft_model_config.dtype) if draft_model_config is not None else ""
+            ),
         ),
     )
 
-    model_name = str(server_args.model)
-    model_overrides = copy.deepcopy(model_config.model_override_args)
-    skip_softmax_threshold = float(server_args.skip_softmax_threshold)
-
     def prefix_for_weight_version(weight_version: str) -> str:
         return storage_key_prefix(
-            model_name,
-            revision=checkpoint_id,
+            deployment_id,
             weight_version=weight_version,
-            model_overrides=model_overrides,
-            cache_signature=cache_signature,
-            pipeline_rank=pipeline_rank,
-            attn_tp_size=attn_tp_size,
-            draft_model=draft_model,
-            draft_revision=draft_revision,
             draft_weight_version=weight_version if draft_model else "",
-            cache_quantization=cache_quantization,
-            runtime_compat=L3_RUNTIME_COMPAT,
-            attention_backend=attention_backend_name,
-            draft_attention_backend=draft_attention_backend_name,
-            skip_softmax_threshold=skip_softmax_threshold,
-            eagle3_layers_to_capture=eagle3_layers_to_capture,
-            kv_producer=kv_producer,
         )
 
     from tokenspeed.runtime.cache.l3.executor import L3Executor

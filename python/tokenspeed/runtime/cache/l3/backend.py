@@ -31,12 +31,9 @@ import json
 import os
 import re
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
@@ -934,130 +931,50 @@ def _file_digest(path: str) -> str:
 L3_RUNTIME_COMPAT = "2"
 
 
-def l3_kv_producer_id(args: ServerArgs, *, dtype: str, draft_dtype: str) -> str:
-    """Snapshot KV-producing launch choices after startup resolution.
-
-    An empty draft dtype means this stage has no draft. Sampling, logprob
-    reporting and storage admission knobs do not change KV for fixed tokens.
-    ``auto`` compute backends describe a selection policy within the runtime
-    compat epoch, not a promise of bitwise invariance across hardware/batches.
-    """
-    mapping = args.mapping
-    assert mapping is not None
-    return json.dumps(
-        {
-            "dtype": dtype,
-            "draft_dtype": draft_dtype,
-            "numerics": args.numerics,
-            "yarn_ramp_mask_device": args.yarn_ramp_mask_device,
-            "mla_lora_scale": args.mla_lora_scale,
-            "layer_boundary_norm": args.layer_boundary_norm,
-            "router_topk": args.router_topk,
-            "moe_combine_order": args.moe_combine_order,
-            "dsa_slot_order": args.dsa_slot_order,
-            "disable_autotune": args.disable_autotune,
-            "disable_tf32": args.disable_tf32,
-            "disable_pdl": args.disable_pdl,
-            "force_deterministic_rsag": args.force_deterministic_rsag,
-            "batch_invariant_collectives": args.batch_invariant_collectives,
-            "tp_batch_invariant": args.tp_batch_invariant,
-            "enable_allreduce_fusion": args.enable_allreduce_fusion,
-            "comm_fusion_max_num_tokens": args.comm_fusion_max_num_tokens,
-            "disable_nccl_nvls": args.disable_nccl_nvls,
-            "disable_symm_mem": args.disable_symm_mem,
-            "dense_gemm_backend": args.dense_gemm_backend,
-            "moe_backend": args.moe_backend,
-            "draft_moe_backend": (
-                (args.draft_moe_backend or args.moe_backend) if draft_dtype else ""
-            ),
-            "moe_mxfp4_fp8_activation": args.moe_mxfp4_fp8_activation,
-            "all2all_backend": args.all2all_backend,
-            "deepep_mode": args.deepep_mode,
-            "attn_head_tp_size": mapping.attn.head_tp_size,
-            "attn_kvp_size": mapping.attn.kvp_size,
-            "attn_qcp_size": mapping.attn.qcp_size,
-            "linear_attn_tp_size": mapping.linear_attn.tp_size,
-            "dense_tp_size": mapping.dense.tp_size,
-            "moe_tp_size": mapping.moe.tp_size,
-            "moe_ep_size": mapping.moe.ep_size,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def storage_key_prefix(
+def storage_deployment_id(
     model_name: str,
     *,
     revision: str,
-    weight_version: str,
     model_overrides: dict,
     cache_signature: str,
     pipeline_rank: int,
     attn_tp_size: int,
     draft_model: str,
     draft_revision: str,
-    draft_weight_version: str,
     cache_quantization: str,
     runtime_compat: str,
     attention_backend: str,
     draft_attention_backend: str,
     skip_softmax_threshold: float,
     eagle3_layers_to_capture: Sequence[int],
-    kv_producer: str,
+    kv_producer: dict[str, Any],
 ) -> str:
-    """Return a collision-resistant namespace for compatible L3 objects.
+    """Snapshot static cache compatibility facts into an immutable identity.
 
-    Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, attention-TP width, draft pool,
-    cache-quantization config (target
-    and draft), runtime HF overrides, resolved target/draft attention backends,
-    the KV-producer compat epoch,
-    ``--skip-softmax-threshold``, or the resolved EAGLE3 capture layers
-    and silently collide with an incompatible deployment.
-    ``revision`` is the resolved immutable checkpoint (Hugging Face commit
-    or local fingerprint), not a moving branch name. ``model_overrides``
-    is the ``--hf-overrides`` dict applied to the HF text config
-    (rope_theta, rope_scaling, and the rest of the effective architecture).
-    ``attention_backend`` and ``draft_attention_backend`` are the resolved
-    full-attention backend names from attention construction, including the
-    sub-backend of a hybrid model. An empty draft name means no draft cache
-    backend on this stage. Backend choices can change attention output and
-    therefore downstream K/V even when their packed Host layouts match.
-    ``runtime_compat`` is ``L3_RUNTIME_COMPAT``: the epoch of the runtime
-    that produced the KV, not a build SHA. ``skip_softmax_threshold`` is
-    the resolved gfx950 MHA prefill skip-softmax threshold (0.0 is exact
-    dense attention). A nonzero value changes attention output and
-    therefore downstream cached K/V. ``eagle3_layers_to_capture`` is the
-    resolved EAGLE3 hidden-state capture list (``--eagle3-layers-to-capture``
-    or the draft config's ``eagle_aux_hidden_state_layer_ids``); an empty
-    list means EAGLE3 is off or no capture ids were configured. Different
-    capture layers change which target hidden states the draft consumes
-    and therefore the KV those layers produce. Empty strings and an empty
-    override dict are valid and mean "unset" (no draft pool, no extra cache
-    scales, no HF overrides). ``kv_producer`` is the immutable numerical
-    signature from ``l3_kv_producer_id``. ``runtime_compat`` is the single
-    compatibility epoch; the literal ``tsl3-`` only identifies this cache.
-    The payload keeps a literal ``cp_size`` of 1, the retired CP width.
-    ``attn_tp_size``
-    belongs here rather than only in the per-object ``r{tp_rank}`` shard
-    id: GQA with TP above the KV-head count keeps one local KV head per
-    rank, so packed Host geometry is unchanged, while
-    ``tp_rank // num_kv_head_replicas`` assigns different heads to the
-    same rank.
+    All inputs are explicit: loaded checkpoints and overrides, packed Host
+    layout and quantization, pipeline stage, attention-TP width, resolved
+    target/draft attention backends, numerical/partition producer options,
+    skip-softmax threshold, EAGLE3 capture layers and runtime compatibility.
+    The packed-cache signature already includes the target compute dtype;
+    producer options include draft dtype when a draft pool is present.
+
+    The returned digest retains no mutable inputs. Weight generations are
+    added separately by ``storage_key_prefix``. Empty draft facts mean no
+    draft pool. ``attn_tp_size`` distinguishes head assignments that can
+    otherwise have identical local layouts under replicated KV heads.
     """
-
     if not isinstance(model_overrides, dict):
         raise TypeError("model_overrides must be a dict")
-    if not isinstance(kv_producer, str) or not kv_producer:
-        raise ValueError("kv_producer must be an explicit nonempty signature")
+    if not isinstance(kv_producer, dict):
+        raise TypeError("kv_producer must be a dict")
+    if not kv_producer:
+        raise ValueError("kv_producer must be explicit and nonempty")
     if isinstance(eagle3_layers_to_capture, (str, bytes)):
         raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
     payload = json.dumps(
         {
             "model": str(model_name),
             "revision": str(revision),
-            "weight_version": str(weight_version),
             "model_overrides": model_overrides,
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
@@ -1065,7 +982,6 @@ def storage_key_prefix(
             "cp_size": 1,
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
-            "draft_weight_version": str(draft_weight_version),
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
             "kv_producer": kv_producer,
@@ -1075,6 +991,32 @@ def storage_key_prefix(
             "eagle3_layers_to_capture": [
                 int(layer) for layer in eagle3_layers_to_capture
             ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def storage_key_prefix(
+    deployment_id: str,
+    *,
+    weight_version: str,
+    draft_weight_version: str,
+) -> str:
+    """Combine a frozen deployment identity with target/draft weight versions.
+
+    An empty draft version means no draft generation. Both versions are
+    explicit so a caller cannot silently lose an independently updated draft.
+    This does not inspect weights, mutable launch options or Host allocation.
+    """
+    if not isinstance(deployment_id, str) or not deployment_id:
+        raise ValueError("deployment_id must be an explicit nonempty identity")
+    payload = json.dumps(
+        {
+            "deployment_id": deployment_id,
+            "weight_version": str(weight_version),
+            "draft_weight_version": str(draft_weight_version),
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -42,6 +42,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     l3_checkpoint_id,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
+    storage_deployment_id,
     storage_key_prefix,
     storage_object_key,
 )
@@ -122,6 +123,26 @@ class TestMinimalHostStoreTest:
         assert result.returncode == 0, result.stderr
 
 
+def _deployment_facts():
+    return {
+        "model_name": "org/model",
+        "revision": "abc",
+        "model_overrides": {},
+        "cache_signature": "layout",
+        "pipeline_rank": 0,
+        "attn_tp_size": 1,
+        "draft_model": "",
+        "draft_revision": "",
+        "cache_quantization": "",
+        "runtime_compat": L3_RUNTIME_COMPAT,
+        "attention_backend": "mha",
+        "draft_attention_backend": "",
+        "skip_softmax_threshold": 0.0,
+        "eagle3_layers_to_capture": [],
+        "kv_producer": {"numerics": "resolved", "attn_kvp_size": 1},
+    }
+
+
 class TestStorageKeyTest:
     def test_object_key_includes_group_offset_and_rank(self):
         # The trailing ``|c0`` is the retired context-parallel shard id, kept
@@ -138,32 +159,21 @@ class TestStorageKeyTest:
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
         def prefix(**overrides):
-            values = {
-                "model_name": "org/model",
-                "revision": "abc",
-                "weight_version": "v1",
-                "model_overrides": {},
-                "cache_signature": "layout",
-                "pipeline_rank": 0,
-                "attn_tp_size": 1,
-                "draft_model": "",
-                "draft_revision": "",
-                "draft_weight_version": "",
-                "cache_quantization": "",
-                "runtime_compat": L3_RUNTIME_COMPAT,
-                "attention_backend": "mha",
-                "draft_attention_backend": "",
-                "skip_softmax_threshold": 0.0,
-                "eagle3_layers_to_capture": [],
-                "kv_producer": "resolved-numerics",
-            }
+            values = _deployment_facts()
+            values.update(weight_version="v1", draft_weight_version="")
             values.update(overrides)
-            return storage_key_prefix(**values)
+            weight_version = values.pop("weight_version")
+            draft_weight_version = values.pop("draft_weight_version")
+            return storage_key_prefix(
+                storage_deployment_id(**values),
+                weight_version=weight_version,
+                draft_weight_version=draft_weight_version,
+            )
 
         base = prefix()
         assert base == prefix()
         assert base.startswith("tsl3-")
-        assert base != prefix(kv_producer="different-numerics")
+        assert base != prefix(kv_producer={"numerics": "different"})
         assert base != prefix(model_name="org_model")
         assert base != prefix(revision="def")
         assert base != prefix(weight_version="v2")
@@ -215,7 +225,50 @@ class TestStorageKeyTest:
         with pytest.raises((TypeError)):
             prefix(model_overrides=["rope_theta"])
         with pytest.raises(ValueError):
-            prefix(kv_producer="")
+            prefix(kv_producer={})
+
+    def test_deployment_snapshot_does_not_retain_mutable_inputs(self):
+        facts = _deployment_facts()
+        deployment = storage_deployment_id(**facts)
+        before = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version=""
+        )
+        facts["model_overrides"]["rope_theta"] = 10000.0
+        facts["kv_producer"]["numerics"] = "different"
+        facts["eagle3_layers_to_capture"].append(4)
+        assert (
+            storage_key_prefix(deployment, weight_version="v1", draft_weight_version="")
+            == before
+        )
+        updated = storage_deployment_id(**facts)
+        assert updated != deployment
+        assert (
+            storage_key_prefix(updated, weight_version="v1", draft_weight_version="")
+            != before
+        )
+
+    def test_target_and_draft_weight_generations_are_independent(self):
+        facts = _deployment_facts()
+        facts.update(draft_model="org/draft", draft_revision="draft-abc")
+        deployment = storage_deployment_id(**facts)
+        base = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version="draft-v1"
+        )
+        target = storage_key_prefix(
+            deployment, weight_version="v2", draft_weight_version="draft-v1"
+        )
+        draft = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version="draft-v2"
+        )
+        assert len({base, target, draft}) == 3
+
+    def test_structured_producer_facts_have_canonical_order(self):
+        facts = _deployment_facts()
+        forward = storage_deployment_id(**facts)
+        facts["kv_producer"] = {"attn_kvp_size": 1, "numerics": "resolved"}
+        assert storage_deployment_id(**facts) == forward
+        facts["kv_producer"]["attn_kvp_size"] = 2
+        assert storage_deployment_id(**facts) != forward
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
