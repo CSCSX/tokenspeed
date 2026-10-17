@@ -153,6 +153,19 @@ def _dist_argmax_vetoed() -> bool:
     )
 
 
+def prepare_logits_communication(model: nn.Module) -> None:
+    """Prepare distributed argmax for registered head/processor pairs.
+
+    Traverse the loaded model after shared heads and sampling configuration
+    are wired. Nested language models and draft models use the same boundary;
+    models without a logits processor have no communication to prepare.
+    """
+    for owner in model.modules():
+        processor = owner._modules.get("logits_processor")
+        if isinstance(processor, LogitsProcessor):
+            processor.prepare_communication(owner.lm_head)
+
+
 class VocabParallelArgmax:
     """Greedy token ids from logits left sharded over the vocabulary.
 
@@ -380,6 +393,7 @@ class LogitsProcessor(nn.Module):
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+        self._dist_argmax_binding: tuple[object, ...] | None = None
 
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
@@ -592,12 +606,17 @@ class LogitsProcessor(nn.Module):
         self._LOGITS_DIST_ARGMAX_STATES[key] = state
         return state
 
+    def _dist_argmax_eligible(self) -> bool:
+        # The kernel's cross-rank reduce is a single warp shuffle.
+        return (
+            not _dist_argmax_vetoed()
+            and 2 <= self.tp_size <= 32
+            and not self.skip_all_gather
+            and not self.dp_sampling_enabled
+        )
+
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if _dist_argmax_vetoed():
-            return None
-        if not 2 <= self.tp_size <= 32:
-            return None  # the kernel's cross-rank reduce is a single warp shuffle
-        if self.skip_all_gather or self.dp_sampling_enabled:
+        if not self._dist_argmax_eligible():
             return None
 
         vocab_per_rank = lm_head.weight.size(0)
@@ -616,6 +635,44 @@ class LogitsProcessor(nn.Module):
         if state is None and not torch.cuda.is_current_stream_capturing():
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
+
+    def prepare_communication(self, lm_head: VocabParallelEmbedding) -> None:
+        """Resolve distributed argmax once at startup, outside graph capture.
+
+        A None state is a prepared fallback, distinct from the uninitialized
+        sentinel. The state depends on head geometry, not weight values, so
+        in-place weight updates reuse it; a startup head replacement reprobes
+        only when its shard geometry, dtype, device or sampling gate changes.
+        """
+        enabled = self.do_argmax and self._dist_argmax_eligible()
+        geometry = (
+            (lm_head.weight.shape[0], lm_head.weight.dtype, lm_head.weight.device)
+            if enabled
+            else None
+        )
+        binding = (
+            self.do_argmax,
+            self.skip_all_gather,
+            self.dp_sampling_enabled,
+            self.tp_group,
+            self.tp_rank,
+            self.tp_size,
+            self.config.vocab_size,
+            geometry,
+        )
+        if (
+            self._dist_argmax_state is not self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+            and self._dist_argmax_binding == binding
+        ):
+            return
+        if enabled and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Distributed argmax must be prepared before CUDA graph capture"
+            )
+        self._dist_argmax_state = (
+            self._init_dist_argmax_state(lm_head) if enabled else None
+        )
+        self._dist_argmax_binding = binding
 
     def forward(
         self,
@@ -1075,11 +1132,10 @@ class LogitsProcessor(nn.Module):
 
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
             if self.do_argmax and not require_full_vocab:
-                if (
-                    self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and not torch.cuda.is_current_stream_capturing()
-                ):
-                    self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
+                if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
+                    raise RuntimeError(
+                        "Distributed argmax must be prepared before forwarding"
+                    )
 
                 if (
                     self._dist_argmax_state

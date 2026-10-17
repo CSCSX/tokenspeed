@@ -29,6 +29,7 @@ cache. Run with CUDA_VISIBLE_DEVICES selecting an available GPU.
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -58,6 +59,8 @@ from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41ForCausalLM
 
 VOCAB_SIZE = 128
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 
 def _state(prompt, output):
@@ -169,6 +172,29 @@ def _fill(ib, runtime, op, snapshot):
         torch.tensor(op.extend_prefix_lens, dtype=torch.int32, device=ib.device),
     )
     ib.fill_input_buffers(op, runtime, sum(op.input_lengths), ngram_inputs=snapshot)
+
+
+def test_decode_override_clears_only_consumed_flags_without_host_sync(buffers):
+    ib, runtime = buffers
+    runtime.valid_cache_lengths.fill_(2)
+    runtime.future_input_map.fill_(22)
+    runtime.spec_candidates_ready.fill_(True)
+    states = {"a": _state([10, 11, 12], []), "b": _state([20, 21, 22], [])}
+    op = _op(states, ["a", "b"], [2, 4], [1, 1], [], [], [12, -1])
+    snapshot = ngram_inputs_for_forward(op, states, 3)
+    on_cuda = torch.device(ib.device).type == "cuda"
+    previous = torch.cuda.get_sync_debug_mode() if on_cuda else None
+    try:
+        if on_cuda:
+            torch.cuda.set_sync_debug_mode("error")
+        ib.fill_input_buffers(op, runtime, 2, ngram_inputs=snapshot)
+    finally:
+        if on_cuda:
+            torch.cuda.set_sync_debug_mode(previous)
+    assert ib.input_ids_buf[:2].tolist() == [12, 22]
+    assert runtime.spec_candidates_ready.tolist() == [
+        i not in (2, 4) for i in range(runtime.spec_candidates_ready.numel())
+    ]
 
 
 def _expected(tokens, positions):
@@ -947,6 +973,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         decode_only_attention=False,
         disable_autotune=False,
         model_is_mrope=False,
+        query_shard_size=1,
         device=ib.device,
     )
     executor.input_buffers = ib
