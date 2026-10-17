@@ -45,6 +45,8 @@ FP32 registers. It writes FP32 correction, normalized key and decay records;
 `key_gate_format` distinguishes these from the multi-token raw key/gate
 records. Accepted commit copies normalized factors without another transform.
 Both producers use the same cache-owned history and acceptance lifecycle.
+Workspace planning accounts for FP32 key/decay records in single-token decode
+and activation-dtype raw key/gate records in multi-token verify.
 
 One thread block handles each head, preserving the original fused decode's
 reduction layout. Empty and nonempty histories share the same dense-state

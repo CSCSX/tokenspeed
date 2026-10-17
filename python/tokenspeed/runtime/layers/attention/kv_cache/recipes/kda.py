@@ -69,7 +69,7 @@ def kda_state_fields(
     """Declare one cache-owned convolution and recurrent endpoint.
 
     With retained history, the dense recurrent field is a base checkpoint.
-    Its correction, weighted key, decay and length fields reconstruct the same
+    Its correction, normalized key, decay and length fields reconstruct the same
     endpoint as the convolution field and must move with that cache block.
     """
     fields = (
@@ -206,18 +206,21 @@ def kda_verify_workspace_bytes(
         * head_dim
         * (torch.bfloat16.itemsize if raw_gate else torch.float32.itemsize)
     )
-    if records:
-        # Raw QKV retains the accepted convolution window. Records store
-        # FP32 U and activation-dtype unnormalized K/raw gate.
-        row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
-        row_bytes += (
-            heads * head_dim * (torch.float32.itemsize + 2 * config.dtype.itemsize)
-        )
-    group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
-    metadata_bytes = 0
     retained_history = any(
         field.field_id.endswith(".replay_length") for field in state_fields
     )
+    if records:
+        # The fused T1 producer stores FP32 normalized key/decay; multi-token
+        # verify stores activation-dtype raw key/gate. Both retain FP32 U.
+        key_gate_dtype = (
+            torch.float32 if retained_history and draft_token_num == 1 else config.dtype
+        )
+        row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
+        row_bytes += (
+            heads * head_dim * (torch.float32.itemsize + 2 * key_gate_dtype.itemsize)
+        )
+    group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
+    metadata_bytes = 0
     if draft_token_num > 1 or retained_history:
         metadata_bytes = len(conv_fields) * (10 * 8 + 4)
         metadata_bytes += group_count * (

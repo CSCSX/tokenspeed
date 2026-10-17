@@ -39,12 +39,16 @@ register_cuda_ci(est_time=120, suite="runtime-1gpu")
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import kda_state_fields
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_state_fields,
+    kda_verify_workspace_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     pack,
@@ -64,7 +68,7 @@ FIELD_NAMES = (
 )
 
 
-def _pool(capacity: int) -> HybridKDATokenToKVPool:
+def _groups(capacity: int):
     full = CacheGroupSpec(
         group_id="full_attention",
         attn_kind="full_history",
@@ -91,8 +95,13 @@ def _pool(capacity: int) -> HybridKDATokenToKVPool:
                 ),
             )
         )
+    return tuple(groups)
+
+
+def _pool(capacity: int) -> HybridKDATokenToKVPool:
+    groups = _groups(capacity)
     plan = pack(
-        tuple(groups),
+        groups,
         prefix_granularity=128,
         cache_blocks_per_lcm_block={"full_attention": 4, "state_a": 1, "state_b": 1},
         max_padding_fraction=float("inf"),
@@ -207,6 +216,15 @@ def test_retained_backend_rounds_match_recurrence(width, capacity, captured):
     torch.manual_seed(671)
     pool = _pool(capacity)
     spec = MHAConfig(num_attention_heads=H, num_kv_heads=H, head_dim=D, attn_tp_size=1)
+    linear = LinearAttnConfig(
+        num_k_heads=H,
+        num_v_heads=H,
+        head_k_dim=D,
+        head_v_dim=D,
+        conv_kernel_size=4,
+        layer_ids=(1, 2),
+        tp_size=1,
+    )
     config = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
@@ -217,13 +235,17 @@ def test_retained_backend_rounds_match_recurrence(width, capacity, captured):
         max_bs=3,
         is_draft=False,
         speculative_num_draft_tokens=width,
-        components=(spec,),
+        components=(spec, linear),
     )
     backend = KdaAttnBackend(
         config, spec, enable_prefill_graph=False, kda_backend="fla"
     )
     backend.set_kv_pool(pool)
-    backend.preallocate_verify_workspace(3, width)
+    planned_bytes = kda_verify_workspace_bytes(
+        config, _groups(capacity), draft_token_num=width, replay_kda=True
+    )
+    # Serving reserves this budget before allocating the real record tensors.
+    assert backend.preallocate_verify_workspace(3, width) == planned_bytes
     backend.init_cuda_graph_state(3)
     params = {
         layer: {
