@@ -352,7 +352,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             for layer_id in self._state_layer_ids():
                 self._replay_history_buffers[layer_id] = (
                     cache_pool.get_component(layer_id, "replay_correction"),
-                    cache_pool.get_component(layer_id, "replay_weighted_key"),
+                    cache_pool.get_component(layer_id, "replay_key"),
                     cache_pool.get_component(layer_id, "replay_decay"),
                     cache_pool.get_component(layer_id, "replay_length").squeeze(-1),
                 )
@@ -905,13 +905,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if self._replay_history_capacity:
             from tokenspeed_kernel.ops.attention.kda import kda_materialize_history
 
-            correction, weighted_key, decay, lengths = self._replay_history_buffers[
-                layer_id
-            ]
+            correction, key, decay, lengths = self._replay_history_buffers[layer_id]
             kda_materialize_history(
                 ssm_states,
                 correction,
-                weighted_key,
+                key,
                 decay,
                 lengths,
                 state_in_blocks,
@@ -1105,13 +1103,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 history = None
                 if self._replay_history_capacity:
                     assert self._replay_history_append_offsets is not None
-                    correction, weighted_key, decay, lengths = (
-                        self._replay_history_buffers[layer_id]
-                    )
+                    correction, key, decay, lengths = self._replay_history_buffers[
+                        layer_id
+                    ]
                     history = KdaReplayHistory(
                         correction=correction,
-                        weighted_key=weighted_key,
-                        total_decay=decay,
+                        key=key,
+                        decay=decay,
                         lengths=lengths,
                         write_indices=self.forward_metadata.state_out_blocks_by_group[
                             self._state_group_for(layer_id)

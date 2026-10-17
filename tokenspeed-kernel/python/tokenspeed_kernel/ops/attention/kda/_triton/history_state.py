@@ -22,7 +22,7 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import _recover_weighted_kda_state
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import _recover_kda_history
 
 
 @triton.jit
@@ -48,6 +48,7 @@ def _materialize_history_kernel(
     stride_key_dim,
     stride_decay_page,
     stride_decay_head,
+    stride_decay_token,
     stride_decay_dim,
     stride_length,
     stride_indices,
@@ -83,15 +84,12 @@ def _materialize_history_kernel(
             (length >= 0) & (length <= CAPACITY), "invalid retained KDA interval"
         )
         if length > 0:
-            result = _recover_weighted_kda_state(
+            result = _recover_kda_history(
                 state_addresses,
                 state_mask,
                 correction_ptr + page * stride_u_page + head * stride_u_head,
                 key_ptr + page * stride_key_page + head * stride_key_head,
-                decay_ptr
-                + page * stride_decay_page
-                + head * stride_decay_head
-                + keys * stride_decay_dim,
+                decay_ptr + page * stride_decay_page + head * stride_decay_head,
                 keys,
                 values,
                 key_mask,
@@ -101,6 +99,8 @@ def _materialize_history_kernel(
                 stride_u_dim,
                 stride_key_token,
                 stride_key_dim,
+                stride_decay_token,
+                stride_decay_dim,
                 BT,
                 USE_TENSOR_CORES,
                 1,
@@ -120,8 +120,8 @@ def _materialize_history_kernel(
 def materialize_history(
     base_state: torch.Tensor,
     correction: torch.Tensor,
-    weighted_key: torch.Tensor,
-    total_decay: torch.Tensor,
+    key: torch.Tensor,
+    decay: torch.Tensor,
     lengths: torch.Tensor,
     read_indices: torch.Tensor,
     *,
@@ -137,15 +137,15 @@ def materialize_history(
     _materialize_history_kernel[(triton.cdiv(value_dim, block_v), rows, heads)](
         base_state,
         correction,
-        weighted_key,
-        total_decay,
+        key,
+        decay,
         lengths,
         read_indices,
         out,
         *base_state.stride(),
         *correction.stride(),
-        *weighted_key.stride(),
-        *total_decay.stride(),
+        *key.stride(),
+        *decay.stride(),
         lengths.stride(0),
         read_indices.stride(0),
         *out.stride(),

@@ -234,9 +234,9 @@ commits the accepted state into slot 1 unconditionally
 
 KDA can represent that endpoint as a composite checkpoint. The block holds
 its convolution window, a dense recurrent base, and a bounded accepted
-history of FP32 corrections, decay-weighted normalized keys, total decay and
-length. The recurrent endpoint is `base * decay + correction @ weighted_key`;
-a zero history length means the base alone. These are fields of the same
+history of FP32 corrections, normalized keys, per-token decays and length.
+The recurrent endpoint applies these updates in token order, starting at the
+base. A zero history length means the base alone. These are fields of the same
 state block, so prefix reuse, zeroing, copying, retraction and PD transfer
 carry all of them together. The physical history capacity is independent of
 the engine role and speculative width. Head-valued fields follow attention

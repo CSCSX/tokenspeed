@@ -21,3 +21,17 @@ use finite inputs away from overflow and subnormal ranges; they do not
 establish behavior for unrestricted IEEE inputs or universal cuBLAS identity.
 Recurrence, candidate record precision, and accepted-prefix
 ownership use the existing RecoverSSM contracts.
+
+## Accepted history
+
+Each cache checkpoint retains FP32 correction, normalized key and decay for
+every accepted token. Appending a new token leaves older factors unchanged.
+Scalar reconstruction applies each decay multiplication before the fused
+correction/key update. Keep key normalization as a one-dimensional reduction
+with one warp; changing its layout can change FP32 rounding.
+
+The optional TF32x3 specialization forms decay-weighted keys during recovery.
+It preserves the same accepted interval but can round differently because it
+groups products. Serving currently uses scalar recovery. Per-token decay uses
+more checkpoint storage than an accumulated decay; the cache plan includes
+the complete field shape when it selects the number of physical pages.

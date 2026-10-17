@@ -42,8 +42,8 @@ _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bflo
 def triton_nvidia_kda_materialize_history(
     base_state: torch.Tensor,
     correction: torch.Tensor,
-    weighted_key: torch.Tensor,
-    total_decay: torch.Tensor,
+    key: torch.Tensor,
+    decay: torch.Tensor,
     lengths: torch.Tensor,
     read_indices: torch.Tensor,
     *,
@@ -57,8 +57,8 @@ def triton_nvidia_kda_materialize_history(
     return materialize_history(
         base_state,
         correction,
-        weighted_key,
-        total_decay,
+        key,
+        decay,
         lengths,
         read_indices,
         out=out,

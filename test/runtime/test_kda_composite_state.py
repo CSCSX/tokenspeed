@@ -107,7 +107,7 @@ def test_composite_endpoint_survives_cache_copy_and_reuse(
         "conv_state",
         "recurrent_state",
         "replay_correction",
-        "replay_weighted_key",
+        "replay_key",
         "replay_decay",
         "replay_length",
     )
@@ -132,11 +132,11 @@ def test_composite_endpoint_survives_cache_copy_and_reuse(
         current = fields["recurrent_state"][block].clone()
         length = int(fields["replay_length"][block, 0].item())
         if length:
-            current *= fields["replay_decay"][block, :, None, :]
             for token in range(length):
+                current *= fields["replay_decay"][block, :, token, None, :]
                 current += (
                     fields["replay_correction"][block, :, token, :, None]
-                    * fields["replay_weighted_key"][block, :, token, None, :]
+                    * fields["replay_key"][block, :, token, None, :]
                 )
         return current
 
@@ -154,7 +154,7 @@ def test_composite_endpoint_survives_cache_copy_and_reuse(
         kda_materialize_history(
             fields["recurrent_state"],
             fields["replay_correction"],
-            fields["replay_weighted_key"],
+            fields["replay_key"],
             fields["replay_decay"],
             lengths,
             indices,
@@ -204,7 +204,7 @@ def test_composite_endpoint_survives_cache_copy_and_reuse(
     destinations = torch.tensor([2, 0, -1], device=device, dtype=torch.int32)
     kda_clear_history(lengths, destinations)
     torch.testing.assert_close(endpoint(2), first, atol=0, rtol=0)
-    for name in ("replay_correction", "replay_weighted_key", "replay_decay"):
+    for name in ("replay_correction", "replay_key", "replay_decay"):
         torch.testing.assert_close(fields[name][2], before[name][1], atol=0, rtol=0)
     if captured:
         graph.replay()

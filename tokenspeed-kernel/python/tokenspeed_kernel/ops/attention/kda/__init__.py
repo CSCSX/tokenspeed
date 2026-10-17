@@ -111,11 +111,10 @@ class KdaPrefillResult:
 class KdaReplayHistory:
     """A recurrent checkpoint represented by a base plus accepted updates.
 
-    For history length h, the logical recurrent state is base * total_decay
-    + correction[:h].T @ weighted_key[:h], independently for each head.
-    correction and weighted_key are FP32 [page, head, capacity, channel].
-    Keys are normalized before absorption and include all subsequent accepted
-    decays. total_decay is FP32 [page, head, key]; lengths is INT32 [page].
+    Starting at the base, apply each accepted token as
+    state = fma(correction, key, round(state * decay)). Corrections, normalized
+    keys and per-token decays are FP32 [page, head, capacity, channel].
+    lengths is INT32 [page].
     Length zero means the base state alone, regardless of unused field bytes.
 
     write_indices selects private pages. Verify writes a reconstructed base
@@ -123,12 +122,13 @@ class KdaReplayHistory:
     length in fixed append_offsets scratch. Commit absorbs only accepted
     records. A published page, including its factors, remains immutable.
     use_tensor_cores explicitly selects the reconstruction arithmetic.
-    Floating-point grouping can differ from token-by-token replay.
+    The Tensor Core specialization groups updates into a matrix product and
+    can round differently from ordered scalar reconstruction.
     """
 
     correction: torch.Tensor
-    weighted_key: torch.Tensor
-    total_decay: torch.Tensor
+    key: torch.Tensor
+    decay: torch.Tensor
     lengths: torch.Tensor
     write_indices: torch.Tensor
     append_offsets: torch.Tensor
@@ -139,10 +139,10 @@ class KdaReplayHistory:
 class KdaReplayHistoryBatch:
     """Stable addresses and field geometry for all recurrent layers.
 
-    descriptors is UINT64 [layers, 4]: correction, weighted key, total decay,
+    descriptors is UINT64 [layers, 4]: correction, normalized key, token decay,
     and length addresses. append_offsets is INT32 [layers, max_batch], written
     by verify. Page strides count elements. Records within each page are
-    contiguous [head, capacity, channel], and decay is [head, key].
+    contiguous [head, capacity, channel], including decay.
     """
 
     descriptors: torch.Tensor
@@ -179,8 +179,8 @@ class KdaReplayRecords:
 def kda_materialize_history(
     base_state: torch.Tensor,
     correction: torch.Tensor,
-    weighted_key: torch.Tensor,
-    total_decay: torch.Tensor,
+    key: torch.Tensor,
+    decay: torch.Tensor,
     lengths: torch.Tensor,
     read_indices: torch.Tensor,
     *,
@@ -192,8 +192,8 @@ def kda_materialize_history(
     Args:
         base_state: FP32 [blocks, heads, value, key] base checkpoints.
         correction: FP32 [blocks, heads, capacity, value] accepted corrections.
-        weighted_key: FP32 [blocks, heads, capacity, key] decay-weighted keys.
-        total_decay: FP32 [blocks, heads, key] accepted decay products.
+        key: FP32 [blocks, heads, capacity, key] normalized accepted keys.
+        decay: FP32 [blocks, heads, capacity, key] per-token decay factors.
         lengths: INT32 [blocks] retained lengths; zero selects the base alone.
         read_indices: One block per output row; nonpositive blocks produce zero.
         out: FP32 [rows, heads, value, key] destination for dense scan inputs.
@@ -210,8 +210,8 @@ def kda_materialize_history(
     return kernel(
         base_state,
         correction,
-        weighted_key,
-        total_decay,
+        key,
+        decay,
         lengths,
         read_indices,
         out=out,

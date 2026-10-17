@@ -194,7 +194,7 @@ def _partition_for_field(
             "conv_state",
             "recurrent_state",
             "replay_correction",
-            "replay_weighted_key",
+            "replay_key",
             "replay_decay",
         )
         and linear_config is not None

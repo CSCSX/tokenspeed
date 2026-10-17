@@ -58,7 +58,7 @@ FIELD_NAMES = (
     "conv_state",
     "recurrent_state",
     "replay_correction",
-    "replay_weighted_key",
+    "replay_key",
     "replay_decay",
     "replay_length",
 )
@@ -116,11 +116,11 @@ def _pool(capacity: int) -> HybridKDATokenToKVPool:
 def _endpoint(pool: HybridKDATokenToKVPool, layer: int, page: int) -> torch.Tensor:
     state = pool.get_component(layer, "recurrent_state")[page].clone()
     length = int(pool.get_component(layer, "replay_length")[page, 0])
-    if length:
-        state *= pool.get_component(layer, "replay_decay")[page, :, None, :]
-        u = pool.get_component(layer, "replay_correction")[page, :, :length]
-        key = pool.get_component(layer, "replay_weighted_key")[page, :, :length]
-        state += torch.einsum("htv,htk->hvk", u, key)
+    for token in range(length):
+        state *= pool.get_component(layer, "replay_decay")[page, :, token, None, :]
+        u = pool.get_component(layer, "replay_correction")[page, :, token, :, None]
+        key = pool.get_component(layer, "replay_key")[page, :, token, None, :]
+        state += u * key
     return state
 
 

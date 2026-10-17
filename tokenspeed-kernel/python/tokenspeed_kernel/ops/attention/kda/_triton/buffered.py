@@ -18,13 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Absorb accepted KDA updates into a bounded weighted history."""
+"""Append accepted KDA updates in token order."""
 
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
-    _kda_gate,
-    _recoverssm_decay_product,
-)
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import _kda_gate
 
 
 @triton.jit(do_not_specialize=["batch"])
@@ -67,6 +64,7 @@ def append_kda_history_kernel(
     stride_history_key_dim,
     stride_history_decay_page,
     stride_history_decay_head,
+    stride_history_decay_token,
     stride_history_decay_dim,
     stride_history_length,
     lower_bound,
@@ -76,7 +74,6 @@ def append_kda_history_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
-    BH: tl.constexpr,
     BD: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -149,85 +146,67 @@ def append_kda_history_kernel(
     tl.device_assert(valid, "stale candidate KDA record")
     if not valid:
         return
-    correction = tl.load(
-        correction_ptr
-        + slot * stride_correction_slot
-        + head * stride_correction_head
-        + ring[:, None] * stride_correction_token
-        + dims[None, :] * stride_correction_dim,
-        mask=live[:, None] & (dims[None, :] < V),
-        other=0.0,
-    )
-    raw_key = tl.load(
-        kg_ptr
-        + slot * stride_kg_slot
-        + head * stride_kg_head
-        + ring[:, None] * stride_kg_token
-        + dims[None, :] * stride_kg_dim,
-        mask=live[:, None] & (dims[None, :] < K),
-        other=0.0,
-    ).to(tl.float32)
-    raw_gate = tl.load(
-        kg_ptr
-        + slot * stride_kg_slot
-        + head * stride_kg_head
-        + ring[:, None] * stride_kg_token
-        + (K + dims[None, :]) * stride_kg_dim,
-        mask=live[:, None] & (dims[None, :] < K),
-        other=0.0,
-    ).to(tl.float32)
-    key = raw_key * tl.rsqrt(tl.sum(raw_key * raw_key, axis=1) + 1e-6)[:, None]
+    # Keep each key reduction one-dimensional, matching scalar dense recovery.
     A = tl.exp(tl.load(a_ptr + head))
     bias = tl.load(bias_ptr + head * K + dims, mask=dims < K, other=0.0)
-    gate = _kda_gate(raw_gate, bias[None, :], A, lower_bound, USE_LOWER_BOUND)
-    decay = tl.where(live[:, None], tl.exp(gate), 1.0)
-    inclusive = tl.associative_scan(
-        decay, axis=0, combine_fn=_recoverssm_decay_product, reverse=True
-    )
-    next_row = tl.broadcast_to(tl.minimum(tokens + 1, BT - 1)[:, None], (BT, BD))
-    suffix = tl.gather(inclusive, next_row, axis=0)
-    suffix = tl.where((tokens + 1 < accepted)[:, None], suffix, 1.0)
-    window_decay = tl.sum(tl.where(tokens[:, None] == 0, inclusive, 0.0), axis=0)
-
-    # One writer per request/head scales the accepted prefix exactly once.
-    # Rejected candidate rows never participate in these products.
-    old_tokens = tl.arange(0, BH)
-    old_key_ptrs = (
-        history_key_ptr
-        + page * stride_history_key_page
-        + head * stride_history_key_head
-        + old_tokens[:, None] * stride_history_key_token
-        + dims[None, :] * stride_history_key_dim
-    )
-    old_mask = (old_tokens[:, None] < start) & (dims[None, :] < K)
-    old_keys = tl.load(old_key_ptrs, mask=old_mask, other=0.0)
-    tl.store(old_key_ptrs, old_keys * window_decay[None, :], mask=old_mask)
-    decay_ptrs = (
-        history_decay_ptr
-        + page * stride_history_decay_page
-        + head * stride_history_decay_head
-        + dims * stride_history_decay_dim
-    )
-    old_decay = tl.load(decay_ptrs, mask=(start > 0) & (dims < K), other=1.0)
-    tl.store(decay_ptrs, old_decay * window_decay, mask=dims < K)
-    output_tokens = start + tokens
-    tl.store(
-        history_correction_ptr
-        + page * stride_history_correction_page
-        + head * stride_history_correction_head
-        + output_tokens[:, None] * stride_history_correction_token
-        + dims[None, :] * stride_history_correction_dim,
-        correction,
-        mask=live[:, None] & (dims[None, :] < V),
-    )
-    tl.store(
-        history_key_ptr
-        + page * stride_history_key_page
-        + head * stride_history_key_head
-        + output_tokens[:, None] * stride_history_key_token
-        + dims[None, :] * stride_history_key_dim,
-        key * suffix,
-        mask=live[:, None] & (dims[None, :] < K),
-    )
+    for token in range(accepted):
+        ring_token = (position + token) % RECORD_CAPACITY
+        correction = tl.load(
+            correction_ptr
+            + slot * stride_correction_slot
+            + head * stride_correction_head
+            + ring_token * stride_correction_token
+            + dims * stride_correction_dim,
+            mask=dims < V,
+            other=0.0,
+        )
+        raw_key = tl.load(
+            kg_ptr
+            + slot * stride_kg_slot
+            + head * stride_kg_head
+            + ring_token * stride_kg_token
+            + dims * stride_kg_dim,
+            mask=dims < K,
+            other=0.0,
+        ).to(tl.float32)
+        raw_gate = tl.load(
+            kg_ptr
+            + slot * stride_kg_slot
+            + head * stride_kg_head
+            + ring_token * stride_kg_token
+            + (K + dims) * stride_kg_dim,
+            mask=dims < K,
+            other=0.0,
+        ).to(tl.float32)
+        key = raw_key * tl.rsqrt(tl.sum(raw_key * raw_key) + 1e-6)
+        decay = tl.exp(_kda_gate(raw_gate, bias, A, lower_bound, USE_LOWER_BOUND))
+        output_token = start + token
+        tl.store(
+            history_correction_ptr
+            + page * stride_history_correction_page
+            + head * stride_history_correction_head
+            + output_token * stride_history_correction_token
+            + dims * stride_history_correction_dim,
+            correction,
+            mask=dims < V,
+        )
+        tl.store(
+            history_key_ptr
+            + page * stride_history_key_page
+            + head * stride_history_key_head
+            + output_token * stride_history_key_token
+            + dims * stride_history_key_dim,
+            key,
+            mask=dims < K,
+        )
+        tl.store(
+            history_decay_ptr
+            + page * stride_history_decay_page
+            + head * stride_history_decay_head
+            + output_token * stride_history_decay_token
+            + dims * stride_history_decay_dim,
+            decay,
+            mask=dims < K,
+        )
     if head == 0:
         tl.store(history_lengths_ptr + page * stride_history_length, start + accepted)

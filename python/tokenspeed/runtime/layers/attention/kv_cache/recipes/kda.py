@@ -105,11 +105,11 @@ def kda_state_fields(
                     torch.float32,
                 ),
                 (
-                    "replay_weighted_key",
+                    "replay_key",
                     (heads, history_capacity, key_dim),
                     torch.float32,
                 ),
-                ("replay_decay", (heads, key_dim), torch.float32),
+                ("replay_decay", (heads, history_capacity, key_dim), torch.float32),
                 ("replay_length", (1,), torch.int32),
             )
         )

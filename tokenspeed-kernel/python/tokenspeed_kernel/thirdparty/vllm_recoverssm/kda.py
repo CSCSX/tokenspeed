@@ -193,6 +193,7 @@ def _kda_recoverssm_verify_kernel(
     stride_history_key_dim,
     stride_history_decay_block,
     stride_history_decay_head,
+    stride_history_decay_pos,
     stride_history_decay_dim,
     stride_history_length,
     HISTORY_CAPACITY: tl.constexpr,
@@ -328,7 +329,7 @@ def _kda_recoverssm_verify_kernel(
         )
         write_idx = tl.load(history_write_indices_ptr + pid_b).to(tl.int64)
         if history_len > 0:
-            state = _recover_weighted_kda_state(
+            state = _recover_kda_history(
                 state_ptrs,
                 mask_state,
                 history_correction_ptr
@@ -339,8 +340,7 @@ def _kda_recoverssm_verify_kernel(
                 + pid_h * stride_history_key_head,
                 history_decay_ptr
                 + state_idx * stride_history_decay_block
-                + pid_h * stride_history_decay_head
-                + offs_k * stride_history_decay_dim,
+                + pid_h * stride_history_decay_head,
                 offs_k,
                 offs_v,
                 mask_k,
@@ -350,6 +350,8 @@ def _kda_recoverssm_verify_kernel(
                 stride_history_correction_dim,
                 stride_history_key_pos,
                 stride_history_key_dim,
+                stride_history_decay_pos,
+                stride_history_decay_dim,
                 max(8, triton.next_power_of_2(HISTORY_CAPACITY)),
                 HISTORY_USE_TENSOR_CORES,
                 4 if SPEC_QUERY_LEN == 4 else 1,
@@ -585,12 +587,12 @@ def _recoverssm_decay_product(left, right):
 
 
 @triton.jit
-def _recover_weighted_kda_state(
+def _recover_kda_history(
     state_ptrs,
     mask_state,
     correction_ptr,
     key_ptr,
-    decay_ptrs,
+    decay_ptr,
     offs_k,
     offs_v,
     mask_k,
@@ -600,13 +602,13 @@ def _recover_weighted_kda_state(
     stride_correction_dim,
     stride_key_token,
     stride_key_dim,
+    stride_decay_token,
+    stride_decay_dim,
     BT: tl.constexpr,
     USE_TENSOR_CORES: tl.constexpr,
     HISTORY_UNROLL: tl.constexpr,
 ):
-    decay = tl.load(decay_ptrs, mask=mask_k, other=1.0)
     state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
-    state *= decay[None, :]
     if USE_TENSOR_CORES:
         tokens = tl.arange(0, BT)
         live = tokens < history_len
@@ -624,9 +626,25 @@ def _recover_weighted_kda_state(
             mask=live[:, None] & mask_k[None, :],
             other=0.0,
         )
-        state = tl.dot(corrections, keys, acc=state, input_precision="tf32x3")
+        decay = tl.load(
+            decay_ptr
+            + tokens[:, None] * stride_decay_token
+            + offs_k[None, :] * stride_decay_dim,
+            mask=live[:, None] & mask_k[None, :],
+            other=1.0,
+        )
+        next_row = tl.broadcast_to(tl.minimum(tokens + 1, BT - 1)[:, None], decay.shape)
+        later_decay = tl.gather(decay, next_row, axis=0)
+        later_decay = tl.where((tokens + 1 < history_len)[:, None], later_decay, 1.0)
+        suffix = tl.associative_scan(
+            later_decay, axis=0, combine_fn=_recoverssm_decay_product, reverse=True
+        )
+        total_decay = tl.sum(
+            tl.where(tokens[:, None] == 0, suffix * decay, 0.0), axis=0
+        )
+        update = tl.dot(corrections, keys * suffix, input_precision="tf32x3")
+        state = tl.fma(state, total_decay[None, :], update)
     else:
-        # Unroll short speculative recovery without changing update order.
         for token in tl.range(
             0, history_len, num_stages=3, loop_unroll_factor=HISTORY_UNROLL
         ):
@@ -642,7 +660,13 @@ def _recover_weighted_kda_state(
                 mask=mask_k,
                 other=0.0,
             )
-            state += correction[:, None] * key[None, :]
+            decay = tl.load(
+                decay_ptr + token * stride_decay_token + offs_k * stride_decay_dim,
+                mask=mask_k,
+                other=1.0,
+            )
+            # Preserve the rounded decay multiplication before the fused update.
+            state = tl.fma(correction[:, None], key[None, :], state * decay[None, :])
     return state
 
 
@@ -1067,7 +1091,7 @@ def kda_recoverssm_verify(
             else (0, 0, 0, 0)
         ),
         *(history_key.stride() if history_key is not None else (0, 0, 0, 0)),
-        *(history_decay.stride() if history_decay is not None else (0, 0, 0)),
+        *(history_decay.stride() if history_decay is not None else (0, 0, 0, 0)),
         0 if history_lengths is None else history_lengths.stride(0),
         0 if history_correction is None else history_correction.shape[2],
         history_use_tensor_cores,

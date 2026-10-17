@@ -55,7 +55,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         self._layer_types = tuple(layer_types)
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._replay_correction: list[torch.Tensor | None] = []
-        self._replay_weighted_key: list[torch.Tensor | None] = []
+        self._replay_key: list[torch.Tensor | None] = []
         self._replay_decay: list[torch.Tensor | None] = []
         self._replay_length: list[torch.Tensor | None] = []
         self.requires_page_zeroing = True
@@ -75,7 +75,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         "conv_state": "_conv_state",
         "recurrent_state": "_recurrent_state",
         "replay_correction": "_replay_correction",
-        "replay_weighted_key": "_replay_weighted_key",
+        "replay_key": "_replay_key",
         "replay_decay": "_replay_decay",
         "replay_length": "_replay_length",
     }
@@ -109,7 +109,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
                 "conv_state",
                 "recurrent_state",
                 "replay_correction",
-                "replay_weighted_key",
+                "replay_key",
                 "replay_decay",
                 "replay_length",
             ),
@@ -129,7 +129,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             return recurrent
         histories = {
             "replay_correction": self._replay_correction,
-            "replay_weighted_key": self._replay_weighted_key,
+            "replay_key": self._replay_key,
             "replay_decay": self._replay_decay,
             "replay_length": self._replay_length,
         }

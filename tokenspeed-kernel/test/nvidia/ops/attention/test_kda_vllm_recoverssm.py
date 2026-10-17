@@ -526,9 +526,11 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
         layers, pages, heads, retained_capacity, dim
     )
     retained_key = torch.randn_like(retained_u)
-    retained_decay = torch.rand(layers, pages, heads * dim + 16, device="cuda")[
-        :, :, : heads * dim
-    ].view(layers, pages, heads, dim)
+    retained_decay = torch.rand(
+        layers, pages, heads * retained_capacity * dim + 16, device="cuda"
+    )[:, :, : heads * retained_capacity * dim].view(
+        layers, pages, heads, retained_capacity, dim
+    )
     retained_lengths = torch.zeros(layers, pages, 5, device="cuda", dtype=torch.int32)[
         :, :, 0
     ]
@@ -644,8 +646,6 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
                     )
                 if buffered:
                     offset = int(append_offsets[layer, request].item())
-                    if offset == 0:
-                        expected_decay[layer, dest].fill_(1)
                     for token in range(count):
                         row = request * capacity + (record_start + token) % capacity
                         raw_key, raw_gate = (
@@ -664,10 +664,7 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
                                 * (raw_gate + dt_bias[layer])
                             )
                         )
-                        expected_key[layer, dest, :, : offset + token] *= decay[
-                            :, None, :
-                        ]
-                        expected_decay[layer, dest] *= decay
+                        expected_decay[layer, dest, :, offset + token] = decay
                         expected_u[layer, dest, :, offset + token] = corrections[
                             layer, row, :channels
                         ].view(heads, dim)
@@ -1303,7 +1300,7 @@ def test_buffered_recoverssm_multiple_rounds(
     state[1 : batch + 1].copy_(initial)
     history_u = torch.full((pages, heads, capacity, dim), float("nan"), device="cuda")
     history_key = torch.full((pages, heads, capacity, dim), float("nan"), device="cuda")
-    history_decay = torch.zeros(pages, heads, dim, device="cuda")
+    history_decay = torch.zeros(pages, heads, capacity, dim, device="cuda")
     lengths = torch.zeros(pages, dtype=torch.int32, device="cuda")
     read = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
     write = read + batch
@@ -1312,8 +1309,8 @@ def test_buffered_recoverssm_multiple_rounds(
     offsets = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
     history = KdaReplayHistory(
         correction=history_u,
-        weighted_key=history_key,
-        total_decay=history_decay,
+        key=history_key,
+        decay=history_decay,
         lengths=lengths,
         write_indices=write,
         append_offsets=offsets,
@@ -1462,15 +1459,22 @@ def test_buffered_state_cancellation_against_fp64(
     u = torch.randn(3, heads, capacity, dim, device="cuda") * 0.2
     w = torch.randn_like(u)
     w *= torch.rsqrt(w.square().sum(-1, keepdim=True) + 1e-6)
-    decay = torch.rand(3, heads, dim, device="cuda") * 0.1 + 0.9
+    decay = torch.rand_like(u) * 0.1 + 0.9
     # A nearly cancelled checkpoint exposes errors hidden by BF16 outputs or
     # by checking only the final state after strongly contracting updates.
-    product = torch.einsum(
-        "htv,htk->hvk", u[1, :, :retained].double(), w[1, :, :retained].double()
-    )
-    state[1].copy_((-product / decay[1].double()[:, None, :]).float())
+    product = torch.zeros_like(state[1], dtype=torch.float64)
+    total_decay = torch.ones_like(decay[1, :, 0], dtype=torch.float64)
+    for token in range(retained):
+        token_decay = decay[1, :, token].double()
+        product *= token_decay[:, None, :]
+        product += u[1, :, token, :, None].double() * w[1, :, token, None, :].double()
+        total_decay *= token_decay
+    state[1].copy_((-product / total_decay[:, None, :]).float())
     state[1].add_(torch.randn_like(state[1]) * 1e-4)
-    current = state[1].double() * decay[1].double()[:, None, :] + product
+    current = state[1].double()
+    for token in range(retained):
+        current *= decay[1, :, token, None, :].double()
+        current += u[1, :, token, :, None].double() * w[1, :, token, None, :].double()
     lengths = torch.tensor([0, retained, 0], device="cuda", dtype=torch.int32)
     read = torch.tensor([1], device="cuda", dtype=torch.int32)
     write = torch.tensor([2 if rotate else 1], device="cuda", dtype=torch.int32)
@@ -1611,3 +1615,113 @@ def test_verify_convolution_captures_original_rows(
                 atol=0,
                 rtol=0,
             )
+
+
+@pytest.mark.parametrize("batch", [4, 16])
+@pytest.mark.parametrize("partition", [(1,), (3,), (3, 3, 2)])
+def test_retained_scalar_state_matches_dense_recovery(
+    batch: int, partition: tuple[int, ...]
+) -> None:
+    """Retain identical accepted records without changing FP32 recovery order."""
+    from tokenspeed_kernel.ops.attention.kda import (
+        KdaReplayHistory,
+        KdaReplayRecords,
+        kda_materialize_history,
+    )
+    from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+        commit_recoverssm_history,
+    )
+
+    torch.manual_seed(59000)
+    width, heads, dim = 8, 12, 128
+    pages = batch + 1
+    q = torch.randn(1, batch * width, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k, v, gate = (torch.randn_like(q) for _ in range(3))
+    beta = torch.randn(1, batch * width, heads, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(heads, device="cuda") * 0.1
+    bias = torch.randn(heads, dim, device="cuda") * 0.1
+    base = torch.randn(pages, heads, dim, dim, device="cuda") * 0.02
+    reads = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    query_start = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * width
+    u = torch.empty(batch, heads, width, dim, device="cuda")
+    raw = torch.empty(batch, heads, width, 2 * dim, device="cuda", dtype=torch.bfloat16)
+    vllm_triton_kda_recoverssm_verify(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        a,
+        bias,
+        checkpoint_state=base,
+        correction_cache=u,
+        kg_cache=raw,
+        query_start_loc=query_start,
+        state_indices=reads,
+        spec_query_len=width,
+        lower_bound=-5.0,
+        out=torch.empty_like(q),
+        record_metadata=None,
+        record_stamps=None,
+    )
+    dense = base.clone()
+    accepted = torch.full((batch,), sum(partition), device="cuda", dtype=torch.int32)
+    plan = [torch.empty_like(reads) for _ in range(4)]
+    vllm_triton_kda_recoverssm_commit(
+        q,
+        k,
+        v,
+        checkpoint_state=dense,
+        correction_cache=u,
+        kg_cache=raw,
+        state_indices=reads,
+        query_start_loc=query_start,
+        num_accepted_tokens=accepted,
+        commit_lens=plan[0],
+        final_state_indices=plan[1],
+        boundary_state_indices=plan[2],
+        boundary_recovery_lens=plan[3],
+        state_base_addrs=_device_addresses((dense,)),
+        correction_cache_base_addrs=_device_addresses((u,)),
+        kg_cache_base_addrs=_device_addresses((raw,)),
+        spec_query_len=width,
+        record_metadata=None,
+        record_stamps=None,
+        gate_parameters=(a, bias, -5.0),
+    )
+    factors = [torch.empty(pages, heads, width, dim, device="cuda") for _ in range(3)]
+    lengths = torch.zeros(pages, device="cuda", dtype=torch.int32)
+    offsets = torch.zeros_like(reads)
+    history = KdaReplayHistory(*factors, lengths, reads, offsets, False)
+    metadata = torch.zeros(batch, 3, device="cuda", dtype=torch.int64)
+    metadata[:, 0] = torch.arange(batch, device="cuda")
+    metadata[:, 1] = 1
+    stamps = torch.ones(batch, width, 2, device="cuda", dtype=torch.int64)
+    stamps[:, :, 0] = torch.arange(width, device="cuda")
+    records = KdaReplayRecords(
+        correction=u,
+        key_gate=raw,
+        metadata=metadata,
+        stamps=stamps,
+        query_start_loc=query_start,
+        history=history,
+    )
+    position = 0
+    for count in partition:
+        metadata[:, 2] = position
+        offsets.fill_(position)
+        accepted.fill_(count)
+        commit_recoverssm_history(
+            records, accepted, A_log=a, dt_bias=bias, lower_bound=-5.0
+        )
+        position += count
+    recovered = torch.empty_like(dense[1:])
+    kda_materialize_history(
+        base,
+        *factors,
+        lengths,
+        reads,
+        out=recovered,
+        use_tensor_cores=False,
+    )
+    torch.testing.assert_close(recovered, dense[1:], atol=0, rtol=0)

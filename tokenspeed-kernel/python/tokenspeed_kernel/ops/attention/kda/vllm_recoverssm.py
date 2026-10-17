@@ -136,8 +136,8 @@ def vllm_triton_kda_recoverssm_verify(
         record_metadata=record_metadata,
         record_stamps=record_stamps,
         history_correction=None if history is None else history.correction,
-        history_key=None if history is None else history.weighted_key,
-        history_decay=None if history is None else history.total_decay,
+        history_key=None if history is None else history.key,
+        history_decay=None if history is None else history.decay,
         history_lengths=None if history is None else history.lengths,
         history_write_indices=None if history is None else history.write_indices,
         history_append_offsets=None if history is None else history.append_offsets,
@@ -606,6 +606,7 @@ def _append_batched_recoverssm_history(
         head_dim,
         1,
         history.decay_page_stride,
+        history.capacity * head_dim,
         head_dim,
         1,
         history.length_page_stride,
@@ -616,9 +617,8 @@ def _append_batched_recoverssm_history(
         K=head_dim,
         V=head_dim,
         BT=triton.next_power_of_2(capacity),
-        BH=triton.next_power_of_2(history.capacity),
         BD=triton.next_power_of_2(head_dim),
-        num_warps=1 if history.capacity <= 16 else 2,
+        num_warps=1,
         debug=True,
         sanitize_overflow=False,
     )
@@ -632,14 +632,14 @@ def commit_recoverssm_history(
     dt_bias: torch.Tensor,
     lower_bound: float | None,
 ) -> None:
-    """Absorb accepted raw records into the weighted composite after sampling.
+    """Append accepted records to the recurrent history after sampling.
 
     records.history owns the persistent page-indexed buffers. Verify must
     have populated append_offsets on the caller stream. accepted_length
     contains the stop-clipped count including the target input, with zero
     for padding. A_log, dt_bias and lower_bound must match verify's gate.
-    Normalize accepted keys in FP32, apply their later accepted decays, and
-    rescale the older factors once. The caller commits convolution state at
+    Store normalized keys and each token's decay in FP32, preserving older
+    accepted factors. The caller commits convolution state at
     the same endpoint. All buffers must exist before graph capture.
     """
     from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
@@ -660,8 +660,8 @@ def commit_recoverssm_history(
         records.metadata,
         records.stamps,
         history.correction,
-        history.weighted_key,
-        history.total_decay,
+        history.key,
+        history.decay,
         history.lengths,
         history.write_indices,
         history.append_offsets,
@@ -678,8 +678,8 @@ def commit_recoverssm_history(
         *records.correction.stride(),
         *records.key_gate.stride(),
         *history.correction.stride(),
-        *history.weighted_key.stride(),
-        *history.total_decay.stride(),
+        *history.key.stride(),
+        *history.decay.stride(),
         history.lengths.stride(0),
         lower_bound,
         lower_bound is not None,
@@ -688,9 +688,8 @@ def commit_recoverssm_history(
         K=key_dim,
         V=value_dim,
         BT=triton.next_power_of_2(capacity),
-        BH=triton.next_power_of_2(history.correction.shape[2]),
         BD=triton.next_power_of_2(max(key_dim, value_dim)),
-        num_warps=1 if history.correction.shape[2] <= 16 else 2,
+        num_warps=1,
         debug=True,
         sanitize_overflow=False,
     )
