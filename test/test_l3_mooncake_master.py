@@ -361,8 +361,7 @@ class TestMooncakeMasterLiveTest:
             writer.submit(StorageJob(1, "put", (key,), (0,), (64,)))
             complete(writer)
         finally:
-            writer.shutdown(timeout_s=10)
-            writer.backend.close()
+            writer.close(timeout_s=10)
         reader = client()
         try:
             reader.submit(StorageJob(1, "get", (key,), (128,), (64,)))
@@ -370,8 +369,7 @@ class TestMooncakeMasterLiveTest:
             assert bytes(reader.host_storage.host_buffer[128:192]) == payload
             assert reader.backend.remove_by_prefix(key)
         finally:
-            reader.shutdown(timeout_s=10)
-            reader.backend.close()
+            reader.close(timeout_s=10)
 
     def test_l3_executor_round_trips_through_mooncake_master(self) -> None:
         from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
@@ -535,8 +533,7 @@ class TestMooncakeMasterLiveTest:
         finally:
             if not restarted:
                 restart()
-            executor.shutdown(timeout_s=10)
-            backend.close()
+            executor.close(timeout_s=10)
             if owner is not None:
                 owner.close()
 

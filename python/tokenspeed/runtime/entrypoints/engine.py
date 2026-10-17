@@ -395,12 +395,7 @@ class Engine(EngineBase):
             and self.server_args.kvstore_storage_backend is not None
         ):
             return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
-        weight_version = resolve_l3_weight_version(
-            self.server_args.weight_version,
-            weight_version,
-            flush_cache=flush_cache,
-            storage_backend=self.server_args.kvstore_storage_backend,
-        )
+        weight_version = resolve_l3_weight_version(weight_version)
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,
@@ -434,14 +429,11 @@ class Engine(EngineBase):
         on an intermediate (unflushed) one (``mooncake_load_weight_version``).
         """
         weight_version = resolve_l3_weight_version(
-            self.server_args.weight_version,
             mooncake_load_weight_version(
                 version=version,
                 flush_cache=flush_cache,
                 weight_version=weight_version,
             ),
-            flush_cache=flush_cache,
-            storage_backend=self.server_args.kvstore_storage_backend,
         )
         obj = UpdateWeightsFromMooncakeReqInput(
             version=version,

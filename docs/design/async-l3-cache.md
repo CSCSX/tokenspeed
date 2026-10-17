@@ -71,6 +71,9 @@ round sequencing, and the shared Host resource owns its allocation.
 Device-copy and L3 teardown are attempted independently. A failed Device
 shutdown must still retire L3 workers before its backend can be closed;
 unproven native retirement retains the registered Host allocation.
+The executor exposes one `close()` operation: it first stops its workers and
+proves native retirement, then closes the backend. Worker shutdown is an
+internal step, not a second resource-management interface.
 
 `StorageConfig` is the read-only scheduling contract: credits, prefetch limits,
 deadlines and pressure watermarks. `StorageRuntimeConfig` contains that contract

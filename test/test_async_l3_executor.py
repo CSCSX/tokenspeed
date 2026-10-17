@@ -79,7 +79,7 @@ def wait_results(e, count):
     return result
 
 
-def test_monitor_epoch_half_open_and_cancelled_probe():
+def test_monitor_stale_completions_cannot_reopen_a_failed_recovery():
     now = [1.0]
     monitor = _BackendHealth(
         failure_threshold=1, recovery_interval_s=10, clock=lambda: now[0]
@@ -93,9 +93,15 @@ def test_monitor_epoch_half_open_and_cancelled_probe():
     probe = monitor.begin_operation()
     assert probe.recovery
     assert monitor.begin_operation() is None
-    monitor.cancel_check(probe)
-    probe = monitor.begin_operation()
-    monitor.report_success(probe)
+    monitor.report_failure(probe)
+    monitor.report_success(probe)  # This completion belongs to the failed epoch.
+    assert monitor.begin_operation() is None
+    assert monitor.snapshot().state == "open"
+    now[0] = 23.0
+    recovered = monitor.begin_operation()
+    assert recovered.recovery
+    assert monitor.begin_operation() is None
+    monitor.report_success(recovered)
     assert not monitor.begin_operation().recovery
 
 
@@ -118,7 +124,7 @@ def test_slow_query_does_not_block_later_worker_or_submit_thread():
         assert result.op_id == 2 and result.success == (True,)
     finally:
         release.set()
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_cancel_queued_get_prevents_native_access():
@@ -150,7 +156,7 @@ def test_cancel_queued_get_prevents_native_access():
         assert wait_results(e, 1)[0].op_id == 1
     finally:
         release.set()
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_query_exception_degrades_without_killing_worker():
@@ -166,7 +172,7 @@ def test_query_exception_degrades_without_killing_worker():
         e.submit(StorageJob(2, "query", ("b",), (), ()))
         assert wait_results(e, 1)[0].op_id == 2
     finally:
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 @pytest.mark.parametrize("success", [False, True])
@@ -184,7 +190,7 @@ def test_unproven_native_failure_disables_io_and_refuses_buffer_shutdown(success
     result = wait_results(e, 1)[0]
     assert result.retired and result.success == (False,)  # no new I/O submitted
     with pytest.raises(RuntimeError, match="retirement is unproven"):
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
     backend_ref = weakref.ref(e.backend)
     host_ref = weakref.ref(e.host_storage)
     executor_ref = weakref.ref(e)
@@ -207,8 +213,8 @@ def test_global_store_roundtrip_between_independent_host_executors():
         assert reader.host_storage.host_buffer[16:24] == b"abcdefgh"
         assert reader.host_storage.host_buffer[:8] == bytes(8)
     finally:
-        writer.shutdown(timeout_s=2)
-        reader.shutdown(timeout_s=2)
+        writer.close(timeout_s=2)
+        reader.close(timeout_s=2)
 
 
 def test_operation_credits_bound_queue_and_undelivered_results():
@@ -224,7 +230,7 @@ def test_operation_credits_bound_queue_and_undelivered_results():
             e.submit(StorageJob(2, "query", ("b",), (), ()))
         wait_results(e, 1)
     finally:
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_executor_applies_the_parsed_storage_key_limit():
@@ -272,7 +278,7 @@ def test_retired_get_miss_does_not_open_backend_circuit():
         assert result.object_failures == (True,)
         assert e.snapshot().health.state == "healthy"
     finally:
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_snapshot_accounts_for_cancelled_queue_and_late_completed_bytes():
@@ -315,7 +321,7 @@ def test_snapshot_accounts_for_cancelled_queue_and_late_completed_bytes():
         assert not any(dict(e.snapshot().operations[1].operations).values())
     finally:
         release.set()
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_snapshot_cannot_consume_recovery_probe_and_rejections_are_visible():
@@ -342,7 +348,7 @@ def test_snapshot_cannot_consume_recovery_probe_and_rejections_are_visible():
         assert dict(row.events)["backend_calls"] == 0
         assert row.success_bytes == row.backend_seconds == 0
     finally:
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_pressure_snapshot_tracks_queue_and_cancelled_native_work_until_retirement():
@@ -404,7 +410,7 @@ def test_pressure_snapshot_tracks_queue_and_cancelled_native_work_until_retireme
         assert e.is_idle()
     finally:
         release.set()
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_query_pressure_counts_metadata_jobs_without_fake_payload_bytes():
@@ -444,7 +450,7 @@ def test_query_pressure_counts_metadata_jobs_without_fake_payload_bytes():
         assert e.poll().oldest_operation_us == 0
     finally:
         release.set()
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 @pytest.mark.parametrize(
@@ -493,7 +499,7 @@ def test_malformed_retirement_cannot_publish_or_release_native_buffers(retired):
     assert result.success == (False,)
     assert e.snapshot().unsafe_io
     with pytest.raises(RuntimeError, match="retirement is unproven"):
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 @pytest.mark.parametrize("failure", ["health", "queue", "exception"])
@@ -522,7 +528,7 @@ def test_get_rejection_or_transport_error_has_no_object_failure(failure):
         assert result.object_failures == (False,)
         assert backend.batch_exists(("present",)) == [True]
     finally:
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 @pytest.mark.parametrize("object_failures", [(), (1,), (True,)])
@@ -539,7 +545,7 @@ def test_malformed_object_failure_facts_cannot_publish(object_failures):
         assert result.object_failures == (False,)
         assert e.snapshot().health.state == "open"
     finally:
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_close_waits_for_native_retirement_and_preserves_host_owner():
@@ -578,7 +584,7 @@ def test_close_waits_for_native_retirement_and_preserves_host_owner():
             close.assert_called_once_with()
     finally:
         release.set()
-        e.shutdown(timeout_s=2)
+        e.close(timeout_s=2)
 
 
 def test_close_timeout_preserves_backend_and_host_after_worker_exit():

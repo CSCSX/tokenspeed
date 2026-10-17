@@ -524,12 +524,7 @@ class RequestHandler:
         storage_backend = self.server_args.kvstore_storage_backend
         if storage_backend is None or recv_req.flush_cache:
             return True, ""
-        version = resolve_l3_weight_version(
-            self.server_args.weight_version,
-            _requested_weight_version(recv_req),
-            flush_cache=False,
-            storage_backend=storage_backend,
-        )
+        version = resolve_l3_weight_version(_requested_weight_version(recv_req))
         if version is None or str(version) == str(self.server_args.weight_version):
             return True, ""
         return (
@@ -754,12 +749,7 @@ class RequestHandler:
         ok, err = self._require_flush_for_l3_version_switch(recv_req)
         if not ok:
             return False, err
-        version = resolve_l3_weight_version(
-            self.server_args.weight_version,
-            _requested_weight_version(recv_req),
-            flush_cache=recv_req.flush_cache,
-            storage_backend=self.server_args.kvstore_storage_backend,
-        )
+        version = resolve_l3_weight_version(_requested_weight_version(recv_req))
         if version is None:
             return True, msg
         self.server_args.weight_version = str(version)

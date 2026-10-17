@@ -228,12 +228,7 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
                 "success": False,
                 "message": L3_FLUSH_REQUIRES_WEIGHT_VERSION,
             }
-        weight_version = resolve_l3_weight_version(
-            llm.server_args.weight_version,
-            requested_version,
-            flush_cache=flush_cache,
-            storage_backend=storage_backend,
-        )
+        weight_version = resolve_l3_weight_version(requested_version)
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,  # translate dtypes -> dtype_names
@@ -275,7 +270,6 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
         llm = _llm(request)
         requested_version = body.get("weight_version")
         weight_version = resolve_l3_weight_version(
-            llm.server_args.weight_version,
             mooncake_load_weight_version(
                 version=version,
                 flush_cache=flush_cache,
@@ -283,8 +277,6 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
                     None if requested_version is None else str(requested_version)
                 ),
             ),
-            flush_cache=flush_cache,
-            storage_backend=llm.server_args.kvstore_storage_backend,
         )
         obj = UpdateWeightsFromMooncakeReqInput(
             version=version,

@@ -118,11 +118,6 @@ class _BackendHealth:
                 self._unavailable_until = None
                 self._probe_inflight = False
 
-    def cancel_check(self, token: _HealthToken) -> None:
-        with self._lock:
-            if token.epoch == self._epoch and token.recovery:
-                self._probe_inflight = False
-
 
 @dataclass(frozen=True, slots=True)
 class StorageJob:
@@ -310,7 +305,7 @@ class L3Executor:
         """
         if self._closed:
             return
-        self.shutdown(timeout_s=timeout_s)
+        self._shutdown_workers(timeout_s=timeout_s)
         self.backend.close()
         self._closed = True
 
@@ -626,7 +621,7 @@ class L3Executor:
                 tuple(rows), self._health.snapshot(), self._unsafe_io
             )
 
-    def shutdown(self, *, timeout_s: float) -> None:
+    def _shutdown_workers(self, *, timeout_s: float) -> None:
         self._stopping.set()
         deadline = time.monotonic() + timeout_s
         for thread in self._threads:

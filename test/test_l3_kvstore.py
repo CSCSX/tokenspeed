@@ -33,7 +33,6 @@ from unittest import mock
 import pytest
 
 from tokenspeed.runtime.cache.l3.backend import (
-    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     L3_RUNTIME_COMPAT,
     MemoryKvStore,
     _ext_def_file_from_yaml_text,
@@ -1434,40 +1433,10 @@ class TestStorageKeyTest:
                 )
             )
 
-    def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=True,
-                storage_backend="memory",
-            )
-        ) is None
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=True,
-                storage_backend=None,
-            )
-        ) is None
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=False,
-                storage_backend="memory",
-            )
-        ) is None
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                "explicit",
-                flush_cache=True,
-                storage_backend="memory",
-            )
-        ) == ("explicit")
-        assert ("require weight_version") in (L3_FLUSH_REQUIRES_WEIGHT_VERSION)
+    def test_resolve_l3_weight_version_preserves_requested_identity(self):
+        assert resolve_l3_weight_version(None) is None
+        assert resolve_l3_weight_version("explicit") == "explicit"
+        assert resolve_l3_weight_version(12) == "12"
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(

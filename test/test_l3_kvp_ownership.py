@@ -105,7 +105,7 @@ def test_page_keys_follow_replica_while_state_keys_follow_rank():
         assert a._object_key("h", 1, 0) != b._object_key("h", 1, 0)
     finally:
         for client in (a, b, other):
-            client.shutdown(timeout_s=2)
+            client._shutdown_workers(timeout_s=2)
         backend.close()
 
 
@@ -134,7 +134,7 @@ def test_source_owner_one_restores_on_destination_owner_zero():
                 assert fact.object_failures == (False,)
             finally:
                 # These clients deliberately share one in-memory backend.
-                executor.shutdown(timeout_s=2)
+                executor._shutdown_workers(timeout_s=2)
     assert len(backend.writes) == 1
     assert len(backend.reads) == 1
     assert target[0].host_buffer[8:12] == b"KV01"

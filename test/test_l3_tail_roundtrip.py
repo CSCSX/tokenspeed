@@ -241,11 +241,12 @@ def test_cold_tail_restores_actual_put_bytes(
                 offset, _ = writer_host.host_block_range(key[0], block)
                 write_host_bytes(writer_host.host_buffer, offset, payload)
             assert all(_complete(writer, writer_io, operation).success)
-        writer_io.shutdown(timeout_s=5)
         if backend_kind == "mooncake":
             # The independent owner retains native objects after client close.
-            # MemoryKvStore itself is the shared owner in the CPU variant.
             writer_io.close(timeout_s=5)
+        else:
+            # MemoryKvStore itself is the shared owner in the CPU variant.
+            writer_io._shutdown_workers(timeout_s=5)
         writer_host.host_buffer.zero_()
 
         reader, reader_host = _scheduler(kinds), _Host()

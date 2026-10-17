@@ -70,22 +70,14 @@ _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
 
 
-def resolve_l3_weight_version(
-    current: str,
-    requested: str | None,
-    *,
-    flush_cache: bool,
-    storage_backend: str | None,
-) -> str | None:
-    """Choose the namespace to publish after a successful weight load.
+def resolve_l3_weight_version(requested: str | None) -> str | None:
+    """Normalize an explicit namespace without inventing a successor.
 
     An explicit ``requested`` version always wins. ``None`` keeps the
-    current namespace. Flushed L3 updates must pass a caller-supplied
-    identity; minting ``{current}-uN`` would let independent checkpoints
-    collide under the same successor.
+    current namespace. The request handler separately validates whether
+    the update may preserve or change that namespace.
     """
 
-    del current, flush_cache, storage_backend
     if requested is not None:
         return str(requested)
     return None
