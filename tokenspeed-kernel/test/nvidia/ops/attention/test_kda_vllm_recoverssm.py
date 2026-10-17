@@ -1000,3 +1000,126 @@ def test_recoverssm_parallel_recovery_extreme_decays(
         gate_parameters=(a, bias, lower_bound),
     )
     torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("width", [16, 32])
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+@pytest.mark.parametrize("captured", [False, True])
+def test_recoverssm_aligned_checkpoint_states(
+    width: int, use_tensor_cores: bool, captured: bool
+) -> None:
+    """Aligned recovery preserves boundary, final, and masked states."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
+        _commit_kda_state_kernel,
+    )
+
+    torch.manual_seed(2423)
+    batch, heads, dim = 5, 2, 128
+    initial = torch.randn(1 + 3 * batch, heads, dim, dim, device="cuda") * 0.02
+    state, expected = initial.clone(), initial.clone()
+    corrections = torch.randn(batch, heads, width, dim, device="cuda") * 0.2
+    key_gate = torch.randn(
+        batch, heads, width, 2 * dim, device="cuda", dtype=torch.bfloat16
+    )
+    a_log = torch.randn(heads, device="cuda") * 0.1
+    bias = torch.randn(heads, dim, device="cuda") * 0.1
+    sources = [1, 2, 3, 4, 0]
+    destinations = [6, 7, 3, 0, 10]
+    boundaries = [11, 12, -1, 14, 15]
+    counts = [width, width // 2, width, 0, width]
+    boundary_lengths = [width // 2, width // 4, width // 2, 0, width // 2]
+    for row, count in enumerate(counts):
+        if sources[row] <= 0 or destinations[row] <= 0:
+            corrections[row].fill_(float("nan"))
+            key_gate[row].fill_(float("nan"))
+            continue
+        current = initial[sources[row]].clone()
+        for token in range(count):
+            key = key_gate[row, :, token, :dim].float()
+            key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+            raw_gate = key_gate[row, :, token, dim:].float()
+            decay = (
+                -5.0 * torch.sigmoid(a_log.exp()[:, None] * (raw_gate + bias))
+            ).exp()
+            current = current * decay[:, None, :] + (
+                corrections[row, :, token, :, None] * key[:, None, :]
+            )
+            if token + 1 == boundary_lengths[row] and boundaries[row] > 0:
+                expected[boundaries[row]].copy_(current)
+        expected[destinations[row]].copy_(current)
+        corrections[row, :, count:].fill_(float("nan"))
+        key_gate[row, :, count:].fill_(float("nan"))
+    indices, final_indices, boundary_indices, commit_lengths, boundary_steps = (
+        torch.tensor(values, device="cuda", dtype=torch.int32)
+        for values in (sources, destinations, boundaries, counts, boundary_lengths)
+    )
+    state_addresses = _device_addresses((state,))
+    correction_addresses = _device_addresses((corrections,))
+    key_gate_addresses = _device_addresses((key_gate,))
+    a_addresses = _device_addresses((a_log,))
+    bias_addresses = _device_addresses((bias,))
+    grid = lambda meta: (triton.cdiv(dim, meta["BV"]), batch, heads)
+
+    def commit():
+        state.copy_(initial)
+        _commit_kda_state_kernel[grid](
+            state_ref_ptr=state,
+            state_base_addrs_ptr=state_addresses,
+            state_block_stride=state.stride(0),
+            correction_cache_ref_ptr=corrections,
+            correction_cache_base_addrs_ptr=correction_addresses,
+            correction_cache_block_stride=corrections.stride(0),
+            kg_cache_ref_ptr=key_gate,
+            kg_cache_base_addrs_ptr=key_gate_addresses,
+            kg_cache_block_stride=key_gate.stride(0),
+            state_indices_ptr=indices,
+            commit_lens_ptr=commit_lengths,
+            final_state_indices_ptr=final_indices,
+            boundary_state_indices_ptr=boundary_indices,
+            boundary_recovery_lens_ptr=boundary_steps,
+            null_block_id=0,
+            stride_state_head=state.stride(1),
+            stride_state_v=state.stride(2),
+            stride_state_k=state.stride(3),
+            stride_correction_cache_head=corrections.stride(1),
+            stride_correction_cache_pos=corrections.stride(2),
+            stride_correction_cache_dim=corrections.stride(3),
+            stride_kg_cache_head=key_gate.stride(1),
+            stride_kg_cache_pos=key_gate.stride(2),
+            stride_kg_cache_dim=key_gate.stride(3),
+            stride_state_indices=indices.stride(0),
+            group_indices_ptr=None,
+            stride_state_group=0,
+            stride_pointer_layer=1,
+            record_metadata_ptr=None,
+            record_stamps_ptr=None,
+            stamp_layer_stride=0,
+            RECORD_CAPACITY=width,
+            RECORD_SLOTS=batch,
+            K=dim,
+            V=dim,
+            BK=dim,
+            BT=width,
+            USE_TENSOR_CORES=use_tensor_cores,
+            NUM_HEADS=heads,
+            ALIGN_MODE=True,
+            BATCH=batch,
+            LAUNCH_DEPENDENT_KERNELS=False,
+            a_base_addrs_ptr=a_addresses,
+            bias_base_addrs_ptr=bias_addresses,
+            lower_bound=-5.0,
+            USE_LOWER_BOUND=True,
+            debug=True,
+            sanitize_overflow=False,
+            num_stages=2,
+        )
+
+    commit()
+    if captured:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            commit()
+        graph.replay()
+    torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)

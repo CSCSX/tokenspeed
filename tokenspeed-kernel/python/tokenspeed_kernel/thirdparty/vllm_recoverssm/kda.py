@@ -388,7 +388,7 @@ def _prepare_commit_plan_kernel(
 
 
 def _commit_kda_value_block(args: dict[str, Any]) -> int:
-    if args["USE_TENSOR_CORES"]:
+    if args["USE_TENSOR_CORES"] and not args["ALIGN_MODE"]:
         return 64 if args["BT"] <= 8 else 128
     batch = args["BATCH"]
     if not args["ALIGN_MODE"]:
@@ -399,7 +399,7 @@ def _commit_kda_value_block(args: dict[str, Any]) -> int:
 
 
 def _commit_kda_num_warps(args: dict[str, Any]) -> int:
-    if args["USE_TENSOR_CORES"]:
+    if args["USE_TENSOR_CORES"] and not args["ALIGN_MODE"]:
         return 2 if args["BT"] <= 8 else 4
     if not args["ALIGN_MODE"]:
         return 1
@@ -574,66 +574,54 @@ def _commit_kda_state_kernel(
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k
         )
-    if USE_TENSOR_CORES:
+    # Aligned checkpoints use recurrence to write boundary and final states
+    # in one pass. Tensor Cores only recover the final state.
+    if USE_TENSOR_CORES and not ALIGN_MODE:
         # Recover S_n = S_0 * product(d_j) + U @ K_weighted. Each key row
         # includes only the decays after its update. The reverse product scan
         # avoids dividing by prefix products, which can underflow for long windows.
         # Zero padding supplies the Tensor Core reduction tile for short windows.
         tokens = tl.arange(0, BT)
-        for phase in tl.static_range(2 if ALIGN_MODE else 1):
-            length = commit_len
-            if ALIGN_MODE and phase == 0:
-                length = tl.minimum(boundary_recovery_len, commit_len)
-            live = tokens < length
-            slots = (record_start + tokens) % RECORD_CAPACITY
-            key_ptrs = (
-                kg_cache_ptr
-                + slots[:, None] * stride_kg_cache_pos
-                + offs_k[None, :] * stride_kg_cache_dim
-            )
-            keys = tl.load(
-                key_ptrs, mask=live[:, None] & mask_k[None, :], other=0.0
-            ).to(tl.float32)
-            keys *= tl.rsqrt(tl.sum(keys * keys, axis=1) + 1e-06)[:, None]
-            raw_g = tl.load(
-                key_ptrs + K * stride_kg_cache_dim,
-                mask=live[:, None] & mask_k[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            gates = _kda_gate(raw_g, dt_bias[None, :], A, lower_bound, USE_LOWER_BOUND)
-            decay = tl.where(live[:, None], tl.exp(gates), 1.0)
-            next_row = tl.broadcast_to(
-                tl.minimum(tokens + 1, BT - 1)[:, None], (BT, BK)
-            )
-            decay_after = tl.gather(decay, next_row, axis=0)
-            decay_after = tl.where((tokens + 1 < length)[:, None], decay_after, 1.0)
-            suffix = tl.associative_scan(
-                decay_after, axis=0, combine_fn=_recoverssm_decay_product, reverse=True
-            )
-            weighted_keys = keys * suffix
-            total_decay = tl.sum(
-                tl.where(tokens[:, None] == 0, suffix * decay, 0.0), axis=0
-            )
-            corrections = tl.load(
-                correction_cache_ptr
-                + slots[None, :] * stride_correction_cache_pos
-                + offs_v[:, None] * stride_correction_cache_dim,
-                mask=mask_v[:, None] & live[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            # U and weighted K stay FP32. TF32x3 uses Tensor Cores with FP32
-            # accumulation; the checkpoint is scaled and added after the product.
-            update = tl.dot(corrections, weighted_keys, input_precision="tf32x3")
-            if not ALIGN_MODE:
-                initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(
-                    tl.float32
-                )
-            state = tl.fma(initial_state, total_decay[None, :], update)
-            if ALIGN_MODE and phase == 0:
-                boundary_valid = (boundary_state_idx > null_block_id) & (
-                    (boundary_recovery_len > 0) & (boundary_recovery_len <= commit_len)
-                )
-                tl.store(boundary_ptrs, state, mask=mask_state & boundary_valid)
+        live = tokens < commit_len
+        slots = (record_start + tokens) % RECORD_CAPACITY
+        key_ptrs = (
+            kg_cache_ptr
+            + slots[:, None] * stride_kg_cache_pos
+            + offs_k[None, :] * stride_kg_cache_dim
+        )
+        keys = tl.load(key_ptrs, mask=live[:, None] & mask_k[None, :], other=0.0).to(
+            tl.float32
+        )
+        keys *= tl.rsqrt(tl.sum(keys * keys, axis=1) + 1e-06)[:, None]
+        raw_g = tl.load(
+            key_ptrs + K * stride_kg_cache_dim,
+            mask=live[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        gates = _kda_gate(raw_g, dt_bias[None, :], A, lower_bound, USE_LOWER_BOUND)
+        decay = tl.where(live[:, None], tl.exp(gates), 1.0)
+        next_row = tl.broadcast_to(tl.minimum(tokens + 1, BT - 1)[:, None], (BT, BK))
+        decay_after = tl.gather(decay, next_row, axis=0)
+        decay_after = tl.where((tokens + 1 < commit_len)[:, None], decay_after, 1.0)
+        suffix = tl.associative_scan(
+            decay_after, axis=0, combine_fn=_recoverssm_decay_product, reverse=True
+        )
+        weighted_keys = keys * suffix
+        total_decay = tl.sum(
+            tl.where(tokens[:, None] == 0, suffix * decay, 0.0), axis=0
+        )
+        corrections = tl.load(
+            correction_cache_ptr
+            + slots[None, :] * stride_correction_cache_pos
+            + offs_v[:, None] * stride_correction_cache_dim,
+            mask=mask_v[:, None] & live[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        # U and weighted K stay FP32. TF32x3 uses Tensor Cores with FP32
+        # accumulation; the checkpoint is scaled and added after the product.
+        update = tl.dot(corrections, weighted_keys, input_precision="tf32x3")
+        initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+        state = tl.fma(initial_state, total_decay[None, :], update)
     else:
         state = initial_state
         for token_offset in range(commit_len):

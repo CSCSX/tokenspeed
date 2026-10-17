@@ -441,8 +441,9 @@ def try_kda_fused_paged_verify(
     scratches for partial-accept commit. ``store_states`` selects the
     rollback-tape variant and ``recurrent_layout`` defaults to the
     platform's state layout; which producer arrangement runs is the
-    registry's choice. ``replay_records`` holds FP32 corrections, FP32
-    normalized keys/decays, and query boundaries for same-round recovery.
+    registry's choice. ``replay_records`` holds FP32 corrections,
+    activation-dtype unnormalized keys and raw gates, and query boundaries
+    for same-round recovery. Commit recomputes key normalization and gate decay.
     Returns ``None`` only when no implementation
     supports the current platform.
     """

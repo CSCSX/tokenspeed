@@ -1,8 +1,19 @@
 """Eager KDA replay commit versus the existing per-position scratch path."""
 
+import os
+import sys
+
 import numpy as np
 import pytest
 import torch
+
+# CI registration and absolute test imports use the same paths as the suite.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
