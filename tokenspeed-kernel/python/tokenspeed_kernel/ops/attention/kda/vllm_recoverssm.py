@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.attention.kda import (
         KdaReplayHistory,
         KdaReplayHistoryBatch,
+        KdaReplayKeyGateFormat,
         KdaReplayRecords,
     )
 
@@ -334,6 +335,7 @@ def batched_recoverssm_commit(
     conv_stride: int,
     correction_stride: int,
     key_gate_stride: int,
+    key_gate_format: KdaReplayKeyGateFormat,
     state_stride: int,
     conv_width: int,
     record_metadata: torch.Tensor | None,
@@ -358,7 +360,8 @@ def batched_recoverssm_commit(
 
     State pages use contiguous [head, value, key] FP32 values; conv pages
     use contiguous [channel, conv_width - 1] BF16 values. U is FP32 and
-    K/raw_g is BF16. lower_bound selects the gate transform. Source and
+    key_gate_format selects BF16 raw K/gate or FP32 normalized K/decay.
+    lower_bound selects the raw-gate transform. Source and
     destination pages may alias within a request, but
     requests must not share writable pages.
 
@@ -383,6 +386,12 @@ def batched_recoverssm_commit(
         batched_kda_commit_conv_window_kernel,
     )
 
+    if key_gate_format not in ("raw_key_gate", "normalized_key_decay"):
+        raise ValueError(f"unknown KDA key/gate format: {key_gate_format}")
+    if key_gate_format == "normalized_key_decay" and (
+        history is None or draft_token_num > history.capacity
+    ):
+        raise ValueError("normalized records require retained-history commit")
     if head_dim != 128 or conv_width != 4:
         raise ValueError("batched KDA commit requires head_dim=128 and conv_width=4")
     layers = descriptors.shape[0]
@@ -450,6 +459,7 @@ def batched_recoverssm_commit(
             head_dim=head_dim,
             correction_stride=correction_stride,
             key_gate_stride=key_gate_stride,
+            key_gate_format=key_gate_format,
             lower_bound=lower_bound,
         )
     else:
@@ -559,6 +569,7 @@ def _append_batched_recoverssm_history(
     head_dim: int,
     correction_stride: int,
     key_gate_stride: int,
+    key_gate_format: KdaReplayKeyGateFormat,
     lower_bound: float | None,
 ) -> None:
     from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
@@ -589,6 +600,7 @@ def _append_batched_recoverssm_history(
         record_stamps.stride(0),
         history.append_offsets.stride(0),
         num_heads,
+        key_gate_format == "normalized_key_decay",
         capacity * correction_stride,
         head_dim,
         correction_stride,
@@ -675,6 +687,7 @@ def commit_recoverssm_history(
         0,
         0,
         heads,
+        records.key_gate_format == "normalized_key_decay",
         *records.correction.stride(),
         *records.key_gate.stride(),
         *history.correction.stride(),

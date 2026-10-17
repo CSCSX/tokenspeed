@@ -587,6 +587,7 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
             conv_stride=conv.stride(1),
             correction_stride=corrections.stride(1),
             key_gate_stride=kd.stride(1),
+            key_gate_format="raw_key_gate",
             state_stride=states.stride(1),
             conv_width=4,
             record_metadata=metadata,
@@ -1050,6 +1051,7 @@ def _check_gate_recovery(
         conv_stride=conv.stride(1),
         correction_stride=u.stride(1),
         key_gate_stride=kg.stride(1),
+        key_gate_format="raw_key_gate",
         state_stride=state.stride(1),
         conv_width=4,
         record_metadata=None,
@@ -1321,6 +1323,7 @@ def test_buffered_recoverssm_multiple_rounds(
         (torch.arange(batch, device="cuda"), positions * 0, positions), dim=1
     )
     records = KdaReplayRecords(
+        key_gate_format="raw_key_gate",
         correction=torch.empty(batch, heads, width, dim, device="cuda"),
         key_gate=torch.empty(
             batch, heads, width, 2 * dim, device="cuda", dtype=torch.bfloat16
@@ -1699,6 +1702,7 @@ def test_retained_scalar_state_matches_dense_recovery(
     stamps = torch.ones(batch, width, 2, device="cuda", dtype=torch.int64)
     stamps[:, :, 0] = torch.arange(width, device="cuda")
     records = KdaReplayRecords(
+        key_gate_format="raw_key_gate",
         correction=u,
         key_gate=raw,
         metadata=metadata,

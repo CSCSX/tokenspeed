@@ -2181,9 +2181,9 @@ def batched_kda_commit_conv_window_kernel(
         )
         s0, s1, s2 = s1, s2, x
     dst = conv_pool + write_page * STRIDE_CONV + offsets * 3
-    tl.store(dst, s0, mask=mask & (write_page >= 0))
-    tl.store(dst + 1, s1, mask=mask & (write_page >= 0))
-    tl.store(dst + 2, s2, mask=mask & (write_page >= 0))
+    tl.store(dst, s0, mask=mask & (write_page > 0))
+    tl.store(dst + 1, s1, mask=mask & (write_page > 0))
+    tl.store(dst + 2, s2, mask=mask & (write_page > 0))
 
 
 @triton.jit

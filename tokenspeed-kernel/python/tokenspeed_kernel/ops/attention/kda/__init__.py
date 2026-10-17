@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
@@ -154,13 +155,17 @@ class KdaReplayHistoryBatch:
     length_page_stride: int
 
 
+KdaReplayKeyGateFormat = Literal["raw_key_gate", "normalized_key_decay"]
+
+
 @dataclass(frozen=True)
 class KdaReplayRecords:
     """Current-round recovery destinations and record metadata.
 
     correction and key_gate use slot/head/ring-position/channel order.
-    key_gate holds activation-dtype unnormalized K and raw gate.
-    Correction is always FP32.
+    key_gate_format explicitly selects activation-dtype unnormalized K/raw gate
+    or FP32 normalized K/decay. Correction is always FP32. The single-token
+    fused producer uses normalized factors to preserve its FP32 intermediates.
     metadata is INT64 [batch, 3]: physical slot, generation, absolute start.
     stamps is INT64 [slots, capacity, 2]: absolute position and generation.
     Position i maps to i % capacity. PR1 allocates one slot per batch row
@@ -172,6 +177,7 @@ class KdaReplayRecords:
     metadata: torch.Tensor
     stamps: torch.Tensor
     key_gate: torch.Tensor
+    key_gate_format: KdaReplayKeyGateFormat
     query_start_loc: torch.Tensor
     history: KdaReplayHistory | None = None
 
@@ -547,8 +553,9 @@ def try_kda_fused_paged_verify(
     rollback-tape variant and ``recurrent_layout`` defaults to the
     platform's state layout; which producer arrangement runs is the
     registry's choice. ``replay_records`` holds FP32 corrections,
-    activation-dtype unnormalized keys and raw gates, and query boundaries
-    for same-round recovery. Commit recomputes key normalization and gate decay.
+    explicit key/gate representation, and query boundaries for recovery. Split
+    producers save raw keys/gates; fused one-token history verify saves FP32
+    normalized keys/decays without rounding its intermediates to BF16.
     Returns ``None`` only when no implementation
     supports the current platform.
     """
@@ -592,7 +599,9 @@ def try_kda_fused_paged_verify(
         kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
         kwargs["replay_records"] = replay_records
     elif replay_records is not None:
-        raise ValueError("KDA replay records require split producers")
+        if store_states or replay_records.key_gate_format != "normalized_key_decay":
+            raise ValueError("inline record production requires normalized factors")
+        kwargs["replay_records"] = replay_records
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,

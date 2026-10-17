@@ -125,8 +125,36 @@ def _endpoint(pool: HybridKDATokenToKVPool, layer: int, page: int) -> torch.Tens
 
 
 def _reference(inputs, params, state, conv):
-    """Direct FP32 recurrence over independently convolved BF16 candidates."""
+    """Use fused FP32 T1 decode or the independent BF16 multi-token oracle."""
     width = inputs["mixed_qkv"].shape[0]
+    if width == 1:
+        from tokenspeed_kernel.ops.attention.kda import try_kda_fused_paged_decode
+
+        # Standard decode retains FP32 producer intermediates. A width-one
+        # split BF16 verify is a different numerical reference.
+        reference_state = state.unsqueeze(0).clone()
+        reference_conv = conv.unsqueeze(0).clone()
+        page = torch.zeros(1, device="cuda", dtype=torch.int32)
+        output = try_kda_fused_paged_decode(
+            inputs["mixed_qkv"],
+            params["conv_weights"],
+            reference_conv,
+            inputs["f_a_out"],
+            params["f_b_weight"],
+            inputs["beta_raw"],
+            params["A_log"],
+            params["dt_bias"],
+            state_pool=reference_state,
+            read_indices=page,
+            write_indices=page,
+            num_heads=H,
+            head_dim=D,
+            cu_seqlens=torch.arange(2, device="cuda", dtype=torch.int32),
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+        assert output is not None
+        return output.reshape(1, H, D), [reference_state[0]], [reference_conv[0]]
     window = torch.cat((conv.T, inputs["mixed_qkv"]), dim=0)
     projected = []
     for token in range(width):

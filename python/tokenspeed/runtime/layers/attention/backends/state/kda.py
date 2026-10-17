@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     KdaReplayHistory,
     KdaReplayHistoryBatch,
+    KdaReplayKeyGateFormat,
     KdaReplayRecords,
     kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
@@ -170,6 +171,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._replay_uses_raw_gate = False
         self._verify_split_producers = False
         self._replay_history_capacity: int = 0
+        self._replay_key_gate_format: KdaReplayKeyGateFormat = "raw_key_gate"
         self._replay_history_buffers: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
@@ -193,6 +195,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
     def _reset_replay_state(self) -> None:
         self._replay_history_capacity = 0
+        self._replay_key_gate_format = "raw_key_gate"
         self._replay_history_buffers = {}
         self._replay_history_descriptors = None
         self._replay_history_append_offsets = None
@@ -359,6 +362,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
             self._replay_history_capacity = self._replay_history_buffers[
                 first_state_layer
             ][0].shape[2]
+            if self.speculative_num_draft_tokens == 1:
+                self._replay_key_gate_format = "normalized_key_decay"
 
         # Group/layer identity is part of pool binding, even before any
         # decode workspace is needed (for example on a prefill-only engine).
@@ -418,7 +423,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
                             *payload_shape,
                             2 * hv * head_dim if self._verify_split_producers else hv,
                         ),
-                        dtype=self.dtype,
+                        dtype=(
+                            torch.float32
+                            if self._replay_key_gate_format == "normalized_key_decay"
+                            else self.dtype
+                        ),
                         device=self.device,
                     ),
                     torch.empty(
@@ -768,6 +777,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                                 : accepted_length.shape[0]
                             ],
                             "record_stamps": self._replay_record_stamps,
+                            "key_gate_format": self._replay_key_gate_format,
                         }
                     if history is not None:
                         record_args["history"] = history
@@ -1085,19 +1095,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 }
             elif self._verify_split_producers:
                 heads = value_dim // attn_tp_size // head_v_dim
-                conv_qkv, g_raw = kda_verify_conv_gate(
-                    mixed_qkv[:rows],
-                    conv_weights,
-                    conv_comp,
-                    state_in_blocks[:batch_size],
-                    f_a_out[:rows],
-                    f_b_weight,
-                    draft_token_num=draft_token_num,
-                    replay_mixed_qkv=qkv[:rows, : mixed_qkv.shape[-1]],
-                )
-                split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
-                # NVIDIA saves FP32 corrections and BF16 unnormalized K/raw gates.
-                # Request rows, not pool block IDs, size the per-round cache.
                 assert self._replay_record_metadata is not None
                 assert self._replay_record_stamps is not None
                 history = None
@@ -1121,6 +1118,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     )
                 replay_records = KdaReplayRecords(
                     history=history,
+                    key_gate_format=self._replay_key_gate_format,
                     metadata=self._replay_record_metadata[:batch_size],
                     stamps=self._replay_record_stamps[
                         self._descriptor_row_by_layer[layer_id], :batch_size
@@ -1135,6 +1133,22 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         : batch_size + 1
                     ],
                 )
+                if self._replay_key_gate_format == "normalized_key_decay":
+                    replay_payload = {
+                        "replay_mixed_qkv": qkv[:rows, : mixed_qkv.shape[-1]]
+                    }
+                else:
+                    conv_qkv, g_raw = kda_verify_conv_gate(
+                        mixed_qkv[:rows],
+                        conv_weights,
+                        conv_comp,
+                        state_in_blocks[:batch_size],
+                        f_a_out[:rows],
+                        f_b_weight,
+                        draft_token_num=draft_token_num,
+                        replay_mixed_qkv=qkv[:rows, : mixed_qkv.shape[-1]],
+                    )
+                    split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
             else:
                 capture_replay_payload(
                     (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),

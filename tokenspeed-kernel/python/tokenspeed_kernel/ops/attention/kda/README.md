@@ -1,6 +1,6 @@
 # KDA verification producers
 
-The record-producing verify path uses one operation for the four-tap
+Multi-token record-producing verify uses one operation for the four-tap
 convolution and the second gate projection. Separate thread blocks perform
 these independent producers in one launch. Verification consumes both outputs
 on the same stream.
@@ -35,3 +35,22 @@ It preserves the same accepted interval but can round differently because it
 groups products. Serving currently uses scalar recovery. Per-token decay uses
 more checkpoint storage than an accumulated decay; the cache plan includes
 the complete field shape when it selects the number of physical pages.
+
+## Single-token FP32 records
+
+Standard decode retains the fused convolution, SiLU and gate projection in
+FP32 registers. It writes FP32 correction, normalized key and decay records;
+`key_gate_format` distinguishes these from the multi-token raw key/gate
+records. Accepted commit copies normalized factors without another transform.
+Both producers use the same cache-owned history and acceptance lifecycle.
+
+The tiled recurrence preserves the fused decode reduction groups and rounds
+products before their sums. Candidate factors stay in separate scratch while
+all value tiles read the previous accepted history. Only the first value tile
+writes shared key/decay records. Convolution publication remains after verify,
+so an in-place update cannot race another tile reading the old window.
+
+Zero acceptance can still publish a consolidated base or copy a checkpoint to
+its private destination. Current record stamps distinguish that case from an
+inactive row. Both accepted factors and convolution commit skip nonpositive
+destination pages, preserving the reserved null page.

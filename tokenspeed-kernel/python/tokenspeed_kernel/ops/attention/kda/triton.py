@@ -17,6 +17,7 @@ import torch
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillResult,
     KdaReplayHistoryBatch,
+    KdaReplayKeyGateFormat,
     KdaReplayRecords,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
@@ -420,8 +421,40 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    replay_records: KdaReplayRecords | None = None,
+    replay_mixed_qkv: torch.Tensor | None = None,
+    replay_gate: torch.Tensor | None = None,
+    replay_beta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run fused target verify without materializing rollback states."""
+    if replay_gate is not None or replay_beta is not None:
+        raise ValueError("NVIDIA fused verify does not write raw gate/beta payloads")
+    if replay_records is not None:
+        from tokenspeed_kernel.ops.attention.kda._triton.nvidia_history_decode import (
+            fused_history_decode,
+        )
+
+        if draft_token_num != 1 or replay_mixed_qkv is None:
+            raise ValueError(
+                "fused history verify requires one token and a QKV payload"
+            )
+        return fused_history_decode(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            state_pool=state_pool,
+            read_indices=read_indices,
+            records=replay_records,
+            replay_mixed_qkv=replay_mixed_qkv,
+            lower_bound=lower_bound,
+        )
+    if replay_mixed_qkv is not None:
+        raise ValueError("a QKV payload requires replay records")
     return _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
@@ -720,9 +753,10 @@ def triton_nvidia_kda_batched_replay_commit(
     lower_bound: float,
     record_metadata: torch.Tensor,
     record_stamps: torch.Tensor,
+    key_gate_format: KdaReplayKeyGateFormat,
     history: KdaReplayHistoryBatch | None = None,
 ) -> None:
-    """Recover every KDA layer from FP32 U and BF16 K/raw-gate records.
+    """Commit every KDA layer using the explicit candidate record format.
 
     Args:
         descriptors: Device pointers for every layer's inputs, weights, and state.
@@ -737,7 +771,8 @@ def triton_nvidia_kda_batched_replay_commit(
         qkv_stride: Token stride of the packed QKV payload.
         conv_stride: Page stride of the convolution state.
         f_a_stride: Token stride of the FP32 correction payload.
-        beta_stride: Token stride of BF16 unnormalized key/raw-gate records.
+        beta_stride: Token stride of the selected key/gate representation.
+        key_gate_format: Raw BF16 keys/gates or normalized FP32 keys/decays.
         state_stride: Page stride of the recurrent state.
         gate_stride: Shared adapter field; no gate scratch is read here.
         conv_width: Width of the depthwise convolution kernel.
@@ -752,7 +787,7 @@ def triton_nvidia_kda_batched_replay_commit(
     )
 
     # Keep the shared NVIDIA/AMD adapter signature. This backend consumes
-    # raw records; the gate bound is forwarded to the recovery kernel.
+    # candidate records; the format and gate bound reach the commit kernel.
     del f_a_dim, gate_stride
 
     batched_recoverssm_commit(
@@ -768,6 +803,7 @@ def triton_nvidia_kda_batched_replay_commit(
         conv_stride=conv_stride,
         correction_stride=f_a_stride,
         key_gate_stride=beta_stride,
+        key_gate_format=key_gate_format,
         state_stride=state_stride,
         conv_width=conv_width,
         record_metadata=record_metadata,

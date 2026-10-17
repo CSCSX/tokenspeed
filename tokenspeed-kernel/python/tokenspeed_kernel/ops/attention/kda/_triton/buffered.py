@@ -46,6 +46,7 @@ def append_kda_history_kernel(
     stride_stamps_layer,
     stride_append_layer,
     HEADS: tl.constexpr,
+    NORMALIZED_KEY_DECAY: tl.constexpr,
     stride_correction_slot,
     stride_correction_head,
     stride_correction_token,
@@ -85,7 +86,7 @@ def append_kda_history_kernel(
             tl.pointer_type(tl.float32)
         )
         kg_ptr = tl.load(descriptors_ptr + layer * 10 + 5).to(
-            tl.pointer_type(tl.bfloat16)
+            tl.pointer_type(tl.float32 if NORMALIZED_KEY_DECAY else tl.bfloat16)
         )
         a_ptr = tl.load(descriptors_ptr + layer * 10 + 6).to(
             tl.pointer_type(tl.float32)
@@ -113,20 +114,15 @@ def append_kda_history_kernel(
     if page <= 0:
         return
     accepted = tl.load(accepted_ptr + row)
-    start = tl.load(append_offsets_ptr + row)
-    tl.device_assert(
-        (accepted >= 0)
-        & (accepted <= RECORD_CAPACITY)
-        & (start >= 0)
-        & (start + accepted <= HISTORY_CAPACITY),
-        "invalid accepted KDA history interval",
-    )
     slot = tl.load(metadata_ptr + row * 3)
+    if slot < 0:
+        return
     generation = tl.load(metadata_ptr + row * 3 + 1)
     position = tl.load(metadata_ptr + row * 3 + 2)
     tokens = tl.arange(0, BT)
     dims = tl.arange(0, BD)
-    live = tokens < accepted
+    # A current first record distinguishes zero acceptance from stale padding.
+    live = tokens < tl.maximum(accepted, 1)
     ring = (position + tokens) % RECORD_CAPACITY
     stamp = stamps_ptr + (slot * RECORD_CAPACITY + ring) * 2
     stamped_position = tl.load(stamp, mask=live, other=-1)
@@ -143,12 +139,21 @@ def append_kda_history_kernel(
         )
         == 0
     )
-    tl.device_assert(valid, "stale candidate KDA record")
+    tl.device_assert(valid | (accepted == 0), "stale candidate KDA record")
     if not valid:
         return
-    # Keep each key reduction one-dimensional, matching scalar dense recovery.
-    A = tl.exp(tl.load(a_ptr + head))
-    bias = tl.load(bias_ptr + head * K + dims, mask=dims < K, other=0.0)
+    start = tl.load(append_offsets_ptr + row)
+    tl.device_assert(
+        (accepted >= 0)
+        & (accepted <= RECORD_CAPACITY)
+        & (start >= 0)
+        & (start + accepted <= HISTORY_CAPACITY),
+        "invalid accepted KDA history interval",
+    )
+    # Keep each raw-key reduction one-dimensional, matching dense recovery.
+    if not NORMALIZED_KEY_DECAY:
+        A = tl.exp(tl.load(a_ptr + head))
+        bias = tl.load(bias_ptr + head * K + dims, mask=dims < K, other=0.0)
     for token in range(accepted):
         ring_token = (position + token) % RECORD_CAPACITY
         correction = tl.load(
@@ -178,8 +183,11 @@ def append_kda_history_kernel(
             mask=dims < K,
             other=0.0,
         ).to(tl.float32)
-        key = raw_key * tl.rsqrt(tl.sum(raw_key * raw_key) + 1e-6)
-        decay = tl.exp(_kda_gate(raw_gate, bias, A, lower_bound, USE_LOWER_BOUND))
+        if NORMALIZED_KEY_DECAY:
+            key, decay = raw_key, raw_gate
+        else:
+            key = raw_key * tl.rsqrt(tl.sum(raw_key * raw_key) + 1e-6)
+            decay = tl.exp(_kda_gate(raw_gate, bias, A, lower_bound, USE_LOWER_BOUND))
         output_token = start + token
         tl.store(
             history_correction_ptr
