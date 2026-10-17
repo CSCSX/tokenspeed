@@ -953,7 +953,6 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         decode_only_attention=False,
         disable_autotune=False,
         model_is_mrope=False,
-        query_shard_size=1,
         device=ib.device,
     )
     executor.input_buffers = ib
