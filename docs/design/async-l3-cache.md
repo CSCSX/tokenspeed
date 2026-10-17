@@ -22,12 +22,12 @@ never call the scheduler, GPU APIs or collectives. Host references remain in
 C++ until every cache-owning rank proves retirement. L2 and L3 independently
 retain one Host allocation from `cache/host_storage.py`. L3 owns its backend and accepts only Host storage
 and immutable namespace facts; it has no reference to L2 or DeviceHandle.
-The standalone byte-store adapter imports no device or numerical libraries;
-the runtime supplies an owner translation when sharding is used.
-`host_store.py` owns this key/range mapping and the backend/Host binding;
-`executor.py` contains the sole `L3Executor`. The adapter has no query,
-read or write entry points: runtime QUERY/GET/PUT use the executor's bounded
-queues and explicit completion/retirement protocol. Idle administrative namespace
+The executor imports no device or numerical libraries; the runtime supplies
+an owner translation when sharding is used. It binds the backend and Host
+resource directly and resolves object keys and local byte ranges before
+enqueueing immutable descriptors. Workers consume only those snapshots.
+Runtime QUERY/GET/PUT use its bounded queues and explicit
+completion/retirement protocol. Idle administrative namespace
 purge remains a synchronous management call.
 
 Device construction returns a complete DeviceHandle and a startup-only
@@ -57,7 +57,7 @@ callback only combines that identity with explicit target/draft generations.
 It retains no mutable launch configuration. This consolidation changes namespace
 hashes, so earlier objects remain cold; the compatibility epoch stays unchanged.
 The factory validates page-sharded payloads and constructs the backend,
-Host store and asynchronous executor. It retains no L2 executor or device
+asynchronous executor with the shared Host resource. It retains no L2 executor or device
 capability. The device builder only extracts resolved facts; it neither selects
 an L3 backend nor starts storage work. L2 copies remain inside device construction
 because they bind Device buffers, streams and slot-state exporters.
@@ -380,7 +380,7 @@ L1-only clear may proceed while Host-only storage I/O remains active.
 Shutdown attempts device-copy cleanup and L3 retirement independently from the
 control plane. L3 joins its workers with a deadline and then closes its backend;
 if native retirement remains unknown it refuses backend close/Host deregistration
-and retains the store and Host allocation even if the runtime owner is collected.
+and retains the backend and Host allocation even if the runtime owner is collected.
 
 ## Initial scope and validation
 

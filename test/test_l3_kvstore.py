@@ -46,9 +46,9 @@ from tokenspeed.runtime.cache.l3.backend import (
     storage_key_prefix,
     storage_object_key,
 )
-from tokenspeed.runtime.cache.l3.config import parse_extra_config
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig, parse_extra_config
+from tokenspeed.runtime.cache.l3.executor import L3Executor
 from tokenspeed.runtime.cache.l3.factory import create_storage_backend
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeKvStore,
     MooncakeStoreConfig,
@@ -77,13 +77,16 @@ class _FakeHost:
         return offset, self._payload_size
 
 
-class TestMinimalHostStoreTest:
+class TestMinimalL3ExecutorTest:
     def test_roundtrip_without_site_packages(self):
-        # The native master CI installs no inference runtime dependencies.
-        # -S also excludes any numerical packages present in this interpreter.
+        # Only the scheduler native package is needed; no inference dependencies.
+        import tokenspeed_scheduler
+
         source = textwrap.dedent("""
+            import time
             from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
-            from tokenspeed.runtime.cache.l3.host_store import L3HostStore
+            from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+            from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 
             class Host:
                 def __init__(self):
@@ -93,26 +96,44 @@ class TestMinimalHostStoreTest:
                     return 0, 4
 
             host = Host()
-            store = L3HostStore(
-                MemoryKvStore(), host, key_prefix="minimal", rank=0, ownership=None
+            executor = L3Executor(
+                MemoryKvStore(), host, key_prefix="minimal", rank=0, ownership=None,
+                config=StorageRuntimeConfig.from_extra_config(
+                    None, host_blocks=8, prefix_granularity=2
+                ),
+                prefix_for_weight_version=None,
             )
-            pages = [(0, 1, "prefix", 0)]
-            keys, offsets, sizes = store.page_ranges(pages)
-            assert store.backend.batch_put_from_result(
-                keys, host.host_buffer, offsets, sizes
-            ).success == (True,)
-            host.host_buffer[:] = bytes(4)
-            assert store.backend.batch_get_into_result(
-                keys, host.host_buffer, offsets, sizes
-            ).success == (True,)
-            assert host.host_buffer == b"tail"
+            def run(op_id, kind):
+                keys, offsets, sizes = executor._page_ranges([(0, 1, "prefix", 0)])
+                executor.submit(StorageJob(op_id, kind, tuple(keys), tuple(offsets), tuple(sizes)))
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    facts = executor.poll().completions
+                    if facts:
+                        assert len(facts) == 1
+                        assert facts[0].retired and facts[0].success == (True,)
+                        return
+                    time.sleep(0.001)
+                raise AssertionError("L3 operation did not finish")
+            try:
+                run(1, "put")
+                host.host_buffer[:] = bytes(4)
+                run(2, "get")
+                assert host.host_buffer == b"tail"
+            finally:
+                executor.close(timeout_s=3)
             """)
         result = subprocess.run(
             [sys.executable, "-S", "-c", source],
             env={
                 **os.environ,
-                "PYTHONPATH": os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), "..", "python")
+                "PYTHONPATH": os.pathsep.join(
+                    [
+                        os.path.abspath(
+                            os.path.join(os.path.dirname(__file__), "..", "python")
+                        ),
+                        os.path.dirname(os.path.dirname(tokenspeed_scheduler.__file__)),
+                    ]
                 ),
             },
             capture_output=True,
@@ -1527,99 +1548,97 @@ class TestMemoryKvStoreTest:
         assert (store.batch_exists(["k"])) == ([False])
 
 
-class TestL3HostStoreTest:
+class TestL3NamespaceTest:
+    @contextmanager
+    def executor(self, backend, host, *, prefix, rank):
+        executor = L3Executor(
+            backend,
+            host,
+            key_prefix=prefix,
+            rank=rank,
+            ownership=None,
+            config=StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=32, prefix_granularity=2
+            ),
+            prefix_for_weight_version=lambda version: version,
+        )
+        try:
+            yield executor
+        finally:
+            executor.close(timeout_s=2)
+
     def test_resolves_packed_pages_for_byte_store_roundtrip(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
-        pages = [(0, 1, "h0", 0)]
-        keys, offsets, sizes = l3.page_ranges(pages)
-        assert backend.batch_put_from_result(
-            keys, host.host_buffer, offsets, sizes
-        ).success == (True,)
-        assert backend.batch_exists(keys) == [True]
-        host.host_buffer[:8] = b"\x00" * 8
-        assert backend.batch_get_into_result(
-            keys, host.host_buffer, offsets, sizes
-        ).success == (True,)
-        assert (host.host_buffer[:8]) == (b"abcdefgh")
-        assert backend.batch_exists([keys[0], l3.object_key("miss", 0, 0)]) == [
-            True,
-            False,
-        ]
-        l3.close()
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert backend.batch_exists(keys) == [True]
+            host.host_buffer[:8] = bytes(8)
+            assert backend.batch_get_into_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert host.host_buffer[:8] == b"abcdefgh"
+            assert backend.batch_exists(
+                [keys[0], executor._object_key("miss", 0, 0)]
+            ) == [True, False]
 
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
-        pages = [(0, 1, "h0", 0)]
-        keys, offsets, sizes = l3.page_ranges(pages)
-        assert backend.batch_put_from_result(
-            keys, host.host_buffer, offsets, sizes
-        ).success == (True,)
-        old_key = l3.object_key("h0", 0, 0)
-        l3.rotate_namespace()
-        assert old_key == l3.object_key("h0", 0, 0)
-        assert backend.batch_exists(keys) == [False]
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
-        assert restarted.object_key("h0", 0, 0) == old_key
-        assert restarted.backend.batch_exists([restarted.object_key("h0", 0, 0)]) == [
-            False
-        ]
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = executor._object_key("h0", 0, 0)
+            assert executor.delete_namespace()
+            assert old_key == executor._object_key("h0", 0, 0)
+            assert backend.batch_exists(keys) == [False]
+            with self.executor(backend, host, prefix="m", rank=1) as restarted:
+                assert restarted._object_key("h0", 0, 0) == old_key
+                assert backend.batch_exists([old_key]) == [False]
 
-    def test_clear_returns_false_when_remote_delete_fails_and_keeps_the_prefix(self):
-        backend = mock.Mock()
-        backend.remove_by_prefix.return_value = False
-        l3 = L3HostStore(
-            backend,
-            _FakeHost(b"abcdefgh", size=64),
-            key_prefix="m",
-            rank=1,
-            ownership=None,
-        )
-        old_key = l3.object_key("h0", 0, 0)
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_clear_failure_keeps_the_namespace(self, raises):
+        class DeleteFailure(MemoryKvStore):
+            def remove_by_prefix(self, prefix):
+                if raises:
+                    raise RuntimeError("delete failed")
+                return False
 
-        assert not (l3.rotate_namespace())
+        backend = DeleteFailure()
+        host = _FakeHost(b"abcdefgh", size=64)
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = keys[0]
+            assert not executor.delete_namespace()
+            assert executor._object_key("h0", 0, 0) == old_key
+            assert backend.batch_exists([old_key]) == [True]
 
-        assert (old_key) == (l3.object_key("h0", 0, 0))
-
-    def test_clear_returns_false_when_remote_delete_raises(self):
-        backend = mock.Mock()
-        backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
-        l3 = L3HostStore(
-            backend,
-            _FakeHost(b"abcdefgh", size=64),
-            key_prefix="m",
-            rank=1,
-            ownership=None,
-        )
-        old_key = l3.object_key("h0", 0, 0)
-
-        assert not (l3.rotate_namespace())
-
-        assert (old_key) == (l3.object_key("h0", 0, 0))
-
-    def test_set_key_prefix_republishes_under_the_new_namespace(self):
+    def test_weight_version_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, ownership=None)
-        pages = [(0, 1, "h0", 0)]
-        keys, offsets, sizes = l3.page_ranges(pages)
-        assert backend.batch_put_from_result(
-            keys, host.host_buffer, offsets, sizes
-        ).success == (True,)
-        old_key = l3.object_key("h0", 0, 0)
-        l3.rotate_namespace()
-        l3.set_key_prefix("v2")
-        assert (old_key) != (l3.object_key("h0", 0, 0))
-        keys, offsets, sizes = l3.page_ranges(pages)
-        assert backend.batch_exists(keys) == [False]
-        assert backend.batch_put_from_result(
-            keys, host.host_buffer, offsets, sizes
-        ).success == (True,)
-        assert l3.object_key("h0", 0, 0).startswith("v2_")
-        assert (backend.batch_exists([old_key])) == ([False])
+        with self.executor(backend, host, prefix="v1", rank=0) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = keys[0]
+            assert executor.delete_namespace()
+            executor.set_weight_version("v2")
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert keys[0] != old_key and keys[0].startswith("v2_")
+            assert backend.batch_exists(keys) == [False]
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert backend.batch_exists([old_key]) == [False]
 
 
 class TestFactoryTest:

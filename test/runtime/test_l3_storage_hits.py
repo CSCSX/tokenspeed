@@ -31,7 +31,6 @@ from prometheus_client import CollectorRegistry
 from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.metrics import L3Metrics
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 
@@ -110,16 +109,19 @@ def runtime():
     )
     host = _Host()
     backend = _ControlledMemoryStore()
-    store = L3HostStore(backend, host, key_prefix="old", rank=0, ownership=None)
     now = [time.monotonic()]
     executor = L3Executor(
-        store,
+        backend,
+        host,
+        key_prefix="old",
+        rank=0,
+        ownership=None,
         config=config,
         prefix_for_weight_version=lambda version: f"new-{version}",
         clock=lambda: now[0],
     )
     try:
-        yield config, host, backend, store, executor, now
+        yield config, host, backend, executor, now
     finally:
         backend.release_reads.set()
         executor.close(timeout_s=2)
@@ -178,8 +180,8 @@ def _query(scheduler, request_id):
     return operation
 
 
-def _keys(store, operation):
-    return [store.object_key(h, g, o) for g, h, o in operation.keys]
+def _keys(executor, operation):
+    return [executor._object_key(h, g, o) for g, h, o in operation.keys]
 
 
 def _seed(backend, keys, payload):
@@ -222,10 +224,10 @@ def _finish(scheduler, result):
     )
 
 
-def _get_descriptor(config, backend, store):
+def _get_descriptor(config, backend, executor):
     scheduler = _scheduler(config)
     query = _query(scheduler, "snapshot")
-    keys = _keys(store, query)
+    keys = _keys(executor, query)
     _seed(backend, keys, b"snapshot")
     _send(
         scheduler,
@@ -267,7 +269,7 @@ def test_parsed_storage_deadline_controls_scheduler_admission():
 
 
 def test_local_completion_is_reported_once_and_does_not_select_a_prefix(runtime):
-    config, host, backend, _, executor, _ = runtime
+    config, host, backend, executor, _ = runtime
     scheduler = _scheduler(config)
     h = _hooks(scheduler, executor, config, None)
     _seed(backend, ["present"], b"restored")
@@ -292,8 +294,8 @@ def test_local_completion_is_reported_once_and_does_not_select_a_prefix(runtime)
 
 
 def test_storage_ranges_and_namespace_are_captured_before_queueing(runtime):
-    config, host, backend, store, executor, _ = runtime
-    _, operation, keys = _get_descriptor(config, backend, store)
+    config, host, backend, executor, _ = runtime
+    _, operation, keys = _get_descriptor(config, backend, executor)
     ranges = [
         host.host_block_range(g, b)
         for (g, _, _), b in zip(operation.keys, operation.host_blocks, strict=True)
@@ -305,9 +307,9 @@ def test_storage_ranges_and_namespace_are_captured_before_queueing(runtime):
     executor.submit_operations([operation])
     # Bypass the management guard only to expose descriptor lifetime: workers
     # must consume the namespace and byte ranges captured at submission.
-    store.set_key_prefix("changed")
+    executor._key_prefix = "changed"
     host.block_bytes = 16
-    _seed(backend, _keys(store, operation), b"wrong!!!")
+    _seed(backend, _keys(executor, operation), b"wrong!!!")
     backend.release_reads.set()
     results = _completions(executor, 2)
     assert all(result.retired and all(result.success) for result in results)
@@ -315,12 +317,12 @@ def test_storage_ranges_and_namespace_are_captured_before_queueing(runtime):
         assert host.host_buffer[offset : offset + size] == b"snapshot"
     assert backend.batch_exists(keys) == [True] * len(keys)
     executor.set_weight_version("v2")
-    assert store.key_prefix == "new-v2"
+    assert executor.key_prefix == "new-v2"
 
 
 def test_cancelled_queued_scheduler_get_retires_without_writing_host(runtime):
-    config, host, backend, store, executor, _ = runtime
-    scheduler, operation, _ = _get_descriptor(config, backend, store)
+    config, host, backend, executor, _ = runtime
+    scheduler, operation, _ = _get_descriptor(config, backend, executor)
     _seed(backend, ["blocker"], b"blocking")
     backend.release_reads.clear()
     executor.submit(StorageJob(1, "get", ("blocker",), (240,), (8,)))
@@ -342,8 +344,8 @@ def test_cancelled_queued_scheduler_get_retires_without_writing_host(runtime):
 
 
 def test_namespace_mutation_rejects_inflight_io_without_waiting(runtime):
-    _, host, backend, store, executor, _ = runtime
-    old_key = store.object_key("hash", 0, 0)
+    _, host, backend, executor, _ = runtime
+    old_key = executor._object_key("hash", 0, 0)
     _seed(backend, [old_key, "other_hash"], b"original")
     backend.release_reads.clear()
     executor.submit(StorageJob(1, "get", (old_key,), (0,), (8,)))
@@ -354,7 +356,7 @@ def test_namespace_mutation_rejects_inflight_io_without_waiting(runtime):
         executor.set_weight_version("v2")
     assert time.perf_counter() - started < 1
     assert not backend.release_reads.is_set()
-    assert store.key_prefix == "old"
+    assert executor.key_prefix == "old"
     assert backend.batch_exists([old_key, "other_hash"]) == [True, True]
     assert host.host_buffer[:8] == bytes(8)
     backend.release_reads.set()
@@ -363,8 +365,8 @@ def test_namespace_mutation_rejects_inflight_io_without_waiting(runtime):
     assert executor.delete_namespace()
     assert backend.batch_exists([old_key, "other_hash"]) == [False, True]
     executor.set_weight_version("v2")
-    assert store.key_prefix == "new-v2"
-    new_key = store.object_key("hash", 0, 0)
+    assert executor.key_prefix == "new-v2"
+    new_key = executor._object_key("hash", 0, 0)
     _seed(backend, [new_key], b"newbytes")
     assert executor.delete_namespace()
     assert backend.batch_exists([new_key, "other_hash"]) == [False, True]
@@ -375,7 +377,7 @@ def test_metrics_sample_pending_transitions_without_extra_feedback(
 ):
     import tokenspeed.runtime.engine.l3_cache_hooks as module
 
-    config, _, _, _, executor, _ = runtime
+    config, _, _, executor, _ = runtime
     now = [100.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
     registry = CollectorRegistry()
@@ -428,7 +430,7 @@ def test_metrics_sample_pending_transitions_without_extra_feedback(
 
 
 def test_full_read_queue_rejects_without_invalidating_and_recovers(runtime):
-    _, host, backend, _, executor, _ = runtime
+    _, host, backend, executor, _ = runtime
     _seed(backend, ["blocker", "retry"], b"restored")
     backend.release_reads.clear()
     executor.submit(StorageJob(1, "get", ("blocker",), (240,), (8,)))
@@ -460,10 +462,10 @@ def test_full_read_queue_rejects_without_invalidating_and_recovers(runtime):
 
 
 def test_transient_get_failure_retries_same_remote_keys_after_recovery(runtime):
-    config, host, backend, store, executor, now = runtime
+    config, host, backend, executor, now = runtime
     scheduler = _scheduler(config)
     query = _query(scheduler, "first")
-    keys = _keys(store, query)
+    keys = _keys(executor, query)
     _seed(backend, keys, b"abcdefgh")
     executor.submit_operations([query])
     _finish(scheduler, _completions(executor, 1)[0])
@@ -483,7 +485,7 @@ def test_transient_get_failure_retries_same_remote_keys_after_recovery(runtime):
     _send(scheduler, finished)
     now[0] += 100  # Permit the monitor's single recovery probe.
     query2 = _query(scheduler, "after-recovery")
-    assert _keys(store, query2) == keys
+    assert _keys(executor, query2) == keys
     executor.submit_operations([query2])
     _finish(scheduler, _completions(executor, 1)[0])
     assert executor.snapshot().health.state == "healthy"

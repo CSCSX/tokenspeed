@@ -181,16 +181,13 @@ class TestL3FlatKvRoundTripTest:
     def _l3_executor(self, executor, *, store, namespace, prefix_granularity):
         from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
         from tokenspeed.runtime.cache.l3.executor import L3Executor
-        from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
         return L3Executor(
-            L3HostStore(
-                store,
-                executor.host_storage,
-                key_prefix=namespace,
-                rank=0,
-                ownership=None,
-            ),
+            store,
+            executor.host_storage,
+            key_prefix=namespace,
+            rank=0,
+            ownership=None,
             prefix_for_weight_version=lambda version: f"{namespace}-{version}",
             config=StorageRuntimeConfig.from_extra_config(
                 None,
@@ -284,7 +281,7 @@ class TestL3FlatKvRoundTripTest:
                 )
                 executor.write_stream.synchronize()
                 assert [int(event.op_id) for event in executor.poll_results()] == [7]
-                objects, offsets, sizes = l3.store.page_ranges(
+                objects, offsets, sizes = l3._page_ranges(
                     [
                         (g, block, h, o)
                         for (g, h, o), block in zip(
@@ -298,7 +295,7 @@ class TestL3FlatKvRoundTripTest:
                 self._complete(l3, op_id=1, expected=(True,) * len(groups))
                 return
 
-            objects, offsets, sizes = l3.store.page_ranges(
+            objects, offsets, sizes = l3._page_ranges(
                 [
                     (g, block, h, o)
                     for (g, h, o), block in zip(
@@ -474,7 +471,7 @@ class TestL3FlatKvRoundTripTest:
             assert torch.equal(first.cpu(), expected_first)
             assert torch.equal(second.cpu(), expected_second)
 
-            assert l3.store.backend.remove_by_prefix(namespace)
+            assert l3.backend.remove_by_prefix(namespace)
             executor.host_storage.host_buffer.fill_(0)
             l3.submit_operations(
                 [

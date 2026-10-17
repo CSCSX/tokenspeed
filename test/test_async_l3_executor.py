@@ -39,7 +39,6 @@ from tokenspeed.runtime.cache.l3.executor import (
     StorageJob,
     _BackendHealth,
 )
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
 
 
@@ -49,10 +48,24 @@ def config():
     )
 
 
+class _HostAllocation:
+    """CPU substitute for the GPU-pinned allocation."""
+
+    def __init__(self, data):
+        self.host_buffer = data
+
+
 def executor(backend, *, cfg, data=None):
-    host = SimpleNamespace(host_buffer=bytearray(64) if data is None else data)
-    store = L3HostStore(backend, host, key_prefix="test", rank=0, ownership=None)
-    return L3Executor(store, config=cfg, prefix_for_weight_version=None)
+    host = _HostAllocation(bytearray(64) if data is None else data)
+    return L3Executor(
+        backend,
+        host,
+        key_prefix="test",
+        rank=0,
+        ownership=None,
+        config=cfg,
+        prefix_for_weight_version=None,
+    )
 
 
 def wait_results(e, count):
@@ -172,11 +185,14 @@ def test_unproven_native_failure_disables_io_and_refuses_buffer_shutdown(success
     assert result.retired and result.success == (False,)  # no new I/O submitted
     with pytest.raises(RuntimeError, match="retirement is unproven"):
         e.shutdown(timeout_s=2)
-    store_ref, executor_ref = weakref.ref(e.store), weakref.ref(e)
+    backend_ref = weakref.ref(e.backend)
+    host_ref = weakref.ref(e.host_storage)
+    executor_ref = weakref.ref(e)
     del e
     gc.collect()
     assert executor_ref() is None
-    assert store_ref() is not None  # Host registration survives owner teardown
+    assert backend_ref() is not None
+    assert host_ref() is not None  # Host registration survives owner teardown
 
 
 def test_global_store_roundtrip_between_independent_host_executors():
@@ -188,8 +204,8 @@ def test_global_store_roundtrip_between_independent_host_executors():
         assert wait_results(writer, 1)[0].success == (True,)
         reader.submit(StorageJob(1, "get", ("shared-key",), (16,), (8,)))
         assert wait_results(reader, 1)[0].success == (True,)
-        assert reader.store.host_storage.host_buffer[16:24] == b"abcdefgh"
-        assert reader.store.host_storage.host_buffer[:8] == bytes(8)
+        assert reader.host_storage.host_buffer[16:24] == b"abcdefgh"
+        assert reader.host_storage.host_buffer[:8] == bytes(8)
     finally:
         writer.shutdown(timeout_s=2)
         reader.shutdown(timeout_s=2)
@@ -345,7 +361,11 @@ def test_pressure_snapshot_tracks_queue_and_cancelled_native_work_until_retireme
 
     host = SimpleNamespace(host_buffer=bytearray(64))
     e = L3Executor(
-        L3HostStore(Backend(), host, key_prefix="pressure", rank=0, ownership=None),
+        Backend(),
+        host,
+        key_prefix="pressure",
+        rank=0,
+        ownership=None,
         config=replace(config(), read_workers=1),
         clock=lambda: now[0],
         prefix_for_weight_version=None,
@@ -399,9 +419,11 @@ def test_query_pressure_counts_metadata_jobs_without_fake_payload_bytes():
 
     host = SimpleNamespace(host_buffer=bytearray(64))
     e = L3Executor(
-        L3HostStore(
-            Backend(), host, key_prefix="query-pressure", rank=0, ownership=None
-        ),
+        Backend(),
+        host,
+        key_prefix="query-pressure",
+        rank=0,
+        ownership=None,
         config=replace(config(), query_workers=1),
         clock=lambda: now[0],
         prefix_for_weight_version=None,
@@ -532,16 +554,23 @@ def test_close_waits_for_native_retirement_and_preserves_host_owner():
     backend = Backend()
     host = SimpleNamespace(host_buffer=bytearray(b"abcdefgh"))
     backend.batch_put_from(("a",), host.host_buffer, (0,), (8,))
-    store = L3HostStore(backend, host, key_prefix="test", rank=0, ownership=None)
-    e = L3Executor(store, config=config(), prefix_for_weight_version=None)
-    del host, store  # L2's resource reference can disappear independently.
+    e = L3Executor(
+        backend,
+        host,
+        key_prefix="test",
+        rank=0,
+        ownership=None,
+        config=config(),
+        prefix_for_weight_version=None,
+    )
+    del host  # L2's resource reference can disappear independently.
     try:
         with patch.object(backend, "close", wraps=backend.close) as close:
             e.submit(StorageJob(1, "get", ("a",), (0,), (8,)))
             assert started.wait(1)
             # The serving poll is independent of GPU/device submission.
             assert not e.poll().completions
-            assert e.store.host_storage.host_buffer == b"abcdefgh"
+            assert e.host_storage.host_buffer == b"abcdefgh"
             release.set()
             assert wait_results(e, 1)[0].success == (True,)
             e.close(timeout_s=2)
@@ -550,6 +579,38 @@ def test_close_waits_for_native_retirement_and_preserves_host_owner():
     finally:
         release.set()
         e.shutdown(timeout_s=2)
+
+
+def test_close_timeout_preserves_backend_and_host_after_worker_exit():
+    started, release = threading.Event(), threading.Event()
+
+    class Backend(MemoryKvStore):
+        def batch_get_into_result(self, *args):
+            started.set()
+            assert release.wait(3)
+            return super().batch_get_into_result(*args)
+
+    e = executor(Backend(), cfg=config())
+    e.backend.batch_put_from(("a",), bytearray(b"data"), (0,), (4,))
+    backend_ref = weakref.ref(e.backend)
+    host_ref = weakref.ref(e.host_storage)
+    executor_ref = weakref.ref(e)
+    threads = tuple(e._threads)
+    try:
+        e.submit(StorageJob(1, "get", ("a",), (0,), (4,)))
+        assert started.wait(1)
+        with pytest.raises(RuntimeError, match="retirement is unproven"):
+            e.close(timeout_s=0)
+        assert backend_ref().batch_exists(("a",)) == [True]
+        del e
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(3)
+    gc.collect()
+    assert executor_ref() is None
+    assert backend_ref() is not None and host_ref() is not None
+    assert host_ref().host_buffer[:4] == b"data"
 
 
 def test_close_never_deregisters_unknown_native_access():

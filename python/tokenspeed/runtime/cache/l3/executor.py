@@ -26,11 +26,12 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, storage_object_key
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.io_types import (
     StorageCompletion,
     StorageIOResult,
@@ -42,11 +43,15 @@ from tokenspeed.runtime.cache.l3.statistics import (
     OperationCounters,
 )
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.host_storage import HostCacheStorage
+    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
 logger = logging.getLogger(__name__)
 
 # Shutdown errors must not turn into deregistration when the owning runtime is
 # garbage-collected. Only process exit releases an unretired native transport.
-_unretired_stores: list[L3HostStore] = []
+_unretired_resources: list[tuple[KvStoreStorage, HostCacheStorage]] = []
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,13 +147,21 @@ class _JobState:
 class L3Executor:
     def __init__(
         self,
-        store: L3HostStore,
+        backend: KvStoreStorage,
+        host_storage: HostCacheStorage,
         *,
+        key_prefix: str,
+        rank: int,
+        ownership: BlockOwnerTranslation | None,
         config: StorageRuntimeConfig,
         prefix_for_weight_version: Callable[[str], str] | None,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self.store = store
+        self.backend = backend
+        self.host_storage = host_storage
+        self._key_prefix = key_prefix
+        self._rank = int(rank)
+        self._ownership = ownership
         self.config = config
         self._prefix_for_weight_version = prefix_for_weight_version
         self._closed = False
@@ -186,6 +199,45 @@ class L3Executor:
                 self._threads.append(thread)
                 thread.start()
 
+    @property
+    def key_prefix(self) -> str:
+        return self._key_prefix
+
+    def _object_key(self, content_hash: str, group_id: int, page_offset: int) -> str:
+        return storage_object_key(
+            content_hash,
+            group_id,
+            page_offset,
+            prefix=self._key_prefix,
+            rank=(
+                self._rank // self._ownership.shard_counts[group_id]
+                if self._ownership is not None
+                else self._rank
+            ),
+        )
+
+    def _page_ranges(
+        self, pages: Sequence[tuple[int, int, str, int]]
+    ) -> tuple[list[str], list[int | None], list[int]]:
+        """Freeze keys and local Host ranges in logical operation order.
+
+        Rows are (group, Host block, content hash, logical offset). A None byte
+        offset means this rank owns no payload; its completion stays neutral.
+        Object keys use replica identity so a later allocation may change owner.
+        """
+        keys = [self._object_key(h, g, o) for g, _, h, o in pages]
+        if self._ownership is None:
+            ranges = [self.host_storage.host_block_range(g, b) for g, b, _, _ in pages]
+            return keys, [offset for offset, _ in ranges], [size for _, size in ranges]
+        offsets: list[int | None] = [None] * len(pages)
+        sizes = [self.host_storage.host_cache_block_bytes[g] for g, _, _, _ in pages]
+        owned = self._ownership.owned_host_positions([(g, b) for g, b, _, _ in pages])
+        for position, (group, local_block) in owned:
+            offsets[position], sizes[position] = self.host_storage.host_block_range(
+                group, local_block
+            )
+        return keys, offsets, sizes
+
     def submit_operations(self, operations) -> None:
         """Snapshot plain storage descriptors and enqueue without waiting."""
         from tokenspeed_scheduler import StorageKind
@@ -207,12 +259,11 @@ class L3Executor:
             # a descriptor already owned by a worker.
             if kind == "query":
                 keys = [
-                    self.store.object_key(str(h), int(g), int(o))
-                    for g, h, o in logical_keys
+                    self._object_key(str(h), int(g), int(o)) for g, h, o in logical_keys
                 ]
                 offsets, sizes = (), ()
             else:
-                keys, offsets, sizes = self.store.page_ranges(
+                keys, offsets, sizes = self._page_ranges(
                     [
                         (int(g), int(block), str(h), int(o))
                         for (g, h, o), block in zip(
@@ -236,11 +287,20 @@ class L3Executor:
             raise RuntimeError("L3 prefix cannot be rebuilt without a factory")
         if not self.is_idle():
             raise RuntimeError("L3 operations must retire before changing namespace")
-        self.store.set_key_prefix(self._prefix_for_weight_version(weight_version))
+        key_prefix = self._prefix_for_weight_version(weight_version)
+        if not key_prefix:
+            raise ValueError("key_prefix must be non-empty")
+        self._key_prefix = key_prefix
 
     def delete_namespace(self) -> bool:
         """Delete an idle namespace after the caller agrees that caches can clear."""
-        return self.is_idle() and self.store.rotate_namespace()
+        if not self.is_idle():
+            return False
+        try:
+            return bool(self.backend.remove_by_prefix(f"{self._key_prefix}_"))
+        except Exception:
+            logger.exception("L3 namespace delete failed")
+            return False
 
     def close(self, *, timeout_s: float) -> None:
         """Retire native work before deregistration; retain Host storage on failure.
@@ -251,7 +311,7 @@ class L3Executor:
         if self._closed:
             return
         self.shutdown(timeout_s=timeout_s)
-        self.store.close()
+        self.backend.close()
         self._closed = True
 
     def submit(self, job: StorageJob) -> None:
@@ -423,7 +483,7 @@ class L3Executor:
                 with self._lock:
                     self._counters[kind].backend_calls += 1
                 try:
-                    backend = self.store.backend
+                    backend = self.backend
                     if kind == "query":
                         flags = tuple(backend.batch_exists(local_keys))
                         result = StorageIOResult(
@@ -432,14 +492,14 @@ class L3Executor:
                     elif kind == "get":
                         result = backend.batch_get_into_result(
                             local_keys,
-                            self.store.host_storage.host_buffer,
+                            self.host_storage.host_buffer,
                             local_offsets,
                             local_sizes,
                         )
                     else:
                         result = backend.batch_put_from_result(
                             local_keys,
-                            self.store.host_storage.host_buffer,
+                            self.host_storage.host_buffer,
                             local_offsets,
                             local_sizes,
                         )
@@ -464,7 +524,7 @@ class L3Executor:
                     logger.exception(f"L3 {kind} failed for operation {job.op_id}")
                     result = StorageIOResult(
                         (False,) * len(local_keys),
-                        kind == "query" or self.store.backend.failures_retire,
+                        kind == "query" or self.backend.failures_retire,
                         (False,) * len(local_keys),
                     )
                     self._health.report_failure(token)
@@ -573,7 +633,7 @@ class L3Executor:
             thread.join(max(0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in self._threads) or self._unsafe_io:
             if not self._retained_on_shutdown:
-                _unretired_stores.append(self.store)
+                _unretired_resources.append((self.backend, self.host_storage))
                 self._retained_on_shutdown = True
             raise RuntimeError(
                 "L3 I/O retirement is unproven; retaining registered Host storage; restart required"

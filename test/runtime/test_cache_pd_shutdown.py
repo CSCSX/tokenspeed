@@ -43,7 +43,6 @@ def test_device_shutdown_failure_still_retires_l3_resources() -> None:
     from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
     from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
     from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
-    from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
     class HostAllocation:
         """Substitute only the GPU-pinned allocation, not storage I/O."""
@@ -63,7 +62,11 @@ def test_device_shutdown_failure_still_retires_l3_resources() -> None:
     backend = MemoryKvStore()
     backend.batch_put_from(("live",), host.host_buffer, (0,), (4,))
     executor = L3Executor(
-        L3HostStore(backend, host, key_prefix="close", rank=0, ownership=None),
+        backend,
+        host,
+        key_prefix="close",
+        rank=0,
+        ownership=None,
         config=StorageRuntimeConfig.from_extra_config(
             None, host_blocks=16, prefix_granularity=2
         ),

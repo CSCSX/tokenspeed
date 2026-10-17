@@ -298,7 +298,6 @@ def create_l3_executor(
         )
 
     from tokenspeed.runtime.cache.l3.executor import L3Executor
-    from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
     key_prefix = prefix_for_weight_version(server_args.weight_version)
     storage_backend = create_storage_backend(
@@ -308,15 +307,12 @@ def create_l3_executor(
         tp_size=server_args.mapping.attn.tp_size,
         pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
     )
-    l3_store = L3HostStore(
+    l3_executor = L3Executor(
         storage_backend,
         host_storage,
         key_prefix=key_prefix,
         rank=server_args.mapping.attn.tp_rank,
         ownership=ownership,
-    )
-    l3_executor = L3Executor(
-        l3_store,
         config=config,
         prefix_for_weight_version=prefix_for_weight_version,
     )

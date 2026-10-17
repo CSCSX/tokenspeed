@@ -21,7 +21,7 @@
 """Live Mooncake Store L3 tests against a real ``mooncake_master``.
 
 The test boots ``mooncake_master`` (or reuses ``MOONCAKE_MASTER``) and drives
-``MooncakeKvStore`` / ``L3HostStore`` over TCP with ``P2PHANDSHAKE``. Skip when
+``MooncakeKvStore`` / ``L3Executor`` over TCP with ``P2PHANDSHAKE``. Skip when
 the Mooncake package is not installed, unless ``MOONCAKE_REQUIRE_MASTER=1``.
 """
 
@@ -43,7 +43,6 @@ from pathlib import Path
 import pytest
 
 from tokenspeed.runtime.cache.l3.factory import create_storage_backend
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
 
 
@@ -335,9 +334,11 @@ class TestMooncakeMasterLiveTest:
                 clients, host_buffer=host.host_buffer, tp_size=1, pp_size=1
             )
             return L3Executor(
-                L3HostStore(
-                    backend, host, key_prefix="global-async", rank=0, ownership=None
-                ),
+                backend,
+                host,
+                key_prefix="global-async",
+                rank=0,
+                ownership=None,
                 config=config,
                 prefix_for_weight_version=None,
             )
@@ -356,23 +357,23 @@ class TestMooncakeMasterLiveTest:
 
         writer = client()
         try:
-            writer.store.host_storage.host_buffer[:64] = payload
+            writer.host_storage.host_buffer[:64] = payload
             writer.submit(StorageJob(1, "put", (key,), (0,), (64,)))
             complete(writer)
         finally:
             writer.shutdown(timeout_s=10)
-            writer.store.close()
+            writer.backend.close()
         reader = client()
         try:
             reader.submit(StorageJob(1, "get", (key,), (128,), (64,)))
             complete(reader)
-            assert bytes(reader.store.host_storage.host_buffer[128:192]) == payload
-            assert reader.store.backend.remove_by_prefix(key)
+            assert bytes(reader.host_storage.host_buffer[128:192]) == payload
+            assert reader.backend.remove_by_prefix(key)
         finally:
             reader.shutdown(timeout_s=10)
-            reader.store.close()
+            reader.backend.close()
 
-    def test_l3_host_store_round_trips_through_mooncake_master(self) -> None:
+    def test_l3_executor_round_trips_through_mooncake_master(self) -> None:
         from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
         from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 
@@ -387,9 +388,12 @@ class TestMooncakeMasterLiveTest:
             pp_size=1,
         )
         assert isinstance(backend, MooncakeKvStore)
-        l3 = L3HostStore(backend, host, key_prefix="live", rank=0, ownership=None)
         executor = L3Executor(
-            l3,
+            backend,
+            host,
+            key_prefix="live",
+            rank=0,
+            ownership=None,
             config=StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=8, prefix_granularity=64
             ),
@@ -397,7 +401,7 @@ class TestMooncakeMasterLiveTest:
         )
 
         def run(op_id, kind):
-            keys, offsets, sizes = l3.page_ranges([(0, 1, "h0", 0)])
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
             executor.submit(
                 StorageJob(
                     op_id,
@@ -487,9 +491,11 @@ class TestMooncakeMasterLiveTest:
             config, host_buffer=host.host_buffer, tp_size=1, pp_size=1
         )
         executor = L3Executor(
-            L3HostStore(
-                backend, host, key_prefix="master-restart", rank=0, ownership=None
-            ),
+            backend,
+            host,
+            key_prefix="master-restart",
+            rank=0,
+            ownership=None,
             config=replace(
                 StorageRuntimeConfig.from_extra_config(
                     None, host_blocks=8, prefix_granularity=64

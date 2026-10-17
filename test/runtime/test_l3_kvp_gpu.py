@@ -47,7 +47,6 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
     from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
     from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
-    from tokenspeed.runtime.cache.l3.host_store import L3HostStore
     from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
     from tokenspeed.runtime.cache.transfer.layout import (
         CacheField,
@@ -128,15 +127,12 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     ownership = BlockOwnerTranslation.for_host_pool(
         layout, contract, num_host_lcm_blocks=4, rank=rank
     )
-    store = L3HostStore(
+    l3 = L3Executor(
         backend,
         executor.host_storage,
         key_prefix=namespace,
         rank=rank,
         ownership=ownership,
-    )
-    l3 = L3Executor(
-        store,
         config=StorageRuntimeConfig.from_extra_config(
             None, host_blocks=4, prefix_granularity=1
         ),
@@ -161,7 +157,7 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
         else:
             executor.host_storage.host_buffer.fill_(0)
             block = 3
-        keys, offsets, sizes = store.page_ranges([(0, block, "h", 0)])
+        keys, offsets, sizes = l3._page_ranges([(0, block, "h", 0)])
         l3.submit(StorageJob(1, phase, tuple(keys), tuple(offsets), tuple(sizes)))
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:

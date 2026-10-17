@@ -46,7 +46,6 @@ from tokenspeed.runtime.cache.l3.backend import (
 )
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import L3Executor
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
 
 class _Host:
@@ -198,7 +197,11 @@ def test_cold_tail_restores_actual_put_bytes(
                 config, host_buffer=host.host_buffer, tp_size=1, pp_size=1
             )
         return L3Executor(
-            L3HostStore(backend, host, key_prefix=namespace, rank=0, ownership=None),
+            backend,
+            host,
+            key_prefix=namespace,
+            rank=0,
+            ownership=None,
             config=async_config,
             prefix_for_weight_version=None,
         )
@@ -272,4 +275,4 @@ def test_cold_tail_restores_actual_put_bytes(
         assert list(plan.forward[0].input_lengths) == [suffix_tokens]
         assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
         assert reader.storage_quarantined() == 0
-        assert reader_io.store.backend.remove_by_prefix(namespace)
+        assert reader_io.backend.remove_by_prefix(namespace)

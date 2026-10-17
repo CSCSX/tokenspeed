@@ -142,7 +142,7 @@ def test_factory_roundtrips_through_the_shared_host_resource(construction):
     try:
         assert executor.config.scheduler.max_host_blocks <= host.num_host_lcm_blocks
         host.host_buffer[:4] = b"KV01"
-        key = executor.store.object_key("prefix", 0, 0)
+        key = executor._object_key("prefix", 0, 0)
         executor.submit(StorageJob(1, "put", (key,), (0,), (4,)))
         put = complete(executor)
         assert put.success == (True,) and put.retired
@@ -159,9 +159,9 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
     args, model, _, factory_kwargs = construction
     executor = create_l3_executor(args, model, None, **factory_kwargs)
     try:
-        original = executor.store.key_prefix
+        original = executor.key_prefix
         executor.set_weight_version("v2")
-        expected = executor.store.key_prefix
+        expected = executor.key_prefix
         assert expected != original
         executor.set_weight_version("v1")
         model.model_override_args["new_override"] = {"nested": [1, 2]}
@@ -170,11 +170,11 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
             factory_kwargs["inputs"], eagle3_layers_to_capture=(0, 3)
         )
         executor.set_weight_version("v2")
-        assert executor.store.key_prefix == expected
+        assert executor.key_prefix == expected
         changed = create_l3_executor(args, model, None, **factory_kwargs)
         try:
             changed.set_weight_version("v2")
-            assert changed.store.key_prefix != expected
+            assert changed.key_prefix != expected
         finally:
             changed.close(timeout_s=5)
     finally:
@@ -191,7 +191,7 @@ def test_factory_includes_the_draft_checkpoint_identity(construction, tmp_path):
     target_only = create_l3_executor(args, model, None, **factory_kwargs)
     with_draft = create_l3_executor(args, model, draft, **factory_kwargs)
     try:
-        assert target_only.store.key_prefix != with_draft.store.key_prefix
+        assert target_only.key_prefix != with_draft.key_prefix
     finally:
         target_only.close(timeout_s=5)
         with_draft.close(timeout_s=5)

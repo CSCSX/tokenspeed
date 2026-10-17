@@ -27,7 +27,6 @@ import time
 from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
-from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 
 
@@ -64,14 +63,24 @@ class Backend(MemoryKvStore):
         return super().batch_exists(keys)
 
 
-def store(backend, host, rank):
+def make_executor(backend, host, rank, *, extra_config):
     owners = BlockOwnerTranslation(
         shard_counts=(2, 1),
         device_virtual_counts=(9, 5),
         host_virtual_counts=(9, 5),
         rank=rank % 2,
     )
-    return L3HostStore(backend, host, key_prefix="kvp", rank=rank, ownership=owners)
+    return L3Executor(
+        backend,
+        host,
+        key_prefix="kvp",
+        rank=rank,
+        ownership=owners,
+        config=StorageRuntimeConfig.from_extra_config(
+            extra_config, host_blocks=32, prefix_granularity=2
+        ),
+        prefix_for_weight_version=None,
+    )
 
 
 def completion(executor):
@@ -87,29 +96,36 @@ def completion(executor):
 
 def test_page_keys_follow_replica_while_state_keys_follow_rank():
     backend = Backend()
-    a, b, other = (store(backend, Host(), rank) for rank in [0, 1, 2])
-    assert a.object_key("h", 0, 0) == b.object_key("h", 0, 0)
-    assert a.object_key("h", 0, 0) != other.object_key("h", 0, 0)
-    assert a.object_key("h", 1, 0) != b.object_key("h", 1, 0)
+    a, b, other = (
+        make_executor(backend, Host(), rank, extra_config=None) for rank in [0, 1, 2]
+    )
+    try:
+        assert a._object_key("h", 0, 0) == b._object_key("h", 0, 0)
+        assert a._object_key("h", 0, 0) != other._object_key("h", 0, 0)
+        assert a._object_key("h", 1, 0) != b._object_key("h", 1, 0)
+    finally:
+        for client in (a, b, other):
+            client.shutdown(timeout_s=2)
+        backend.close()
 
 
 def test_source_owner_one_restores_on_destination_owner_zero():
     backend = Backend()
     source = [Host(), Host()]
     source[1].host_buffer[:4] = b"KV01"
-    writers = [store(backend, host, rank) for rank, host in enumerate(source)]
+    writers = [
+        make_executor(backend, host, rank, extra_config=None)
+        for rank, host in enumerate(source)
+    ]
     target = [Host(), Host()]
-    readers = [store(backend, host, rank) for rank, host in enumerate(target)]
-    cfg = StorageRuntimeConfig.from_extra_config(
-        None, host_blocks=32, prefix_granularity=2
-    )
-    for kind, stores, block in (("put", writers, 2), ("get", readers, 3)):
-        for host_store in stores:
-            executor = L3Executor(
-                host_store, config=cfg, prefix_for_weight_version=None
-            )
+    readers = [
+        make_executor(backend, host, rank, extra_config=None)
+        for rank, host in enumerate(target)
+    ]
+    for kind, clients, block in (("put", writers, 2), ("get", readers, 3)):
+        for executor in clients:
             try:
-                keys, offsets, sizes = host_store.page_ranges([(0, block, "h", 0)])
+                keys, offsets, sizes = executor._page_ranges([(0, block, "h", 0)])
                 executor.submit(
                     StorageJob(1, kind, tuple(keys), tuple(offsets), tuple(sizes))
                 )
@@ -129,13 +145,10 @@ def test_source_owner_one_restores_on_destination_owner_zero():
 def test_async_nonowner_is_neutral_and_counts_no_io_bytes():
     backend = Backend()
     host = Host()
-    owned = store(backend, host, 1)
-    cfg = StorageRuntimeConfig.from_extra_config(
-        None, host_blocks=32, prefix_granularity=2
-    )
-    executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
+    owned = make_executor(backend, host, 1, extra_config=None)
+    executor = owned
     try:
-        keys, offsets, sizes = owned.page_ranges([(0, 3, "h", 0)])
+        keys, offsets, sizes = owned._page_ranges([(0, 3, "h", 0)])
         assert offsets == [None]
         executor.submit(StorageJob(1, "get", tuple(keys), tuple(offsets), tuple(sizes)))
         fact = completion(executor)
@@ -154,17 +167,14 @@ def test_async_nonowner_is_neutral_and_counts_no_io_bytes():
 def test_empty_owner_job_cannot_recover_an_unhealthy_backend():
     backend = Backend()
     backend.fail_query = True
-    owned = store(backend, Host(), 1)
-    cfg = StorageRuntimeConfig.from_extra_config(
-        None, host_blocks=32, prefix_granularity=2
-    )
-    executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
+    owned = make_executor(backend, Host(), 1, extra_config=None)
+    executor = owned
     try:
-        executor.submit(StorageJob(1, "query", (owned.object_key("h", 0, 0),), (), ()))
+        executor.submit(StorageJob(1, "query", (owned._object_key("h", 0, 0),), (), ()))
         assert completion(executor).success == (False,)
         before = executor.snapshot().health
         assert before.state != "healthy"
-        keys, offsets, sizes = owned.page_ranges([(0, 3, "h", 0)])
+        keys, offsets, sizes = owned._page_ranges([(0, 3, "h", 0)])
         executor.submit(StorageJob(2, "get", tuple(keys), tuple(offsets), tuple(sizes)))
         assert completion(executor).success == (True,)
         after = executor.snapshot().health
@@ -176,15 +186,12 @@ def test_empty_owner_job_cannot_recover_an_unhealthy_backend():
 
 def test_mixed_owner_results_keep_object_failures_in_logical_order():
     backend = Backend()
-    owned = store(backend, Host(), 0)
-    keys, offsets, sizes = owned.page_ranges(
+    owned = make_executor(backend, Host(), 0, extra_config=None)
+    keys, offsets, sizes = owned._page_ranges(
         [(0, 2, "absent-peer", 0), (0, 3, "absent-local", 0), (1, 1, "state", 0)]
     )
     backend.batch_put_from([keys[2]], bytearray(b"DATA"), [0], [4])
-    cfg = StorageRuntimeConfig.from_extra_config(
-        None, host_blocks=32, prefix_granularity=2
-    )
-    executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
+    executor = owned
     try:
         executor.submit(StorageJob(1, "get", tuple(keys), tuple(offsets), tuple(sizes)))
         fact = completion(executor)
@@ -201,14 +208,11 @@ def test_mixed_owner_results_keep_object_failures_in_logical_order():
 def test_backend_failure_and_cooldown_preserve_nonowner_neutrality():
     backend = Backend()
     backend.fail_get = True
-    owned = store(backend, Host(), 0)
-    keys, offsets, sizes = owned.page_ranges([(0, 2, "peer", 0), (0, 3, "local", 0)])
-    cfg = StorageRuntimeConfig.from_extra_config(
-        '{"async": {"recovery_interval_ms": 60000}}',
-        host_blocks=32,
-        prefix_granularity=2,
+    owned = make_executor(
+        backend, Host(), 0, extra_config='{"async": {"recovery_interval_ms": 60000}}'
     )
-    executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
+    keys, offsets, sizes = owned._page_ranges([(0, 2, "peer", 0), (0, 3, "local", 0)])
+    executor = owned
     try:
         for op_id in (1, 2):
             executor.submit(
