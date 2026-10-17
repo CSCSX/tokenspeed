@@ -182,6 +182,8 @@ def vllm_triton_kda_recoverssm_commit(
 
     gate_parameters supplies (A_log, dt_bias, lower_bound). Weight parameters
     use FP32; lower_bound=None selects softplus instead of the bounded gate.
+    The kernel reads these tensors directly so CUDA graph capture reuses the
+    caller-owned buffers.
     The configured window and head dimensions select CUDA-core or TF32x3
     Tensor Core recovery. Accepted lengths stay runtime GPU inputs.
     Return None after updating checkpoint_state.
@@ -238,12 +240,6 @@ def vllm_triton_kda_recoverssm_commit(
     block_k = triton.next_power_of_2(key_dim)
     grid = lambda meta: (triton.cdiv(meta["V"], meta["BV"]), batch, num_heads)
     a_log, dt_bias, lower_bound = gate_parameters
-    a_addresses = torch.tensor(
-        [a_log.data_ptr()], device=a_log.device, dtype=torch.int64
-    )
-    bias_addresses = torch.tensor(
-        [dt_bias.data_ptr()], device=dt_bias.device, dtype=torch.int64
-    )
     _commit_kda_state_kernel[grid](
         checkpoint_state,
         state_base_addrs,
@@ -278,8 +274,9 @@ def vllm_triton_kda_recoverssm_commit(
         0,
         correction_cache.shape[2],
         correction_cache.shape[0],
-        a_base_addrs_ptr=a_addresses,
-        bias_base_addrs_ptr=bias_addresses,
+        a_ptr=a_log,
+        bias_ptr=dt_bias,
+        USE_GATE_BASE_ADDRESSES=False,
         lower_bound=lower_bound,
         USE_LOWER_BOUND=lower_bound is not None,
         K=key_dim,
@@ -449,8 +446,9 @@ def batched_recoverssm_commit(
         0 if record_stamps is None else record_stamps.stride(0),
         capacity,
         slots,
-        a_base_addrs_ptr=descriptors[:, 6],
-        bias_base_addrs_ptr=descriptors[:, 7],
+        a_ptr=descriptors[:, 6],
+        bias_ptr=descriptors[:, 7],
+        USE_GATE_BASE_ADDRESSES=True,
         lower_bound=lower_bound,
         USE_LOWER_BOUND=lower_bound is not None,
         K=head_dim,

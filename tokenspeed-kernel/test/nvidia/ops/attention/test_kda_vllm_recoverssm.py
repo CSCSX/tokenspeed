@@ -935,14 +935,16 @@ def _check_gate_recovery(
 @pytest.mark.parametrize("width", [4, 16, 32])
 @pytest.mark.parametrize("raw_gate", [-20.0, 20.0])
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("captured", [False, True])
 def test_recoverssm_parallel_recovery_extreme_decays(
-    width: int, raw_gate: float, lower_bound: float | None
+    width: int, raw_gate: float, lower_bound: float | None, captured: bool
 ) -> None:
-    """Recover every prefix with near-unit or underflowing total decay."""
+    """Recover every prefix with extreme decays, eagerly or in a CUDA graph."""
     torch.manual_seed(1893)
     batch, heads, dim = width + 1, 8, 128
     state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
-    expected = state.clone()
+    initial_state = state.clone()
+    expected = initial_state.clone()
     u = torch.randn(batch, heads, width, dim, device="cuda") * 0.2
     kg = torch.empty(batch, heads, width, 2 * dim, device="cuda", dtype=torch.bfloat16)
     kg[..., :dim].normal_()
@@ -977,28 +979,42 @@ def test_recoverssm_parallel_recovery_extreme_decays(
     kg.masked_fill_(invalid, float("nan"))
     placeholder = torch.empty(0, device="cuda", dtype=torch.bfloat16)
     plan = [torch.empty_like(indices) for _ in range(4)]
-    vllm_triton_kda_recoverssm_commit(
-        placeholder,
-        placeholder,
-        placeholder,
-        checkpoint_state=state,
-        correction_cache=u,
-        kg_cache=kg,
-        state_indices=indices,
-        query_start_loc=starts,
-        num_accepted_tokens=counts,
-        commit_lens=plan[0],
-        final_state_indices=plan[1],
-        boundary_state_indices=plan[2],
-        boundary_recovery_lens=plan[3],
-        state_base_addrs=_device_addresses((state,)),
-        correction_cache_base_addrs=_device_addresses((u,)),
-        kg_cache_base_addrs=_device_addresses((kg,)),
-        spec_query_len=width,
-        record_metadata=None,
-        record_stamps=None,
-        gate_parameters=(a, bias, lower_bound),
-    )
+    state_addresses = _device_addresses((state,))
+    correction_addresses = _device_addresses((u,))
+    key_gate_addresses = _device_addresses((kg,))
+
+    def commit():
+        state.copy_(initial_state)
+        vllm_triton_kda_recoverssm_commit(
+            placeholder,
+            placeholder,
+            placeholder,
+            checkpoint_state=state,
+            correction_cache=u,
+            kg_cache=kg,
+            state_indices=indices,
+            query_start_loc=starts,
+            num_accepted_tokens=counts,
+            commit_lens=plan[0],
+            final_state_indices=plan[1],
+            boundary_state_indices=plan[2],
+            boundary_recovery_lens=plan[3],
+            state_base_addrs=state_addresses,
+            correction_cache_base_addrs=correction_addresses,
+            kg_cache_base_addrs=key_gate_addresses,
+            spec_query_len=width,
+            record_metadata=None,
+            record_stamps=None,
+            gate_parameters=(a, bias, lower_bound),
+        )
+
+    commit()
+    if captured:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            commit()
+        graph.replay()
     torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)
 
 
@@ -1106,8 +1122,9 @@ def test_recoverssm_aligned_checkpoint_states(
             ALIGN_MODE=True,
             BATCH=batch,
             LAUNCH_DEPENDENT_KERNELS=False,
-            a_base_addrs_ptr=a_addresses,
-            bias_base_addrs_ptr=bias_addresses,
+            a_ptr=a_addresses,
+            bias_ptr=bias_addresses,
+            USE_GATE_BASE_ADDRESSES=True,
             lower_bound=-5.0,
             USE_LOWER_BOUND=True,
             debug=True,

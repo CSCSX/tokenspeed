@@ -457,8 +457,9 @@ def _commit_kda_state_kernel(
     ALIGN_MODE: tl.constexpr,
     BATCH,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
-    a_base_addrs_ptr,
-    bias_base_addrs_ptr,
+    a_ptr,
+    bias_ptr,
+    USE_GATE_BASE_ADDRESSES: tl.constexpr,
     lower_bound,
     USE_LOWER_BOUND: tl.constexpr,
 ):
@@ -558,12 +559,15 @@ def _commit_kda_state_kernel(
     )
     if ALIGN_MODE or not USE_TENSOR_CORES:
         initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
-    a_ptr = tl.load(a_base_addrs_ptr + pid_l * stride_pointer_layer).to(
-        tl.pointer_type(tl.float32)
-    )
-    bias_ptr = tl.load(bias_base_addrs_ptr + pid_l * stride_pointer_layer).to(
-        tl.pointer_type(tl.float32)
-    )
+    # Batched recovery reads per-layer gate addresses from the descriptors.
+    # Single-layer recovery passes the gate tensors directly.
+    if USE_GATE_BASE_ADDRESSES:
+        a_ptr = tl.load(a_ptr + pid_l * stride_pointer_layer).to(
+            tl.pointer_type(tl.float32)
+        )
+        bias_ptr = tl.load(bias_ptr + pid_l * stride_pointer_layer).to(
+            tl.pointer_type(tl.float32)
+        )
     A = tl.exp(tl.load(a_ptr + pid_h))
     dt_bias = tl.load(bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0)
     if ALIGN_MODE:
