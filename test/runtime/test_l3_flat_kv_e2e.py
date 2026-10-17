@@ -241,6 +241,7 @@ class TestL3FlatKvRoundTripTest:
                 host_ratio=8 / plan.num_lcm_blocks,
             )
             cleanup.callback(executor.shutdown)
+            shared_backend = store is not None
             if store is None:
                 from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
 
@@ -250,7 +251,6 @@ class TestL3FlatKvRoundTripTest:
                     tp_size=1,
                     pp_size=1,
                 )
-                cleanup.callback(store.close)
             l3 = self._l3_executor(
                 executor,
                 store=store,
@@ -259,7 +259,9 @@ class TestL3FlatKvRoundTripTest:
             )
             # Memory's writer and reader share only the backend, never an arena
             # or Host allocation. Native workers additionally exit between phases.
-            cleanup.callback(l3.shutdown, timeout_s=5.0)
+            cleanup.callback(
+                l3._shutdown_workers if shared_backend else l3.close, timeout_s=5.0
+            )
             executor.host_storage.host_buffer.fill_(0)
             arena.buffer.fill_(0xEE)
             if phase == "put":
