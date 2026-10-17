@@ -15,5 +15,9 @@ Gate projection uses BF16 matrix operands and FP32 accumulation, then rounds
 once to BF16. Its reduction order can differ from a standalone GEMM.
 Numerical tests check an FP64 oracle with an FP32 accumulation-error bound
 and the final BF16 rounding interval. Exactly representable sums must match
-bit for bit. Recurrence, candidate record precision, and accepted-prefix
+bit for bit. Separate exact tests cover ties-to-even rounding, small terms,
+and every reduction position across tile boundaries. The error-bound tests
+use finite inputs away from overflow and subnormal ranges; they do not
+establish behavior for unrestricted IEEE inputs or universal cuBLAS identity.
+Recurrence, candidate record precision, and accepted-prefix
 ownership use the existing RecoverSSM contracts.
