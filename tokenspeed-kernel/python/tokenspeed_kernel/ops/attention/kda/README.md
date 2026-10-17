@@ -28,7 +28,9 @@ Each cache checkpoint retains FP32 correction, normalized key and decay for
 every accepted token. Appending a new token leaves older factors unchanged.
 Scalar reconstruction applies each decay multiplication before the fused
 correction/key update. Keep key normalization as a one-dimensional reduction
-with one warp; changing its layout can change FP32 rounding.
+with one warp; changing its layout can change FP32 rounding. Empty and nonempty
+histories share the dense-state load. A sequential recovery loop avoids extra
+unrolled-loop work when only part of a speculative window was accepted.
 
 The optional TF32x3 specialization forms decay-weighted keys during recovery.
 It preserves the same accepted interval but can round differently because it

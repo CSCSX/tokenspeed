@@ -1275,7 +1275,9 @@ def test_recoverssm_aligned_checkpoint_states(
 @pytest.mark.parametrize("capacity", [4, 8, 16, 32])
 @pytest.mark.parametrize("use_tensor_cores", [False, True])
 @pytest.mark.parametrize("captured", [False, True])
-@pytest.mark.parametrize("batch,lower_bound", [(4, -0.1), (8, -5.0), (32, None)])
+@pytest.mark.parametrize(
+    "batch,lower_bound", [(4, -0.1), (8, -5.0), (32, -5.0), (32, None)]
+)
 def test_buffered_recoverssm_multiple_rounds(
     width: int,
     capacity: int,

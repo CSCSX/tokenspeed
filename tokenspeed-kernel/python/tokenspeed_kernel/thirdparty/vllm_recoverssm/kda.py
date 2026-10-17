@@ -328,7 +328,8 @@ def _kda_recoverssm_verify_kernel(
             "invalid retained KDA interval",
         )
         write_idx = tl.load(history_write_indices_ptr + pid_b).to(tl.int64)
-        if history_len > 0:
+        # Scalar recovery shares the dense-state load for empty histories.
+        if not HISTORY_USE_TENSOR_CORES or history_len > 0:
             state = _recover_kda_history(
                 state_ptrs,
                 mask_state,
@@ -354,7 +355,7 @@ def _kda_recoverssm_verify_kernel(
                 stride_history_decay_dim,
                 max(8, triton.next_power_of_2(HISTORY_CAPACITY)),
                 HISTORY_USE_TENSOR_CORES,
-                4 if SPEC_QUERY_LEN == 4 else 1,
+                1,
             )
         else:
             state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
