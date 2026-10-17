@@ -49,6 +49,7 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.process import (
+    begin_process_shutdown,
     kill_process_tree,
     receive_ready_messages,
     register_child_failure_signals,
@@ -470,7 +471,8 @@ def run_data_parallel_controller_process(
     register_child_failure_signals()
 
     def request_shutdown(signum, frame):
-        raise SystemExit(0)
+        if begin_process_shutdown():
+            raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, request_shutdown)
     failed = False
@@ -507,7 +509,10 @@ def run_data_parallel_controller_process(
     finally:
         # The constructor may have started workers before it raised, so cleanup
         # belongs to this process even when no controller object was returned.
-        pipe_writer.close()
-        kill_process_tree(os.getpid(), include_parent=False)
-        if failed:
-            parent_process.send_signal(signal.SIGUSR1)
+        try:
+            begin_process_shutdown()
+        finally:
+            pipe_writer.close()
+            kill_process_tree(os.getpid(), include_parent=False)
+            if failed:
+                parent_process.send_signal(signal.SIGUSR1)

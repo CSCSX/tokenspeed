@@ -35,6 +35,8 @@ from typing import Any
 
 import psutil
 
+_process_shutdown_started = False
+
 
 def register_usr_signal():
     parent_pid = os.getppid()
@@ -45,11 +47,27 @@ def register_usr_signal():
     signal.signal(signal.SIGUSR1, signal_handler)
 
 
+def begin_process_shutdown() -> bool:
+    """Latch owner cleanup, returning whether this is the first shutdown request.
+
+    Failure and termination callbacks share this latch so a second worker's
+    notification cannot interrupt cleanup already unwinding the process.
+    """
+    global _process_shutdown_started
+    if _process_shutdown_started:
+        return False
+    _process_shutdown_started = True
+    return True
+
+
 def register_child_failure_signals():
-    """Unwind to the launcher that owns cleanup when a child reports failure."""
+    """Unwind once to the launcher that owns cleanup after a child failure."""
+    global _process_shutdown_started
+    _process_shutdown_started = False
 
     def signal_handler(sig, frame):
-        raise SystemExit(1)
+        if begin_process_shutdown():
+            raise SystemExit(1)
 
     signal.signal(signal.SIGUSR1, signal_handler)
     signal.signal(signal.SIGQUIT, signal_handler)

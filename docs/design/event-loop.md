@@ -656,5 +656,8 @@ Readiness detection only reports failure. It never joins or terminates workers,
 and introduces no shutdown deadline. The owning launcher stops the process
 tree. A DP controller also owns its workers if its constructor fails partway
 through startup; termination unwinds its cleanup before the controller exits.
-Child-failure signals unwind the launcher with a nonzero exit status. Signal
-callbacks do not log or enumerate processes; cleanup runs outside the callback.
+Child-failure signals unwind the launcher with a nonzero exit status. Failure,
+termination and constructor-error cleanup share one process-local shutdown
+latch: once cleanup starts, later worker notifications cannot interrupt it.
+Signal callbacks do not log or enumerate processes; cleanup runs outside the
+callback.

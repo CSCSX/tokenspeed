@@ -94,6 +94,7 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
 from tokenspeed.runtime.utils.process import (
+    begin_process_shutdown,
     kill_process_tree,
     receive_ready_messages,
     register_child_failure_signals,
@@ -151,7 +152,10 @@ class Engine(EngineBase):
                 port_args=self.port_args,
             )
         except BaseException:
-            self.shutdown()
+            try:
+                begin_process_shutdown()
+            finally:
+                self.shutdown()
             raise
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info

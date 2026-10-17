@@ -94,17 +94,133 @@ def _engine_startup_failure(signum, writer):
         writer.close()
 
 
+def _notify_failure(start, notified, signum, writer):
+    parent_pid = os.getppid()
+    writer.send({"status": "ready"})
+    assert start.wait(_TIMEOUT_S)
+    for sig in (signum, signal.SIGUSR1, signal.SIGQUIT):
+        os.kill(parent_pid, sig)
+    notified.set()
+    threading.Event().wait(_TIMEOUT_S * 10)
+
+
+def _repeated_failure_cleanup(writer):
+    from tokenspeed.runtime.entrypoints.engine import Engine
+
+    # A launcher installed after a failed instance must receive its own first
+    # failure, including when fork inherited a parent's latched state.
+    lifecycle_exitcodes = []
+    for _ in range(2):
+        register_child_failure_signals()
+        try:
+            os.kill(os.getpid(), signal.SIGUSR1)
+        except SystemExit as exc:
+            lifecycle_exitcodes.append(exc.code)
+
+    register_child_failure_signals()
+    triggers = [mp.Event(), mp.Event()]
+    notified = [mp.Event(), mp.Event()]
+    started = [
+        start_process_with_ready_pipe(
+            _notify_failure,
+            (trigger, sent, sig),
+            contextlib.nullcontext(),
+        )
+        for trigger, sent, sig in zip(
+            triggers, notified, (signal.SIGUSR1, signal.SIGQUIT)
+        )
+    ]
+    engine = Engine.__new__(Engine)
+    engine.llm = None
+    engine.tokenizer_manager = None
+    finished_cleanup = False
+    outcome = "failure signal was not delivered"
+    try:
+        for _, reader in started:
+            assert reader.poll(_TIMEOUT_S)
+            assert reader.recv() == {"status": "ready"}
+        try:
+            triggers[0].set()
+            threading.Event().wait(_TIMEOUT_S)
+        except SystemExit as exc:
+            outcome = exc.code
+        finally:
+            # The second real worker reports only after the owner is already
+            # unwinding. Its notifications must not bypass actual Engine cleanup.
+            triggers[1].set()
+            assert all(event.wait(_TIMEOUT_S) for event in notified)
+            engine.shutdown()
+            finished_cleanup = True
+    except SystemExit:
+        # Record the failed behavior before fallback cleanup can hide survivors.
+        outcome = "cleanup interrupted"
+    finally:
+        if finished_cleanup:
+            for proc, _ in started:
+                proc.join(_TIMEOUT_S)
+        writer.send(
+            {
+                "lifecycle_exitcodes": lifecycle_exitcodes,
+                "outcome": outcome,
+                "finished_cleanup": finished_cleanup,
+                "alive": [proc.is_alive() for proc, _ in started],
+                "exitcodes": [proc.exitcode for proc, _ in started],
+            }
+        )
+        for proc, reader in started:
+            if proc.is_alive():
+                proc.kill()
+            proc.join(_TIMEOUT_S)
+            reader.close()
+        writer.close()
+
+
+class _CleanupReadyWriter:
+    """A real ready connection with a gate for controlled peer notifications."""
+
+    def __init__(self, connection, cleanup_started, notifications_sent):
+        self.connection = connection
+        self.cleanup_started = cleanup_started
+        self.notifications_sent = notifications_sent
+
+    @property
+    def closed(self):
+        return self.connection.closed
+
+    def send(self, message):
+        self.connection.send(message)
+
+    def close(self):
+        self.connection.close()
+        self.cleanup_started.set()
+        assert self.notifications_sent.wait(_TIMEOUT_S)
+
+
 def _dp_model_start(
-    mode, startup_barrier, status_writer, server_args, port_args, writer
+    mode,
+    startup_barrier,
+    status_writer,
+    cleanup_started,
+    notifications_sent,
+    server_args,
+    port_args,
+    writer,
 ):
     rank = server_args.mapping.attn.dp_rank
     startup_barrier.wait(_TIMEOUT_S)
     status_writer.send((rank, os.getpid()))
     startup_barrier.wait(_TIMEOUT_S)
-    if mode == "failed_group" and rank == 0:
+    if mode in ("failed_group", "eof_then_failures") and rank == 0:
         # Failure while the other group is still in startup. A lingering thread
         # can hold the process alive even after its ready channel closes.
         writer.close()
+    if mode in ("terminate_then_failures", "eof_then_failures"):
+        assert cleanup_started.wait(_TIMEOUT_S)
+        for sig in (signal.SIGUSR1, signal.SIGQUIT):
+            os.kill(os.getppid(), sig)
+        startup_barrier.wait(_TIMEOUT_S)
+        if rank == 0:
+            notifications_sent.set()
     threading.Event().wait(_TIMEOUT_S * 10)
 
 
@@ -115,6 +231,10 @@ def _dp_controller(mode, result_writer, writer):
 
     status_reader, status_writer = mp.Pipe(duplex=False)
     startup_barrier = mp.Barrier(2)
+    cleanup_started = mp.Event()
+    notifications_sent = mp.Event()
+    if mode in ("terminate_then_failures", "eof_then_failures"):
+        writer = _CleanupReadyWriter(writer, cleanup_started, notifications_sent)
     worker_pids = []
 
     def observe_workers():
@@ -122,7 +242,7 @@ def _dp_controller(mode, result_writer, writer):
             if not status_reader.poll(_TIMEOUT_S):
                 return
             worker_pids.append(status_reader.recv()[1])
-        if mode == "terminate":
+        if mode in ("terminate", "terminate_then_failures"):
             os.kill(os.getpid(), signal.SIGTERM)
 
     args = ServerArgs(
@@ -130,7 +250,7 @@ def _dp_controller(mode, result_writer, writer):
         device="cpu",
         world_size=2,
         nprocs_per_node=2,
-        tensor_parallel_size=1,
+        attn_tp_size=1,
         data_parallel_size=2,
         dist_init_addr="127.0.0.1:28000",
     )
@@ -143,7 +263,14 @@ def _dp_controller(mode, result_writer, writer):
         patch.setattr(
             event_loop_module,
             "run_event_loop",
-            functools.partial(_dp_model_start, mode, startup_barrier, status_writer),
+            functools.partial(
+                _dp_model_start,
+                mode,
+                startup_barrier,
+                status_writer,
+                cleanup_started,
+                notifications_sent,
+            ),
         )
         try:
             controller_module.run_data_parallel_controller_process(args, ports, writer)
@@ -216,7 +343,29 @@ def test_engine_startup_signal_owns_worker_cleanup(signum):
         reader.close()
 
 
-@pytest.mark.parametrize("mode", ["failed_group", "terminate"])
+def test_repeated_failure_signals_cannot_interrupt_owner_cleanup():
+    proc, reader = start_process_with_ready_pipe(
+        _repeated_failure_cleanup, (), contextlib.nullcontext()
+    )
+    try:
+        assert reader.poll(_TIMEOUT_S), "owner did not finish repeated-signal cleanup"
+        result = reader.recv()
+        assert result["lifecycle_exitcodes"] == [1, 1]
+        assert result["outcome"] == 1
+        assert result["finished_cleanup"]
+        assert result["alive"] == [False, False]
+        assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
+        proc.join(_TIMEOUT_S)
+        assert proc.exitcode == 0
+    finally:
+        _stop_supervisor(proc)
+        reader.close()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["failed_group", "terminate", "eof_then_failures", "terminate_then_failures"],
+)
 def test_dp_partial_startup_owns_worker_cleanup(mode):
     result_reader, result_writer = mp.Pipe(duplex=False)
     proc, ready_reader = start_process_with_ready_pipe(
@@ -226,7 +375,7 @@ def test_dp_partial_startup_owns_worker_cleanup(mode):
     try:
         assert result_reader.poll(_TIMEOUT_S), "DP controller did not unwind startup"
         result = result_reader.recv()
-        if mode == "failed_group":
+        if mode in ("failed_group", "eof_then_failures"):
             assert "Scheduler process 0" in result["outcome"]
         else:
             assert result["outcome"] == 0
