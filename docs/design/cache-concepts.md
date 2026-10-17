@@ -843,7 +843,7 @@ Its responsibilities:
   never invalidates a usable L2 entry. An independent GET transaction fills
   Host before admission. Runtime workers receive immutable CPU byte geometry
   and no reference to Device buffers or layouts.
-  Object keys are `{tsl3v2-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{object_rank}|c0`;
+  Object keys are `{tsl3-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{object_rank}|c0`;
   `object_rank` is the TP rank for replicated groups and the payload replica
   rank (`tp_rank // shard_count`) for cyclic page groups;
   the trailing `c0` is the retired context-parallel shard id, kept literal

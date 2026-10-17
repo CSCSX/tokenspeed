@@ -150,9 +150,12 @@ and concurrency they intend to restore together.
 
 Retraction restores exact images through `HostCacheExecutor`; it never starts
 a fresh L3 preparation. State groups use the current fixed two-slot checkpoint
-contract. Runtime compatibility epoch 7 isolates this implementation from
+contract. Runtime compatibility epoch 2 isolates this implementation from
 earlier producer and storage contracts. A different runtime epoch starts a
 separate namespace even with the same weights; objects are not converted.
+The literal `tsl3-` prefix identifies the cache without a second version number;
+the namespace hash includes `runtime_compat` as its single compatibility epoch.
+Scheduling, queue and query-budget changes do not advance that epoch.
 
 The request has one soft deadline shared by query and GET. A soft timeout
 ends its wait and permits local admission; it does not retract the request,
@@ -326,6 +329,13 @@ miss before destination transfer submission. PUT `OBJECT_ALREADY_EXISTS`
 success. Other negative transfer errors, exceptions after native submission,
 and malformed transfer results do not prove retirement.
 
+`failures_retire` declares the backend's guarantee when a call raises or returns
+a malformed result: whether it has stopped accessing the supplied Host buffers.
+It is not an operation's success flag. Valid results carry their own `retired`
+fact, including safely retired misses. The in-process store guarantees retirement
+on failure; Mooncake does not infer it from an exceptional SDK return. QUERY
+accesses no supplied Host payload, so its failure does not retain payload buffers.
+
 Only confirmed missing or invalid GET objects enter C++'s bounded negative
 metadata. Health/queue/shutdown rejection, queued cancellation and backend
 exceptions carry no object evidence. They still complete the request's attempt
@@ -351,9 +361,9 @@ control processing until the backend returns; preparation soft timeouts do not
 bound or cancel it. A deletion failure prevents local cache clearing.
 Asynchronous administrative purge is outside the first-version scope.
 L1-only clear may proceed while Host-only storage I/O remains active.
-Shutdown drains device copies through DeviceHandle before closing L3 from the
+Shutdown attempts device-copy cleanup and L3 retirement independently from the
 control plane. L3 joins its workers with a deadline and then closes its backend;
-if either device drain fails or native retirement remains unknown it refuses backend close/Host deregistration
+if native retirement remains unknown it refuses backend close/Host deregistration
 and retains the store and Host allocation even if the runtime owner is collected.
 
 ## Initial scope and validation

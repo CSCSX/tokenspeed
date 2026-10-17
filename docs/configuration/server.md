@@ -1109,7 +1109,7 @@ warning with the requested and the capped size. An explicit
 startup, as is a share without room for a single LCM block.
 
 Each packed Host CacheBlock is one Mooncake object, keyed as
-`{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
+`{tsl3-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
 (the trailing `c0` is the retired context-parallel shard id, kept literal so
 objects written before its removal stay addressable).
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved

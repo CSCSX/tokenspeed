@@ -165,6 +165,7 @@ class MooncakeKvStore:
                 "to use --kvstore-storage-backend mooncake."
             ) from exc
 
+        # An exceptional SDK return does not prove that RDMA stopped using Host.
         self.failures_retire = False
         self.config = MooncakeStoreConfig.from_mapping(extra_config)
         self.store = MooncakeDistributedStore()

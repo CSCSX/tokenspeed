@@ -162,7 +162,7 @@ class TestStorageKeyTest:
 
         base = prefix()
         assert base == prefix()
-        assert base.startswith("tsl3v2-")
+        assert base.startswith("tsl3-")
         assert base != prefix(kv_producer="different-numerics")
         assert base != prefix(model_name="org_model")
         assert base != prefix(revision="def")
@@ -196,7 +196,8 @@ class TestStorageKeyTest:
             prefix(draft_attention_backend="fa4")
         )
         assert base != prefix(runtime_compat="previous-epoch")
-        assert base != prefix(runtime_compat="2")
+        assert base == prefix(runtime_compat="2")
+        assert base != prefix(runtime_compat="1")
         assert base != prefix(runtime_compat="3")
         assert base != prefix(runtime_compat="4")
         assert prefix(runtime_compat="1") == prefix(runtime_compat="1")
