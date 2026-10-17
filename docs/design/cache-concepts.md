@@ -396,11 +396,9 @@ freshly acquired pages. The scheduler asserts both when batching a plan's ops
 and the runtime refuses an op with nothing to copy; neither side dedups or
 invents an acknowledgement, because an op that never completes a copy would
 hold its tickets forever.
-A load-back cannot fail: every source is a published Host entry. The one
-transfer that may fall short is the pre-admission L3 prefetch
-(`PrefetchOperation`), which is acknowledged once with the number of leading
-prefix pages that landed (`PrefetchDone.landed_pages`); the scheduler
-publishes those and frees the rest.
+A load-back's source is a published Host entry. L3 may return partial or
+missing objects before admission; publication requires complete rows and proven
+native retirement. The existing group matcher chooses the reusable boundary.
 
 ### Retraction image: two Host tiers, one executor, one ownership translation
 
@@ -511,9 +509,12 @@ to other ranks is still acknowledged by this rank from an empty copy; the
 hooks' replica intersection completes the op only once every owner has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
-translation exact, so both Host tiers serve a KV-page-sharded engine; L3
-storage does not (`scheduler.md`), because an L3 key names content and
-position while ownership is decided at allocation.
+translation exact, so both Host tiers serve a KV-page-sharded engine. L3
+uses the same Host owner translation before Device admission. A sharded
+object key names the replica (`attention_tp_rank / shard_count`) rather than
+the writer's cyclic owner. Its bytes must be replicated within that owner
+subgroup; startup rejects head-partitioned fields in a page-sharded group.
+Replicated state groups keep the full rank in their keys.
 
 ## block vs. page
 
@@ -671,7 +672,10 @@ Its responsibilities:
   page-aligned boundary when the window's first row falls inside a block;
   the tail's blocks below that window stay holes). The Host tier runs the same two phases from the Device's
   full-page coverage and wins when it reaches further by a page or a longer
-  tail; the storage tier (L3) matches full pages only. The probe is bounded
+  tail. Storage (L3) uses the same boundary matcher with temporary object
+  hints: candidates are full pages, matching local `TailTable` entries and
+  the exact reusable request bound. It has no shared index for discovering
+  other nonaligned remote checkpoints. The probe is bounded
   in tokens, not pages, so a hit may end exactly at the bound. `Admit` then
   allocates, pins the hit prefix, and produces host→device `load_pairs`
   plus each group's fresh pages and `pages_to_copy`. **A table never keeps a
@@ -710,15 +714,10 @@ Its responsibilities:
   deliberately split so the probe can be taken once and the admission retried
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
-  `Admit` claims exactly the Device and Host entries the probe found: the
-  probe's third tier, `PrefixProbe::storage` (L3-registered keys beyond the
-  Host hit, matched by the same matchers over "Host-cached or registered"),
-  is never admitted. `PlanPrefetch` turns it into Host blocks first, prefix
-  page by prefix page — a page is planned for every group's rows or not at
-  all, so a finer `block_granularity` group that runs out of Host pages
-  mid-page never leaves a half-fetched prefix page — and the request waits in
-  `fsm::Prefetching` for the fill (see `scheduler.md` §1) before it is admitted
-  as an ordinary Host hit.
+  `Admit` claims exactly the published Device and Host entries the probe
+  found. Remote hints exist only within `ReserveStoragePrefix`; they are
+  matched and pinned in a Host-only transaction, never exposed as resident
+  data by a local probe. See [asynchronous L3](async-l3-cache.md).
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history pages
   are reused, and of a State group's checkpoints only the one at exactly the
   prompt end counts (`PrefixProbe::state_at_prompt_end`, claimed as slot 0
@@ -839,24 +838,14 @@ Its responsibilities:
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
-  CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
-  beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
-  Host CacheBlock. That L3 backup is asynchronous, so `WriteBackDone` /
-  `LoadBackDone` are intersected across every cache-owning rank
-  (attention TP, then CP, then PP; not DP) before `CompleteWriteBack`: a
-  finished local backup must not `CacheHostBlock` on one mirrored
-  scheduler while a CP/PP peer still has the op pending. A truncated
-  `batch_is_exist` reply is a failed put, not an implicit success:
-  `WriteBackDone` follows only a completed backup. A backup future that
-  fails is MAX-reduced with the replica idle/work flag before the
-  completion gather so every rank raises together. Every rank
-  stays in every replica-group gather even when an earlier intersection
-  is empty, so a peer that is ready on PP is not left unmatched. A later Host
-  miss that is known to exist in L3 is filled into Host **before** the
-  request is admitted (`PrefetchOperation`, `fsm::Prefetching`); the
-  admission that follows runs the ordinary H2D load against real Host
-  entries.
-  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`;
+  CacheBlock IDs. D2H ACKs are replica-agreed and immediately publish Host
+  entries. Independent PUT tickets pin those Host sources at dispatch; failure
+  never invalidates a usable L2 entry. An independent GET transaction fills
+  Host before admission. Runtime workers receive immutable CPU byte geometry
+  and no reference to Device buffers or layouts.
+  Object keys are `{tsl3v2-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{object_rank}|c0`;
+  `object_rank` is the TP rank for replicated groups and the payload replica
+  rank (`tp_rank // shard_count`) for cyclic page groups;
   the trailing `c0` is the retired context-parallel shard id, kept literal
   (as is the `cp_size: 1` entry of the hashed namespace) so objects written
   before its removal stay addressable until the next deliberate key-format
@@ -947,8 +936,8 @@ Its responsibilities:
   `WriteBackDone` stay TP/CP/PP: DP ranks hold different sequences.
   Flush includes DP because object keys omit DP rank. Remote L3 deletion
   is then an error-returning phase (no
-  raise into the event loop): each rank waits in-flight Host-to-store
-  backups, `remove_by_prefix`, and MIN-reduces that result. Only then
+  raise into the event loop): each rank requires idle storage and runs
+  `remove_by_prefix`, and MIN-reduces that result. Only then
   does each rank call `ClearCache`. A failed probe, a failed delete, or
   a failed clear keeps Device/Host (and the previous checkpoint, on a
   weight update) intact and the caller retries; a split flush would
@@ -962,7 +951,7 @@ Its responsibilities:
   the previous checkpoint. An explicit new `weight_version` with
   `flush_cache=False` is rejected before the GPU load when L3 is on:
   Device/Host still hold the previous checkpoint, and D2H copies not yet
-  in `_backup_futures` would later be stored under the new namespace.
+  published to Host would later be stored under the new namespace.
   Flushed L3 updates require an explicit `weight_version`. Minting
   `{current}-uN` from the old label is not checkpoint-specific: two
   servers that start at `default` and load different weights would both
@@ -982,47 +971,14 @@ Its responsibilities:
   fleet-wide wipe is an operator flush of every instance. A
   `batch_exists` hit is not a lease: the prefetch that follows lands what
   is still there.
-  Cross-instance reuse probes `batch_exists` before `submit_requests`, then
-  MIN-reduces existence across every cache-owning rank in the DP replica
-  (attention TP, then CP, then PP; not across DP) and
-  `register_storage_keys` (the hits only; the prefetch's ACK forgets what did
-  not land). The
-  scheduler's L3 key shadow is bounded to Host page capacity. A single
-  registration keeps the earliest contiguous prefix keys so prefix-closed
-  matchers still hit, even when sequential write-backs already filled the
-  shadow with this prompt's suffix; later unrelated keys LRU-evict older
-  prompts. Unregister removes keys from both the live set and the LRU
-  order deque so a vanished object cannot accumulate tombstones
-  while the live set stays below capacity. Submit-time registration
-  restores keys that were dropped from the shadow.
-  That probe is not a lease: an object can vanish between `batch_exists`
-  and the fetch. So the fetch happens before admission, where a miss costs
-  nothing but the fetch: when a `Submitted` request's probe shows registered
-  keys beyond its Host hit (at least `l3_prefetch_min_pages` whole prefix
-  pages; fewer are computed), the scheduler acquires Host blocks for
-  them, emits one `Cache.PrefetchOp` (rows in prefix-page order with their
-  `page_indices`) and parks the request in `Prefetching` — no Device pages,
-  no request-pool row, no head of line, never a victim, abortable. The
-  runtime's Host transfer lane fetches the rows in order, stops at the first
-  page that fails or at its timeout, MIN-reduces the landed prefix across the
-  replica every round, and acknowledges once with
-  `Cache.PrefetchDoneEvent(op_id, landed_pages)`. The scheduler publishes the
-  landed pages as Host entries (pinned by the request until its admission
-  claims them), frees the rest, forgets the unlanded keys from the shadow (a
-  later `batch_exists` hit may register them again; there is no blacklist),
-  and returns the request to `Submitted` at its original queue position. Its
-  admission is then a plain Host hit: no forward is ever skipped or retracted
-  for L3, and no admission load-back can miss. The D role probes the Device
-  alone and never prefetches. Existence and prefetch are skipped when L3 is
-  unset: Host-only and `--disable-kvstore` admission must not hash prefixes
-  or copy `group_keys` for a storage index that does not exist. CI covers this
-  path with the in-process `memory` backend (scheduler tests register keys /
-  evict Host then assert a `PrefetchOp` precedes admission, and the CUDA
-  runtime suite round-trips packed Host bytes through `batch_put_from` / Host
-  wipe / `batch_get_into`) plus a live `mooncake_master` job that drives
-  `MooncakeKvStore` over TCP / `P2PHANDSHAKE`, matching SGLang HiCache /
-  vLLM `MooncakeStoreConnector` on packed CacheBlocks rather than split
-  K/V pages.
+  Cross-instance reuse uses independent asynchronous query/GET/PUT tickets.
+  The scheduler applies transient query hints through the group matchers,
+  including sparse state checkpoints, and reserves Host destinations before
+  Device admission. Only fully successful, replica-agreed, retired GET rows
+  are published. Local Host publication does not prove remote existence.
+  Waiting/ready holds, soft deadlines and pressure admission are owned by the
+  C++ cache subsystem; CPU workers receive only Host byte ranges and keys.
+  See [asynchronous L3](async-l3-cache.md) for the transaction invariants.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.
@@ -1038,15 +994,15 @@ Its responsibilities:
   descriptors of boundaries with no cached child. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
-For L3 write-through, each lane carries only its own hashed Host destinations.
-Its CUDA completion starts those backups, and its scheduler ACK waits until
-those puts finish; a different lane completing cannot release its pages.
+D2H ACKs publish Host entries and release Device sources as soon as the copy
+lands. L3 backup candidates are nonowning; PUT dispatch independently pins
+resident Host sources until all cache owners report native retirement.
 
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`
 while each manager may use a smaller cache-page token count.
-`enable_l3_storage` is a required argument so Host-hit tagging of L3 keys
-cannot be skipped by a silent default.
+`enable_l3_storage` is explicit; ordinary Device/Host matching does not
+claim remote objects as resident data.
 
 ### `AdmissionPlanner` (`cache_admission.cpp`, anonymous namespace)
 
@@ -1413,11 +1369,14 @@ in its source's bucket (`AcquireHostBlocks(group_ids, buckets)`,
 a batch. A Host block's residue is therefore its owner exactly as a Device
 block's is, and one `owned_local_pages` translation serves both ends of every
 row: a rank keeps the rows it owns and translates both ids to local pages, a
-replicated group (`D = 1`) owns every row. L3 storage stays refused with a
-sharded group (`SchedulerConfig::Validate`): an L3 key names content, group,
-offset and `tp_rank`, but which rank owns a block is decided at allocation,
-so a rank probing `batch_exists` can only answer for the blocks it owned when
-the object was written. A residue-constrained acquisition can fail while
+replicated group (`D = 1`) owns every row. L3 probes replica-stable keys on
+all owners, then reads or writes only the Host blocks this rank owns. A rank
+with no local bytes reports neutral success and proven retirement, performs
+no native I/O and cannot act as a health recovery probe. The all-owner
+intersection still requires the actual owner's success before publication.
+L3 reservations distribute successive logical pages across cyclic owners;
+Device admission later preserves each restored Host block's residue.
+A residue-constrained acquisition can fail while
 other buckets have room; a restore then waits like any readmission, and the
 balanced allocator keeps ordinary admissions within one block per bucket, so
 the imbalance a restore sees is bounded by what its own victim table

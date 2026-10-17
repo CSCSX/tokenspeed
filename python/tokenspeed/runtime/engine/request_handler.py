@@ -207,6 +207,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         *,
         tokenizer_kwargs: Mapping[str, object],
+        l3,
         pause_controller=None,
         memory_controller=None,
         device=None,
@@ -223,6 +224,7 @@ class RequestHandler:
         # data plane so it is ordered against forwards. The scheduler worker
         # passes the handle in; None elsewhere (e.g. unit tests).
         self._device = device
+        self._l3 = l3
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -514,7 +516,7 @@ class RequestHandler:
 
         Device/Host still hold KV from the previous checkpoint until a
         successful ``flush_cache``. Switching the Mooncake prefix first
-        lets later D2H copies (not yet in ``_backup_futures``) land under
+        lets later D2H copies (not yet submitted to storage) land under
         the new namespace, and lets Admit reuse the stale local indexes
         as if they belonged to the new weights.
         """
@@ -699,16 +701,13 @@ class RequestHandler:
         return self.clear_cache_fn is not None and self.clear_cache_fn()
 
     def _delete_l3_namespace(self) -> bool:
-        device = self._device
-        if device is None:
-            return True
-        return bool(device.delete_l3_namespace())
+        return self._l3 is None or self._l3.delete_namespace()
 
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every rank that shares this flush.
 
-        Attention TP, then PP (same order as
-        ``EventLoop._converge_l3_exists``), then attention DP. Exists and
+        Attention TP, then PP (the cache hooks' replica order), then
+        attention DP. Storage completions and
         WriteBackDone omit DP because those ranks hold different sequences.
         Flush includes DP: ``storage_object_key`` has no DP rank, so a
         replica that is clearable must not ``remove_by_prefix`` while
@@ -764,7 +763,8 @@ class RequestHandler:
         if version is None:
             return True, msg
         self.server_args.weight_version = str(version)
-        self._device.set_l3_weight_version(str(version))
+        if self._l3 is not None:
+            self._l3.set_weight_version(str(version))
         return True, msg
 
     def handle_generate_request(

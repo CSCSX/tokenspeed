@@ -54,10 +54,10 @@ class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def execute(self, execution_plan, planned):
+    def execute(self, execution_plan, planned, *, cache_ops):
         # The harness plans no device work and no batch; trace anything that
         # does appear rather than fail on a missing attr.
-        if execution_plan.pages_to_zero or execution_plan.cache or planned:
+        if execution_plan.pages_to_zero or cache_ops or planned:
             self._trace.append("execute")
         return None
 
@@ -73,6 +73,7 @@ class _EventLoopHarness:
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
         self._device = _DeviceHarness(self.trace)
+        self._l3 = None
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             None,
@@ -80,6 +81,8 @@ class _EventLoopHarness:
             attn_tp_cpu_group=None,
             pp_size=1,
             pp_cpu_group=None,
+            config=None,
+            metrics=None,
         )
         self.output_processor = SimpleNamespace(
             rid_to_state={}, finish_scheduler_aborted_requests=lambda aborts: None
@@ -92,7 +95,7 @@ class _EventLoopHarness:
         )
         self._cache_hooks = SimpleNamespace(
             poll_ready_events=lambda: (self.trace.append("poll_cache"), [])[1],
-            count_plan_ops=lambda _plan: self.trace.append("count_cache"),
+            count_ops=lambda _plan: self.trace.append("count_cache"),
         )
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
@@ -182,6 +185,16 @@ def test_abort_uses_the_output_marker() -> None:
     )
     loop = SimpleNamespace(
         output_processor=output,
+        _l3_hooks=L3CacheHooks(
+            None,
+            None,
+            config=None,
+            attn_tp_size=1,
+            attn_tp_cpu_group=None,
+            pp_size=1,
+            pp_cpu_group=None,
+            metrics=None,
+        ),
     )
 
     EventLoop._request_abort_or_mark(
@@ -192,6 +205,56 @@ def test_abort_uses_the_output_marker() -> None:
     )
 
     assert calls == [("request-0", {"notify_client": True})]
+
+
+def test_cancelled_waiter_releases_features_without_a_future_forward() -> None:
+    from multiprocessing import shared_memory
+
+    import torch
+
+    from tokenspeed.runtime.engine.generation_output_processor import (
+        OutputProcesser,
+        RequestState,
+    )
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
+    from tokenspeed.runtime.multimodal.inputs import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+    from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    handle = ShmTensorHandle.publish(torch.tensor([1.0, 2.0]))
+    inputs = MultimodalInputs(
+        mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature_shm=handle)]
+    )
+    state = RequestState(
+        [1, 2],
+        SamplingParams(max_new_tokens=1, ignore_eos=True),
+        False,
+        None,
+        computes_prompt_logprobs=False,
+        multimodal_inputs=inputs,
+    )
+    messages = []
+    output = OutputProcesser(
+        send_to_tokenizer=messages.append,
+        metrics=EngineMetrics(labels={}, enabled=False, reporters=[]),
+    )
+    try:
+        output.register("waiting", state)
+        output.mark_abort("waiting")
+        # L3 cancellation finishes an unadmitted request without another
+        # forward to consume its features or run commit-side cleanup.
+        output.reap_finished_orphan("waiting", state)
+        assert "waiting" not in output.rid_to_state
+        assert not inputs.has_pending_shm_features()
+        assert messages == []
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=handle.shm_name)
+    finally:
+        handle.release()
 
 
 @pytest.mark.parametrize("exit_kind", ["sigterm", "return", "system_exit"])
@@ -346,6 +409,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     assert parent_signals == []
     assert pipe_writer.closed
     assert len(pipe_writer.messages) == 1
+    assert pipe_writer.closed
     assert pipe_writer.messages[0]["status"] == "ready"
     assert signal_calls[0][0] == signal.SIGTERM
     assert callable(signal_calls[0][1])

@@ -21,9 +21,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
-import time
+import textwrap
 import types
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -44,8 +45,8 @@ from tokenspeed.runtime.cache.l3.backend import (
     storage_key_prefix,
     storage_object_key,
 )
-from tokenspeed.runtime.cache.l3.executor import L3HostStore
 from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
+from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeKvStore,
     MooncakeStoreConfig,
@@ -73,6 +74,52 @@ class _FakeHost:
         del group_index
         offset = (int(block_id) - 1) * self._payload_size
         return offset, self._payload_size
+
+
+class TestMinimalHostStoreTest:
+    def test_roundtrip_without_site_packages(self):
+        # The native master CI installs no inference runtime dependencies.
+        # -S also excludes any numerical packages present in this interpreter.
+        source = textwrap.dedent("""
+            from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+            from tokenspeed.runtime.cache.l3.host_store import L3HostStore
+
+            class Host:
+                def __init__(self):
+                    self.host_buffer = bytearray(b"tail")
+
+                def host_block_range(self, group_id, block_id):
+                    return 0, 4
+
+            host = Host()
+            store = L3HostStore(
+                MemoryKvStore(), host, key_prefix="minimal", rank=0, ownership=None
+            )
+            pages = [(0, 1, "prefix", 0)]
+            keys, offsets, sizes = store.page_ranges(pages)
+            assert store.backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            host.host_buffer[:] = bytes(4)
+            assert store.backend.batch_get_into_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert host.host_buffer == b"tail"
+            """)
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", source],
+            env={
+                **os.environ,
+                "PYTHONPATH": os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "python")
+                ),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 class TestStorageKeyTest:
@@ -108,25 +155,30 @@ class TestStorageKeyTest:
                 "draft_attention_backend": "",
                 "skip_softmax_threshold": 0.0,
                 "eagle3_layers_to_capture": [],
+                "kv_producer": "resolved-numerics",
             }
             values.update(overrides)
             return storage_key_prefix(**values)
 
         base = prefix()
-        assert (base) == (prefix())
-        assert base.startswith("tsl3v1-")
-        assert (base) != (prefix(model_name="org_model"))
-        assert (base) != (prefix(revision="def"))
-        assert (base) != (prefix(weight_version="v2"))
-        assert (base) != (prefix(cache_signature="other"))
-        assert (base) != (prefix(pipeline_rank=1))
-        assert (base) != (prefix(attn_tp_size=8))
-        assert (prefix(attn_tp_size=8)) != (prefix(attn_tp_size=16))
-        assert (base) != (prefix(draft_model="org/draft"))
-        assert (base) != (prefix(cache_quantization='{"quantization":"fp8"}'))
-        assert (base) != (prefix(model_overrides={"rope_theta": 10000.0}))
-        assert (prefix(model_overrides={"rope_theta": 10000.0})) != (
-            prefix(model_overrides={"rope_scaling": {"type": "linear"}})
+        assert base == prefix()
+        assert base.startswith("tsl3v2-")
+        assert base != prefix(kv_producer="different-numerics")
+        assert base != prefix(model_name="org_model")
+        assert base != prefix(revision="def")
+        assert base != prefix(weight_version="v2")
+        assert base != prefix(cache_signature="other")
+        assert base != prefix(pipeline_rank=1)
+        assert base != prefix(attn_tp_size=8)
+        assert prefix(attn_tp_size=8) != prefix(attn_tp_size=16)
+        assert base != prefix(draft_model="org/draft")
+        assert base != prefix(cache_quantization='{"quantization":"fp8"}')
+        assert base != prefix(model_overrides={"rope_theta": 10000.0})
+        assert prefix(model_overrides={"rope_theta": 10000.0}) != prefix(
+            model_overrides={"rope_scaling": {"type": "linear"}}
+        )
+        assert prefix(model_overrides={"b": 2, "a": 1}) == prefix(
+            model_overrides={"a": 1, "b": 2}
         )
         assert (prefix(model_overrides={"b": 2, "a": 1})) == (
             prefix(model_overrides={"a": 1, "b": 2})
@@ -143,12 +195,13 @@ class TestStorageKeyTest:
         assert (prefix(draft_attention_backend="fa3")) != (
             prefix(draft_attention_backend="fa4")
         )
-        assert (base) != (prefix(runtime_compat="2"))
-        assert (prefix(runtime_compat="1")) == (prefix(runtime_compat="1"))
-        assert (base) != (prefix(skip_softmax_threshold=1e-2))
-        assert (prefix(skip_softmax_threshold=0.0)) == (
-            prefix(skip_softmax_threshold=0.0)
-        )
+        assert base != prefix(runtime_compat="previous-epoch")
+        assert base != prefix(runtime_compat="2")
+        assert base != prefix(runtime_compat="3")
+        assert base != prefix(runtime_compat="4")
+        assert prefix(runtime_compat="1") == prefix(runtime_compat="1")
+        assert base != prefix(skip_softmax_threshold=0.01)
+        assert prefix(skip_softmax_threshold=0.0) == prefix(skip_softmax_threshold=0.0)
         assert (base) != (prefix(eagle3_layers_to_capture=[2, 16, 29]))
         assert (prefix(eagle3_layers_to_capture=[2, 16, 29])) != (
             prefix(eagle3_layers_to_capture=[1, 16, 29])
@@ -160,6 +213,8 @@ class TestStorageKeyTest:
             prefix(eagle3_layers_to_capture="2,16,29")
         with pytest.raises((TypeError)):
             prefix(model_overrides=["rope_theta"])
+        with pytest.raises(ValueError):
+            prefix(kv_producer="")
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -1419,44 +1474,55 @@ class TestMemoryKvStoreTest:
 
 
 class TestL3HostStoreTest:
-    def test_backups_and_prefetches_packed_pages(self):
+    def test_resolves_packed_pages_for_byte_store_roundtrip(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
         pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
-        assert (l3.exists(pages)) == ([True])
+        keys, offsets, sizes = l3.page_ranges(pages)
+        assert backend.batch_put_from_result(
+            keys, host.host_buffer, offsets, sizes
+        ).success == (True,)
+        assert backend.batch_exists(keys) == [True]
         host.host_buffer[:8] = b"\x00" * 8
-        assert (l3.prefetch(pages)) == ([True])
+        assert backend.batch_get_into_result(
+            keys, host.host_buffer, offsets, sizes
+        ).success == (True,)
         assert (host.host_buffer[:8]) == (b"abcdefgh")
-        groups, hashes, offsets = l3.present_keys(
-            [0, 0], ["h0", "miss"], [0, 0], exists=None
-        )
-        assert (groups) == ([0])
-        assert (hashes) == (["h0"])
-        assert (offsets) == ([0])
-        assert (l3.present_keys([0], ["h0"], [0], exists=[False])) == (([], [], []))
+        assert backend.batch_exists([keys[0], l3.object_key("miss", 0, 0)]) == [
+            True,
+            False,
+        ]
         l3.close()
 
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
         pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
+        keys, offsets, sizes = l3.page_ranges(pages)
+        assert backend.batch_put_from_result(
+            keys, host.host_buffer, offsets, sizes
+        ).success == (True,)
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
-        assert (old_key) == (l3.object_key("h0", 0, 0))
-        assert (l3.exists(pages)) == ([False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
-        assert (restarted.object_key("h0", 0, 0)) == (old_key)
-        assert (restarted.exists(pages)) == ([False])
+        assert old_key == l3.object_key("h0", 0, 0)
+        assert backend.batch_exists(keys) == [False]
+        restarted = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
+        assert restarted.object_key("h0", 0, 0) == old_key
+        assert restarted.backend.batch_exists([restarted.object_key("h0", 0, 0)]) == [
+            False
+        ]
 
     def test_clear_returns_false_when_remote_delete_fails_and_keeps_the_prefix(self):
         backend = mock.Mock()
         backend.remove_by_prefix.return_value = False
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
+            backend,
+            _FakeHost(b"abcdefgh", size=64),
+            key_prefix="m",
+            rank=1,
+            ownership=None,
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1468,7 +1534,11 @@ class TestL3HostStoreTest:
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
+            backend,
+            _FakeHost(b"abcdefgh", size=64),
+            key_prefix="m",
+            rank=1,
+            ownership=None,
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1479,101 +1549,23 @@ class TestL3HostStoreTest:
     def test_set_key_prefix_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, ownership=None)
         pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
+        keys, offsets, sizes = l3.page_ranges(pages)
+        assert backend.batch_put_from_result(
+            keys, host.host_buffer, offsets, sizes
+        ).success == (True,)
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
         l3.set_key_prefix("v2")
         assert (old_key) != (l3.object_key("h0", 0, 0))
-        assert (l3.exists(pages)) == ([False])
-        assert (l3.backup(pages)) == ([True])
+        keys, offsets, sizes = l3.page_ranges(pages)
+        assert backend.batch_exists(keys) == [False]
+        assert backend.batch_put_from_result(
+            keys, host.host_buffer, offsets, sizes
+        ).success == (True,)
         assert l3.object_key("h0", 0, 0).startswith("v2_")
         assert (backend.batch_exists([old_key])) == ([False])
-
-
-class TestL3StoreStatsTest:
-    """Per-op exists/GET/PUT counters and latency on ``L3HostStore``."""
-
-    def test_backup_prefetch_and_exists_record_calls_keys_bytes(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
-
-        assert (l3.backup(pages)) == ([True, True])
-        assert (l3.prefetch(pages)) == ([True, True])
-        assert (l3.exists(pages + [(0, 3, "miss", 0)])) == ([True, True, False])
-
-        stats = l3.stats()
-        assert (stats.put.calls) == (1)
-        assert (stats.put.keys) == (2)
-        assert (stats.put.ok_keys) == (2)
-        # Transferred volume is reported as successful payload bytes.
-        assert (stats.put.payload_bytes) == (16)
-        assert (stats.put.total_seconds) >= (0.0)
-        assert (stats.get.calls) == (1)
-        assert (stats.get.keys) == (2)
-        assert (stats.get.ok_keys) == (2)
-        assert (stats.get.payload_bytes) == (16)
-        assert (stats.exists.calls) == (1)
-        assert (stats.exists.keys) == (3)
-        assert (stats.exists.ok_keys) == (2)
-        # An exists probe carries no payload bytes.
-        assert (stats.exists.payload_bytes) == (0)
-        l3.close()
-
-    def test_slow_get_and_put_latencies_are_measured(self):
-        class SlowStore(MemoryKvStore):
-            def batch_put_from(self, keys, host_buffer, offsets, sizes):
-                time.sleep(0.05)
-                return super().batch_put_from(keys, host_buffer, offsets, sizes)
-
-            def batch_get_into(self, keys, host_buffer, offsets, sizes):
-                time.sleep(0.05)
-                return super().batch_get_into(keys, host_buffer, offsets, sizes)
-
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0)
-        pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
-        assert (l3.prefetch(pages)) == ([True])
-
-        stats = l3.stats()
-        assert (stats.put.total_seconds) >= (0.04)
-        assert (stats.get.total_seconds) >= (0.04)
-        l3.close()
-
-    def test_failed_put_records_zero_ok_keys_and_bytes(self):
-        class FailingStore(MemoryKvStore):
-            def batch_put_from(self, keys, host_buffer, offsets, sizes):
-                return [False] * len(keys)
-
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0)
-        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
-
-        assert (l3.backup(pages)) == ([False, False])
-
-        stats = l3.stats()
-        assert (stats.put.calls) == (1)
-        assert (stats.put.keys) == (2)
-        assert (stats.put.ok_keys) == (0)
-        assert (stats.put.payload_bytes) == (0)
-        l3.close()
-
-    def test_stats_snapshot_is_detached_from_later_calls(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=0)
-        pages = [(0, 1, "h0", 0)]
-
-        assert (l3.backup(pages)) == ([True])
-        snapshot = l3.stats()
-        assert (l3.backup(pages)) == ([True])
-        assert (snapshot.put.calls) == (1)
-        assert (l3.stats().put.calls) == (2)
-        l3.close()
 
 
 class TestFactoryTest:
@@ -1690,12 +1682,26 @@ class TestMooncakeKvStoreTest:
 
             def batch_put_from(self, keys, ptrs, sizes):
                 del ptrs, sizes
-                return [-1] * len(keys)
+                return [-705] * len(keys)
 
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = _Store()
         host = SimpleNamespace(data_ptr=lambda: 100)
         assert (adapter.batch_put_from(["k"], host, [0], [8])) == ([True])
+
+    def test_failed_put_cannot_be_retired_by_an_exists_recheck(self):
+        calls = []
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: calls.append("exists") or [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-800] * len(keys),
+        )
+        result = adapter.batch_put_from_result(
+            ["k"], SimpleNamespace(data_ptr=lambda: 100), [0], [8]
+        )
+        assert result.success == (False,)
+        assert not result.retired
+        assert calls == ["exists"]
 
     def test_truncated_exists_does_not_ack_unuploaded_keys(self):
         class _Store:
@@ -1736,6 +1742,27 @@ class TestMooncakeKvStoreTest:
             [False, False]
         )
 
+    def test_object_evicted_after_exists_is_a_retired_miss(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [1] * len(keys),
+            batch_get_into=lambda keys, ptrs, sizes: [-704, 8],
+        )
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        assert adapter.batch_exists(["evicted", "resident"]) == [True, True]
+        result = adapter.batch_get_into_result(
+            ["evicted", "resident"], host, [0, 8], [8, 8]
+        )
+        assert result.success == (False, True)
+        assert result.retired
+        assert result.object_failures == (True, False)
+        adapter.store.batch_get_into = lambda keys, ptrs, sizes: [-704, -800]
+        result = adapter.batch_get_into_result(
+            ["evicted", "unknown"], host, [0, 8], [8, 8]
+        )
+        assert not result.retired
+        assert result.object_failures == (True, False)
+
     def test_truncated_get_into_is_rejected(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = SimpleNamespace(batch_get_into=lambda keys, ptrs, sizes: [1])
@@ -1752,6 +1779,9 @@ class TestMooncakeKvStoreTest:
         assert (adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])) == (
             [False, True]
         )
+        result = adapter.batch_get_into_result(["k0", "k1"], host, [0, 8], [8, 8])
+        assert result.retired
+        assert result.object_failures == (True, False)
         adapter.store = SimpleNamespace(
             batch_get_into=lambda keys, ptrs, sizes: [0, -1]
         )
@@ -1822,7 +1852,25 @@ class TestMooncakeKvStoreTest:
                 tp_size=4,
                 pp_size=1,
             )
-        assert (captured["segment"]) == (2 * 1024**3)
+        assert captured["segment"] == 2 * 1024**3
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            MooncakeKvStore(
+                dict(extra, global_segment_size=0),
+                host_buffer=host,
+                tp_size=8,
+                pp_size=1,
+            )
+            assert captured["segment"] == 0
+            for size in (-1, 1):
+                with pytest.raises(ValueError, match="too small"):
+                    MooncakeKvStore(
+                        dict(extra, global_segment_size=size),
+                        host_buffer=host,
+                        tp_size=8,
+                        pp_size=1,
+                    )
 
 
 if __name__ == "__main__":

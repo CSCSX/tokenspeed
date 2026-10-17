@@ -34,6 +34,9 @@ import zmq
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
+from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.factory import build_l3_cache
+from tokenspeed.runtime.cache.l3.metrics import L3Metrics
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -60,6 +63,7 @@ from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
     advance_scheduler,
+    cache_ops_from_plan,
     engram_context_len,
     input_logprob_plan_for_forward,
     make_config,
@@ -160,6 +164,7 @@ def scheduler_config_from_args(
     server_args,
     specs,
     *,
+    l3_config: L3AsyncConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
     decode_input_tokens: int,
@@ -167,16 +172,14 @@ def scheduler_config_from_args(
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
 ):
-    """The C++ scheduler's config from the server arguments and the device build.
-
-    One place turns the two into ``make_config``'s arguments, so the knobs an
-    engine does not have -- the L3 prefetch threshold without an L3 store --
-    are translated here, not left as None for the binding.
+    """Build scheduler config from Device facts and separate Host-storage limits.
 
     Args:
         server_args: The resolved server arguments.
         specs: The ``DeviceSpecs`` of the built device side: the cache
             geometry, the cache groups and the Host tiers' page counts.
+        l3_config: Limits returned by Host-storage construction, or None
+            when no storage backend is configured.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
         decode_input_tokens: Verify width per decode step.
@@ -197,8 +200,9 @@ def scheduler_config_from_args(
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
         max_retracted_requests=specs.max_retracted_requests,
-        # The threshold is unset (None) without a store; the binding takes 0.
-        l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages if has_l3 else 0,
+        storage_config=(
+            l3_config.scheduler_config() if l3_config is not None else None
+        ),
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
@@ -289,9 +293,8 @@ class EventLoop:
         per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
         # The entire device side is built in here: model runners, attention
         # backends, KV pools and the executor are locals of the builder and
-        # never come back out. ``device`` is a local too — only ``.handle``
-        # outlives this constructor, so the running loop can neither name a
-        # device object nor call a startup hook.
+        # never come back out. The startup bundle is local; only its device
+        # handle and separate CPU capabilities survive construction.
         device = build_device_side(
             server_args=server_args,
             model_config=self.model_config,
@@ -305,6 +308,17 @@ class EventLoop:
             max_batch_size=per_rank_max_batch,
         )
         self._device = device.handle
+        l3_config, self._l3 = build_l3_cache(
+            server_args,
+            self.model_config,
+            draft_model_config,
+            host_cache=device.host_cache,
+            world_cpu_group=(
+                pg_manager.get_process_group("gloo", mapping.world_group)
+                if mapping.world_size > 1
+                else None
+            ),
+        )
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
@@ -415,6 +429,7 @@ class EventLoop:
         scheduler_cfg = scheduler_config_from_args(
             server_args,
             specs,
+            l3_config=l3_config,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
             decode_input_tokens=decode_input_tokens,
@@ -443,11 +458,28 @@ class EventLoop:
         self.scheduler = Scheduler(scheduler_cfg)
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
-            self._device if scheduler_cfg.enable_l3_storage else None,
+            self._l3,
+            config=l3_config,
             attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
+            metrics=(
+                L3Metrics(
+                    labels={
+                        "model_name": server_args.served_model_name,
+                        "app_key": server_args.app_key or "",
+                        "dp_rank": str(dp_rank),
+                        "tp_rank": str(attn_tp_rank),
+                        "engine_role": server_args.disaggregation_mode,
+                    },
+                    enabled=server_args.enable_metrics,
+                    reporters=server_args.metrics_reporters,
+                    event_sink=metrics_service.get_event_sink(),
+                )
+                if scheduler_cfg.enable_l3_storage and server_args.enable_metrics
+                else None
+            ),
         )
         # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
@@ -574,6 +606,7 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,
+            l3=self._l3,
         )
 
         # The rebalance's loop-side glue: the controller's ops ride the request
@@ -680,7 +713,7 @@ class EventLoop:
                 state = self.output_processor.rid_to_state.get(spec.request_id)
                 if state is not None:
                     state.scheduler_enqueue_time = enqueue_time
-        self._l3_hooks.submit_requests(specs)
+        self.scheduler.submit_requests(specs)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -804,11 +837,15 @@ class EventLoop:
     def _request_abort_or_mark(
         self, request_id: str, _reason: str, *, notify_client: bool = False
     ) -> None:
-        """Mark an abort; scheduler release follows the normal lifecycle event."""
+        """Mark output and return L3 cancellation through the next head advance."""
         if notify_client:
             self.output_processor.mark_abort(request_id, notify_client=True)
         else:
             self.output_processor.mark_abort(request_id)
+        if self._l3_hooks.cancel_request(request_id):
+            state = self.output_processor.rid_to_state.get(request_id)
+            if state is not None:
+                self.output_processor.reap_finished_orphan(request_id, state)
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
@@ -1155,18 +1192,18 @@ class EventLoop:
                 # rank-identical every cycle. A no-op without an EPD admission
                 # controller (every non-EPD deployment).
                 self._epd_hooks.drain_ready_embeddings()
-                # The in-flight L3 prefetches converge first (replica MIN of
-                # the landed prefix), so a finished one is acknowledged in
-                # this round's cache poll and its request is admissible in
-                # this round's plan.
-                self._l3_hooks.converge_prefetches()
-                cache_events = self._cache_hooks.poll_ready_events()
+                cache_events = self._l3_hooks.poll_ready_events(
+                    allow_forward=not self._pause.forward_blocked,
+                    allow_storage=not self._pause.forward_blocked,
+                )
+                cache_events.extend(self._cache_hooks.poll_ready_events())
                 if cache_events:
                     # Advanced at the HEAD of the round (not funneled into the
                     # tail advance) so completed cache ops are visible to this
                     # round's next_execution_plan — deferring them would delay
                     # cache-gated admissions by a full round.
                     advance_scheduler(self.scheduler, cache_events)
+                self._l3_hooks.record_metrics()
 
                 # Every path in this round appends its committed results here;
                 # they feed back into the scheduler through the single
@@ -1182,6 +1219,14 @@ class EventLoop:
                     # Freeze: dispatched forwards can't be un-launched; commit them
                     # all before idling.
                     request_changes.extend(self._drain_in_flight(in_flight))
+                    if self._l3 is not None:
+                        execution_plan = self.scheduler.next_execution_plan()
+                        cache_ops = cache_ops_from_plan(execution_plan)
+                        self._cache_hooks.count_ops(cache_ops.device)
+                        self._l3.submit_operations(cache_ops.storage)
+                        self._device.execute(
+                            execution_plan, None, cache_ops=cache_ops.device
+                        )
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
@@ -1193,7 +1238,12 @@ class EventLoop:
                     # read that drives the in-flight accounting also yields
                     # the round's preemption count (0 on rounds without
                     # retraction, which are the overwhelming majority).
-                    num_retracted = self._cache_hooks.count_plan_ops(execution_plan)
+                    cache_ops = cache_ops_from_plan(execution_plan)
+                    if cache_ops.storage and self._l3 is None:
+                        raise RuntimeError(
+                            "cache storage operations require an L3 executor"
+                        )
+                    num_retracted = self._cache_hooks.count_ops(cache_ops.device)
                     if num_retracted:
                         self.metrics.record_preemptions(num_retracted)
                     # A capacity retraction whose victim could not be imaged
@@ -1203,6 +1253,8 @@ class EventLoop:
                     self.output_processor.finish_scheduler_aborted_requests(
                         execution_plan.aborts
                     )
+                    if cache_ops.storage:
+                        self._l3.submit_operations(cache_ops.storage)
 
                     forward_op = self._get_forward_op(execution_plan)
                     stats = self._get_scheduler_stats()
@@ -1294,7 +1346,9 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(execution_plan, planned)
+                    pending = self._device.execute(
+                        execution_plan, planned, cache_ops=cache_ops.device
+                    )
                     if need_idle_forward:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
@@ -1431,9 +1485,13 @@ class EventLoop:
         if callable(send_engine_dead):
             send_engine_dead()
         close_transfer = getattr(self.kv_transfer, "close", None)
-        if callable(close_transfer):
-            close_transfer()
-        self._device.shutdown_cache()
+        try:
+            if callable(close_transfer):
+                close_transfer()
+        finally:
+            self._device.shutdown_cache()
+            if self._l3 is not None:
+                self._l3.close(timeout_s=5.0)
 
 
 def run_event_loop(

@@ -51,13 +51,13 @@ def _real_handler(server_args, *, can_clear_cache_fn, clear_cache_fn=None, devic
             clear_cache_fn=clear_cache_fn,
             tokenizer_kwargs={},
             device=device,
+            l3=mock.Mock(delete_namespace=mock.Mock(return_value=True)),
         )
 
 
 class TestRequestHandlerFlushCache:
     def _handler(self, can_clear, clear_result):
         device = mock.Mock()
-        device.delete_l3_namespace.return_value = True
         return _real_handler(
             ServerArgs(model="x"),
             can_clear_cache_fn=mock.Mock(return_value=can_clear),
@@ -73,7 +73,7 @@ class TestRequestHandlerFlushCache:
                 handler.process_requests([FlushCacheReqInput()])
 
                 handler.can_clear_cache_fn.assert_called_once_with()
-                handler._device.delete_l3_namespace.assert_called_once_with()
+                handler._l3.delete_namespace.assert_called_once_with()
                 handler.clear_cache_fn.assert_called_once_with()
                 output = handler.send_func.send_pyobj.call_args.args[0]
                 assert (output.success) == (success)
@@ -94,7 +94,7 @@ class TestRequestHandlerFlushCache:
 
         assert (groups_seen) == (["tp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
@@ -118,7 +118,7 @@ class TestRequestHandlerFlushCache:
 
         assert (groups_seen) == (["tp", "pp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
@@ -139,7 +139,7 @@ class TestRequestHandlerFlushCache:
 
         assert (groups_seen) == (["tp", "tp"])
         handler.clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_called_once_with()
+        handler._l3.delete_namespace.assert_called_once_with()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert output.success
 
@@ -164,7 +164,7 @@ class TestRequestHandlerFlushCache:
 
         assert (groups_seen) == (["dp", "tp", "pp", "dp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
@@ -186,7 +186,7 @@ class TestRequestHandlerFlushCache:
 
         assert (groups_seen) == (["dp", "dp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
@@ -205,8 +205,8 @@ class TestRequestHandlerFlushCache:
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([FlushCacheReqInput()])
 
-        assert (groups_seen) == (["dp", "dp", "dp"])
-        handler._device.delete_l3_namespace.assert_called_once_with()
+        assert groups_seen == ["dp", "dp", "dp"]
+        handler._l3.delete_namespace.assert_called_once_with()
         handler.clear_cache_fn.assert_called_once_with()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert output.success
@@ -235,11 +235,11 @@ class TestRequestHandlerFlushCache:
 
     def test_failed_l3_delete_does_not_clear(self):
         handler = self._handler(can_clear=True, clear_result=True)
-        handler._device.delete_l3_namespace.return_value = False
+        handler._l3.delete_namespace.return_value = False
 
         handler.process_requests([FlushCacheReqInput()])
 
-        handler._device.delete_l3_namespace.assert_called_once_with()
+        handler._l3.delete_namespace.assert_called_once_with()
         handler.clear_cache_fn.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
@@ -262,8 +262,8 @@ class TestRequestHandlerFlushCache:
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([FlushCacheReqInput()])
 
-        assert (groups_seen) == (["tp", "tp"])
-        handler._device.delete_l3_namespace.assert_called_once_with()
+        assert groups_seen == ["tp", "tp"]
+        handler._l3.delete_namespace.assert_called_once_with()
         handler.clear_cache_fn.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
@@ -272,7 +272,6 @@ class TestRequestHandlerFlushCache:
 class TestRequestHandlerL3WeightVersion:
     def _handler(self):
         device = mock.Mock()
-        device.delete_l3_namespace.return_value = True
         return _real_handler(
             ServerArgs(model="x", weight_version="v1"),
             can_clear_cache_fn=mock.Mock(return_value=True),
@@ -285,9 +284,7 @@ class TestRequestHandlerL3WeightVersion:
         handler.can_clear_cache_fn = mock.Mock(
             side_effect=lambda: order.append("preflight") or True
         )
-        handler._device.delete_l3_namespace.side_effect = lambda: (
-            order.append("l3") or True
-        )
+        handler._l3.delete_namespace.side_effect = lambda: order.append("l3") or True
         handler.clear_cache_fn = mock.Mock(
             side_effect=lambda: order.append("flush") or True
         )
@@ -298,8 +295,8 @@ class TestRequestHandlerL3WeightVersion:
             return True, "ok"
 
         handler._device.update_weights.side_effect = _update_weights
-        handler._device.set_l3_weight_version.side_effect = lambda version: (
-            order.append(("prefix", version))
+        handler._l3.set_weight_version.side_effect = lambda version: order.append(
+            ("prefix", version)
         )
         req = UpdateWeightsFromDistributedReqInput(
             names=["w"],
@@ -332,8 +329,8 @@ class TestRequestHandlerL3WeightVersion:
         handler.process_requests([req])
 
         handler.clear_cache_fn.assert_called_once_with()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
 
     def test_skips_flush_when_more_updates_are_coming(self):
         handler = self._handler()
@@ -350,7 +347,7 @@ class TestRequestHandlerL3WeightVersion:
         handler.process_requests([req])
 
         handler.clear_cache_fn.assert_not_called()
-        handler._device.set_l3_weight_version.assert_called_once_with("v2")
+        handler._l3.set_weight_version.assert_called_once_with("v2")
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert output.success
 
@@ -371,8 +368,8 @@ class TestRequestHandlerL3WeightVersion:
 
         handler._device.update_weights.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
         assert ("cannot change without flush_cache") in (output.message)
@@ -394,8 +391,8 @@ class TestRequestHandlerL3WeightVersion:
 
         handler._device.update_weights.assert_called_once_with(req)
         handler.clear_cache_fn.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert output.success
 
@@ -417,8 +414,8 @@ class TestRequestHandlerL3WeightVersion:
         handler.can_clear_cache_fn.assert_called_once_with()
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert isinstance((output), (UpdateWeightsFromDistributedReqOutput))
         assert not (output.success)
@@ -440,8 +437,8 @@ class TestRequestHandlerL3WeightVersion:
 
         handler.can_clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
         assert ("cache flush failed") in (output.message)
@@ -463,8 +460,8 @@ class TestRequestHandlerL3WeightVersion:
 
         handler._device.update_weights.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
         assert ("require weight_version") in (output.message)
@@ -497,11 +494,11 @@ class TestRequestHandlerL3WeightVersion:
 
         assert (groups_seen) == (["tp", "pp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
         assert ("cache flush failed") in (output.message)
@@ -536,11 +533,11 @@ class TestRequestHandlerL3WeightVersion:
 
         assert (groups_seen) == (["dp", "tp", "pp", "dp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
         assert ("cache flush failed") in (output.message)
@@ -571,7 +568,7 @@ class TestRequestHandlerL3WeightVersion:
 
         assert (groups_seen) == (["tp"])
         handler.can_clear_cache_fn.assert_called_once_with()
-        handler._device.delete_l3_namespace.assert_not_called()
+        handler._l3.delete_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
@@ -580,7 +577,7 @@ class TestRequestHandlerL3WeightVersion:
 
     def test_failed_l3_delete_skips_clear_and_nccl(self):
         handler = self._handler()
-        handler._device.delete_l3_namespace.return_value = False
+        handler._l3.delete_namespace.return_value = False
         handler.clear_cache_fn = mock.Mock(return_value=True)
         handler._device.update_weights.return_value = (True, "ok")
         req = UpdateWeightsFromDistributedReqInput(
@@ -593,10 +590,10 @@ class TestRequestHandlerL3WeightVersion:
 
         handler.process_requests([req])
 
-        handler._device.delete_l3_namespace.assert_called_once_with()
+        handler._l3.delete_namespace.assert_called_once_with()
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
-        handler._device.set_l3_weight_version.assert_not_called()
+        handler._l3.set_weight_version.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         assert not (output.success)
         assert ("cache flush failed") in (output.message)
@@ -615,8 +612,8 @@ class TestRequestHandlerL3WeightVersion:
 
         handler.process_requests([req])
 
-        handler._device.set_l3_weight_version.assert_not_called()
-        assert (handler.server_args.weight_version) == ("v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
 
 
 class TestEngineStampsL3Version:

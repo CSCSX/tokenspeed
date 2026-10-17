@@ -4144,4 +4144,36 @@ TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithIts
 }
 
 }  // namespace
+TEST(StoragePrefixReservationTest, DistributesRestoredPagesAcrossCyclicOwners) {
+    BlockPool pool(4, {2});
+    BlockPool host_pool(4, {2});
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/true, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true);
+    const auto tokens = MakeTokens(7);
+    const auto hashes = ComputePrefixHashes(
+        std::array{token_span(tokens.data(), 2), token_span(tokens.data() + 2, 2), token_span(tokens.data() + 4, 2)},
+        "");
+    const CacheCoordinator::PromptPrefix prompt{
+        .prefix_hashes = hashes,
+        .tokens = tokens,
+        .max_tokens = 7,
+        .tail =
+            TailPublication{.tail_tokens = 1, .hash = HashPrefixPage(token_span(tokens.data() + 6, 1), hashes.back())}};
+    const auto query = coordinator.MissingStorageKeys(prompt, 16);
+    ASSERT_EQ(query.keys.size(), 4u);
+    const auto reservation = coordinator.ReserveStoragePrefix(prompt, query.keys, 4);
+    ASSERT_EQ(reservation.blocks.size(), 4u);
+    ASSERT_TRUE(reservation.tail);
+    EXPECT_EQ(reservation.keys.back().content_hash, prompt.tail->hash);
+    for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
+        EXPECT_EQ(coordinator.Allocator(0).BucketOf(reservation.blocks[i]->Location()),
+                  static_cast<std::int32_t>(i % 2));
+    }
+}
+
 }  // namespace tokenspeed::test

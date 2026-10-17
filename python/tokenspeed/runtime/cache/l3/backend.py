@@ -31,7 +31,12 @@ import json
 import os
 import re
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
@@ -925,7 +930,60 @@ def _file_digest(path: str) -> str:
 # value so they still share L3. This is not a git SHA or package version:
 # those would split the store on every non-cache commit while staying
 # 0.1.0 across cache-affecting edits.
-L3_RUNTIME_COMPAT = "1"
+# Isolates this Host-storage contract from earlier producer implementations.
+L3_RUNTIME_COMPAT = "7"
+
+
+def l3_kv_producer_id(args: ServerArgs, *, dtype: str, draft_dtype: str) -> str:
+    """Snapshot KV-producing launch choices after startup resolution.
+
+    An empty draft dtype means this stage has no draft. Sampling, logprob
+    reporting and storage admission knobs do not change KV for fixed tokens.
+    ``auto`` compute backends describe a selection policy within the runtime
+    compat epoch, not a promise of bitwise invariance across hardware/batches.
+    """
+    mapping = args.mapping
+    assert mapping is not None
+    return json.dumps(
+        {
+            "dtype": dtype,
+            "draft_dtype": draft_dtype,
+            "numerics": args.numerics,
+            "yarn_ramp_mask_device": args.yarn_ramp_mask_device,
+            "mla_lora_scale": args.mla_lora_scale,
+            "layer_boundary_norm": args.layer_boundary_norm,
+            "router_topk": args.router_topk,
+            "moe_combine_order": args.moe_combine_order,
+            "dsa_slot_order": args.dsa_slot_order,
+            "disable_autotune": args.disable_autotune,
+            "disable_tf32": args.disable_tf32,
+            "disable_pdl": args.disable_pdl,
+            "force_deterministic_rsag": args.force_deterministic_rsag,
+            "batch_invariant_collectives": args.batch_invariant_collectives,
+            "tp_batch_invariant": args.tp_batch_invariant,
+            "enable_allreduce_fusion": args.enable_allreduce_fusion,
+            "comm_fusion_max_num_tokens": args.comm_fusion_max_num_tokens,
+            "disable_nccl_nvls": args.disable_nccl_nvls,
+            "disable_symm_mem": args.disable_symm_mem,
+            "dense_gemm_backend": args.dense_gemm_backend,
+            "moe_backend": args.moe_backend,
+            "draft_moe_backend": (
+                (args.draft_moe_backend or args.moe_backend) if draft_dtype else ""
+            ),
+            "moe_mxfp4_fp8_activation": args.moe_mxfp4_fp8_activation,
+            "all2all_backend": args.all2all_backend,
+            "deepep_mode": args.deepep_mode,
+            "attn_head_tp_size": mapping.attn.head_tp_size,
+            "attn_kvp_size": mapping.attn.kvp_size,
+            "attn_qcp_size": mapping.attn.qcp_size,
+            "linear_attn_tp_size": mapping.linear_attn.tp_size,
+            "dense_tp_size": mapping.dense.tp_size,
+            "moe_tp_size": mapping.moe.tp_size,
+            "moe_ep_size": mapping.moe.ep_size,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def storage_key_prefix(
@@ -946,6 +1004,7 @@ def storage_key_prefix(
     draft_attention_backend: str,
     skip_softmax_threshold: float,
     eagle3_layers_to_capture: Sequence[int],
+    kv_producer: str,
 ) -> str:
     """Return a collision-resistant namespace for compatible L3 objects.
 
@@ -976,9 +1035,10 @@ def storage_key_prefix(
     capture layers change which target hidden states the draft consumes
     and therefore the KV those layers produce. Empty strings and an empty
     override dict are valid and mean "unset" (no draft pool, no extra cache
-    scales, no HF overrides). The payload keeps a literal ``cp_size`` of 1,
-    the retired context-parallel width, so the namespace of every existing
-    deployment is unchanged until the next deliberate key-format bump.
+    scales, no HF overrides). ``kv_producer`` is the immutable numerical
+    signature from ``l3_kv_producer_id``. V2 deliberately isolates objects
+    written before this signature was required; old namespaces remain cold.
+    The payload keeps a literal ``cp_size`` of 1, the retired CP width.
     ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
     id: GQA with TP above the KV-head count keeps one local KV head per
@@ -989,6 +1049,8 @@ def storage_key_prefix(
 
     if not isinstance(model_overrides, dict):
         raise TypeError("model_overrides must be a dict")
+    if not isinstance(kv_producer, str) or not kv_producer:
+        raise ValueError("kv_producer must be an explicit nonempty signature")
     if isinstance(eagle3_layers_to_capture, (str, bytes)):
         raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
     payload = json.dumps(
@@ -1006,6 +1068,7 @@ def storage_key_prefix(
             "draft_weight_version": str(draft_weight_version),
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
+            "kv_producer": kv_producer,
             "attention_backend": str(attention_backend),
             "draft_attention_backend": str(draft_attention_backend),
             "skip_softmax_threshold": float(skip_softmax_threshold),
@@ -1016,7 +1079,7 @@ def storage_key_prefix(
         sort_keys=True,
         separators=(",", ":"),
     )
-    return "tsl3v1-" + hashlib.sha256(payload.encode()).hexdigest()
+    return "tsl3v2-" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def host_buffer_ptr(host_buffer: Any) -> int:
@@ -1052,10 +1115,30 @@ def write_host_bytes(host_buffer: Any, offset: int, payload: bytes) -> None:
 class KvStoreStorage(Protocol):
     """Byte store for packed Host CacheBlocks.
 
-    Implementations must be safe to call from the runtime thread that owns
-    the Host buffer. ``batch_get_into`` / ``batch_put_from`` operate on
+    Implementations must allow concurrent calls from the bounded I/O workers.
+    Workers retain the registered Host buffer for the entire native operation. ``batch_get_into`` / ``batch_put_from`` operate on
     offsets into that registered buffer (SGLang HiCacheStorage v1).
     """
+
+    failures_retire: bool
+
+    def batch_get_into_result(
+        self,
+        keys: Sequence[str],
+        host_buffer: Any,
+        offsets: Sequence[int],
+        sizes: Sequence[int],
+    ) -> StorageIOResult:
+        """Return per-key validity and proof that destination access ended."""
+
+    def batch_put_from_result(
+        self,
+        keys: Sequence[str],
+        host_buffer: Any,
+        offsets: Sequence[int],
+        sizes: Sequence[int],
+    ) -> StorageIOResult:
+        """Return per-key publication and proof that source access ended."""
 
     def batch_exists(self, keys: Sequence[str]) -> list[bool]:
         """Return per-key existence, aligned with ``keys``."""
@@ -1094,6 +1177,7 @@ class MemoryKvStore:
 
     def __init__(self) -> None:
         self._objects: dict[str, bytes] = {}
+        self.failures_retire = True
 
     def batch_exists(self, keys: Sequence[str]) -> list[bool]:
         return [key in self._objects for key in keys]
@@ -1134,6 +1218,21 @@ class MemoryKvStore:
             self._objects[key] = copy_host_bytes(host_buffer, int(offset), int(size))
             results.append(True)
         return results
+
+    def batch_get_into_result(
+        self, keys, host_buffer, offsets, sizes
+    ) -> StorageIOResult:
+        flags = tuple(self.batch_get_into(keys, host_buffer, offsets, sizes))
+        return StorageIOResult(flags, True, tuple(not flag for flag in flags))
+
+    def batch_put_from_result(
+        self, keys, host_buffer, offsets, sizes
+    ) -> StorageIOResult:
+        return StorageIOResult(
+            tuple(self.batch_put_from(keys, host_buffer, offsets, sizes)),
+            True,
+            (False,) * len(keys),
+        )
 
     def remove_by_prefix(self, prefix: str) -> bool:
         self._objects = {

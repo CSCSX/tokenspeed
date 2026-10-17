@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tokenspeed.runtime.cache.l3.backend import host_buffer_ptr
+from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
 
 logger = logging.getLogger(__name__)
 
@@ -165,12 +166,17 @@ class MooncakeKvStore:
                 "to use --kvstore-storage-backend mooncake."
             ) from exc
 
+        self.failures_retire = False
         self.config = MooncakeStoreConfig.from_mapping(extra_config)
         self.store = MooncakeDistributedStore()
         tp_size = max(int(tp_size), 1)
         pp_size = max(int(pp_size), 1)
         per_rank_segment = self.config.global_segment_size // (tp_size * pp_size)
-        if per_rank_segment <= 0:
+        # Zero explicitly selects a client backed by independently mounted
+        # store segments, so inference restarts need not remove cached objects.
+        if self.config.global_segment_size < 0 or (
+            self.config.global_segment_size > 0 and per_rank_segment == 0
+        ):
             raise ValueError(
                 "Mooncake global_segment_size "
                 f"{self.config.global_segment_size} is too small to split "
@@ -235,94 +241,83 @@ class MooncakeKvStore:
             return []
         results = self.store.batch_is_exist(list(keys))
         _require_result_len(results, len(keys), op="batch_is_exist")
+        if any(int(flag) not in (0, 1) for flag in results):
+            raise RuntimeError(f"Mooncake existence query failed: {results}")
         return [int(flag) == 1 for flag in results]
 
-    def batch_get_into(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> list[bool]:
-        if not keys:
-            return []
+    def batch_get_into(self, keys, host_buffer, offsets, sizes) -> list[bool]:
+        return list(
+            self.batch_get_into_result(keys, host_buffer, offsets, sizes).success
+        )
+
+    def batch_get_into_result(
+        self, keys, host_buffer, offsets, sizes
+    ) -> StorageIOResult:
         if not (len(keys) == len(offsets) == len(sizes)):
             raise ValueError("ragged L3 get")
-        base = host_buffer_ptr(host_buffer)
-        ptrs = [base + int(offset) for offset in offsets]
-        requested = [int(size) for size in sizes]
-        results = self.store.batch_get_into(list(keys), ptrs, requested)
-        _require_result_len(results, len(keys), op="batch_get_into")
-        return [int(result) == size for result, size in zip(results, requested)]
-
-    def batch_put_from(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> list[bool]:
         if not keys:
-            return []
+            return StorageIOResult((), True, ())
+        base = host_buffer_ptr(host_buffer)
+        requested = [int(size) for size in sizes]
+        results = self.store.batch_get_into(
+            list(keys), [base + int(x) for x in offsets], requested
+        )
+        _require_result_len(results, len(keys), op="batch_get_into")
+        return StorageIOResult(
+            tuple(int(result) == size for result, size in zip(results, requested)),
+            # OBJECT_NOT_FOUND is a metadata-query miss before native transfer
+            # submission. Other negative errors may leave writes in flight.
+            # A nonnegative short read is terminal but invalid.
+            all(int(result) >= 0 or int(result) == -704 for result in results),
+            tuple(
+                int(result) == -704 or (int(result) >= 0 and int(result) != size)
+                for result, size in zip(results, requested)
+            ),
+        )
+
+    def batch_put_from(self, keys, host_buffer, offsets, sizes) -> list[bool]:
+        return list(
+            self.batch_put_from_result(keys, host_buffer, offsets, sizes).success
+        )
+
+    def batch_put_from_result(
+        self, keys, host_buffer, offsets, sizes
+    ) -> StorageIOResult:
         if not (len(keys) == len(offsets) == len(sizes)):
             raise ValueError("ragged L3 put")
+        if not keys:
+            return StorageIOResult((), True, ())
+        # Metadata failures precede any native access to the source buffer.
         try:
-            exist = self.batch_exists(keys)
-        except ValueError:
-            logger.error(
-                "Mooncake batch_is_exist returned a truncated existence reply; "
-                "refusing to ACK Host pages that were not uploaded"
-            )
-            return [False] * len(keys)
-        missing_keys = []
-        missing_ptrs = []
-        missing_sizes = []
-        missing_index = []
+            exists = self.batch_exists(keys)
+        except Exception:
+            logger.exception("Mooncake existence query before PUT failed")
+            return StorageIOResult((False,) * len(keys), True, (False,) * len(keys))
+        indices = [i for i, present in enumerate(exists) if not present]
+        flags = list(exists)
+        if not indices:
+            return StorageIOResult(tuple(flags), True, (False,) * len(keys))
         base = host_buffer_ptr(host_buffer)
-        results = [True] * len(keys)
-        for index, (key, offset, size, present) in enumerate(
-            zip(keys, offsets, sizes, exist)
-        ):
-            if present:
-                continue
-            missing_keys.append(key)
-            missing_ptrs.append(base + int(offset))
-            missing_sizes.append(int(size))
-            missing_index.append(index)
-            results[index] = False
-        if missing_keys:
-            put_results = self.store.batch_put_from(
-                missing_keys, missing_ptrs, missing_sizes
+        results = self.store.batch_put_from(
+            [keys[i] for i in indices],
+            [base + int(offsets[i]) for i in indices],
+            [int(sizes[i]) for i in indices],
+        )
+        if len(results) != len(indices):
+            logger.error(
+                f"Mooncake PUT returned {len(results)} results for {len(indices)} keys"
             )
-            if len(put_results) != len(missing_keys):
-                logger.error(
-                    f"Mooncake batch_put_from returned {len(put_results)} results "
-                    f"for {len(missing_keys)} keys; refusing to ACK Host pages "
-                    "that were not uploaded"
-                )
-                return [False] * len(keys)
-            for index, ret in zip(missing_index, put_results):
-                results[index] = int(ret) == 0
-            failed_positions = [
-                position for position, ret in enumerate(put_results) if int(ret) != 0
-            ]
-            if failed_positions:
-                # Mooncake puts are create-only. A concurrent writer may win
-                # after our existence probe, which is still a successful,
-                # idempotent publication of the immutable cache object.
-                raced_keys = [missing_keys[position] for position in failed_positions]
-                try:
-                    raced_exists = self.batch_exists(raced_keys)
-                except ValueError:
-                    logger.error(
-                        "Mooncake batch_is_exist returned a truncated race "
-                        "recheck; leaving failed puts unacknowledged"
-                    )
-                    raced_exists = [False] * len(raced_keys)
-                for position, present in zip(failed_positions, raced_exists):
-                    if present:
-                        results[missing_index[position]] = True
-        return results
+            return StorageIOResult((False,) * len(keys), False, (False,) * len(keys))
+        # Mooncake's public ErrorCode::OBJECT_ALREADY_EXISTS (-705) is a
+        # create-only rejection before transfer. Other errors do not prove
+        # retirement, even if another writer's object now exists.
+        for index, result in zip(indices, results):
+            flags[index] = int(result) in (0, -705)
+        return StorageIOResult(
+            tuple(flags),
+            all(int(result) in (0, -705) for result in results),
+            (False,) * len(keys),
+        )
 
     def remove_by_prefix(self, prefix: str) -> bool:
         remover = getattr(self.store, "remove_by_regex", None)

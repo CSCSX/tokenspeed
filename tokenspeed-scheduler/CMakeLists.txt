@@ -59,6 +59,8 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/core/cache_block_ref.cpp
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
+    csrc/cache/tier/storage_manager.cpp
+    csrc/scheduler/operations/storage.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
