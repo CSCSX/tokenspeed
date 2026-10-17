@@ -660,38 +660,6 @@ class DeviceHandle:
         executor = self._executor
         self._thread.run(lambda: executor.execute_idle_forward(dp_metadata))
 
-    def run_multimodal_work(self, work: Callable[[], Any], *, wait: bool = True) -> Any:
-        """Run multimodal feature-lifecycle work on the data plane, in order.
-
-        The one generic slot on this handle: the multimodal feature lifecycle
-        is a state machine reached from several control-plane points (EPD
-        admission's device half, the commit-side SHM release), and naming
-        each step would pull those state machines' internals in here. A
-        second KIND of user gets its own named method instead.
-
-        Args:
-            work: Zero-argument callable performing the device step.
-            wait: Block for the result (EPD admission) or fire-and-forget
-                (the commit-side release).
-
-        Returns:
-            ``work``'s return value when waiting, else None.
-        """
-        if wait:
-            return self._thread.run(work)
-
-        def _logged():
-            try:
-                work()
-            except Exception:
-                # Nobody observes this future; swallowing would turn an SHM
-                # release failure into a silent leak. Log and keep the data
-                # plane running.
-                logger.exception("fire-and-forget multimodal work failed")
-
-        self._thread.submit(_logged)
-        return None
-
     def _submit_remote_prefill(self, remote_prefill, zero_future):
         """Queue a remote-prefill stream: pull its rows' KV from the peer.
 
@@ -737,6 +705,38 @@ class DeviceHandle:
             kv_transfer.execute(remote_prefill)
 
         return self._thread.submit(_receive)
+
+    def run_multimodal_work(self, work: Callable[[], Any], *, wait: bool = True) -> Any:
+        """Run multimodal feature-lifecycle work on the data plane, in order.
+
+        The one generic slot on this handle: the multimodal feature lifecycle
+        is a state machine reached from several control-plane points (EPD
+        admission's device half, the commit-side SHM release), and naming
+        each step would pull those state machines' internals in here. A
+        second KIND of user gets its own named method instead.
+
+        Args:
+            work: Zero-argument callable performing the device step.
+            wait: Block for the result (EPD admission) or fire-and-forget
+                (the commit-side release).
+
+        Returns:
+            ``work``'s return value when waiting, else None.
+        """
+        if wait:
+            return self._thread.run(work)
+
+        def _logged():
+            try:
+                work()
+            except Exception:
+                # Nobody observes this future; swallowing would turn an SHM
+                # release failure into a silent leak. Log and keep the data
+                # plane running.
+                logger.exception("fire-and-forget multimodal work failed")
+
+        self._thread.submit(_logged)
+        return None
 
     def run_kv_repair(self) -> None:
         """Zero the KV arena after a memory-saver wake re-maps its storage.

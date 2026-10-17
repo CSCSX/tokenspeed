@@ -1487,9 +1487,11 @@ class EventLoop:
             if callable(close_transfer):
                 close_transfer()
         finally:
-            self._device.shutdown_cache()
-            if self._l3 is not None:
-                self._l3.close(timeout_s=5.0)
+            try:
+                self._device.shutdown_cache()
+            finally:
+                if self._l3 is not None:
+                    self._l3.close(timeout_s=5.0)
 
 
 def run_event_loop(

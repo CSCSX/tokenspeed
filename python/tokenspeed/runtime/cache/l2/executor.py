@@ -94,8 +94,9 @@ from tokenspeed.runtime.execution.slot_state import SlotStateExporter, SlotState
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
-_HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
 device_module = get_device_module()
+
+_HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:

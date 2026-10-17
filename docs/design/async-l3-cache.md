@@ -60,6 +60,10 @@ because they bind Device buffers, streams and slot-state exporters.
 No additional HiCacheEngine is needed: C++ owns policy, the existing loop owns
 round sequencing, and the shared Host resource owns its allocation.
 
+Device-copy and L3 teardown are attempted independently. A failed Device
+shutdown must still retire L3 workers before its backend can be closed;
+unproven native retirement retains the registered Host allocation.
+
 `StorageConfig` is the read-only scheduling contract: credits, prefetch limits,
 deadlines and pressure watermarks. `StorageRuntimeConfig` contains that contract
 plus Python worker counts and backend-health settings; it does not duplicate
