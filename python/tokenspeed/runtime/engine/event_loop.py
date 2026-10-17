@@ -1552,6 +1552,10 @@ def run_event_loop(
         logger.error(f"Scheduler hit an exception: {traceback!s}")
         parent_process.send_signal(signal.SIGUSR1)
     finally:
+        # Cleanup can outlive the process entry point (for example, a transport
+        # thread after a partial constructor). Report the closed ready channel
+        # before waiting for cleanup so the launcher can stop the other ranks.
+        pipe_writer.close()
         # SystemExit/KeyboardInterrupt bypass the Exception handler above;
         # report their traceback without swallowing or changing the exit status.
         exception_info = sys.exc_info()

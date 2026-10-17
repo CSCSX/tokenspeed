@@ -268,9 +268,13 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     class _PipeWriter:
         def __init__(self) -> None:
             self.messages: list[object] = []
+            self.closed = False
 
         def send(self, message: object) -> None:
             self.messages.append(message)
+
+        def close(self) -> None:
+            self.closed = True
 
     mapping = Mapping(rank=0)
     server_args = SimpleNamespace(
@@ -340,6 +344,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         else "shutdown_requested=False signal=None"
     ) in exit_logs[0][0]
     assert parent_signals == []
+    assert pipe_writer.closed
     assert len(pipe_writer.messages) == 1
     assert pipe_writer.messages[0]["status"] == "ready"
     assert signal_calls[0][0] == signal.SIGTERM

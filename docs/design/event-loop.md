@@ -642,3 +642,19 @@ For orientation, one iteration of `event_loop`:
   cache-owning rank still enters the replica MIN; raising would hang healthy
   peers. Clients are not failed. The D role never prefetches: its admission
   probes Device only.
+
+## Startup process ownership
+
+The launcher starts all local scheduler processes before waiting for readiness.
+DP groups use the same supervision path: readiness pipes and process exits are
+watched together across every group. A scheduler closes its ready writer as
+its entry point enters cleanup. EOF remains a failure
+until every worker has reported, even if that worker reported earlier: peers
+can still be blocked in startup collectives while its cleanup is running.
+
+Readiness detection only reports failure. It never joins or terminates workers,
+and introduces no shutdown deadline. The owning launcher stops the process
+tree. A DP controller also owns its workers if its constructor fails partway
+through startup; termination unwinds its cleanup before the controller exits.
+Child-failure signals unwind the launcher with a nonzero exit status. Signal
+callbacks do not log or enumerate processes; cleanup runs outside the callback.
