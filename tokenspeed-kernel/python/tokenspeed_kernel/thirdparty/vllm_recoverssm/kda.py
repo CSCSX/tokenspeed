@@ -146,7 +146,11 @@ def _load_kda_candidate_window(
                 16
                 if args["HISTORY_USE_TENSOR_CORES"]
                 else (
-                    (16 if args["SPEC_QUERY_LEN"] == 1 else 8)
+                    (
+                        (4 if args["BATCH"] * args["q_ptr"].shape[2] <= 96 else 16)
+                        if args["SPEC_QUERY_LEN"] == 1
+                        else 8
+                    )
                     if args["HISTORY_CAPACITY"]
                     else (4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16)
                 )
@@ -348,6 +352,7 @@ def _kda_recoverssm_verify_kernel(
                 stride_history_key_dim,
                 max(8, triton.next_power_of_2(HISTORY_CAPACITY)),
                 HISTORY_USE_TENSOR_CORES,
+                4 if SPEC_QUERY_LEN == 4 else 1,
             )
         else:
             state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
@@ -597,6 +602,7 @@ def _recover_weighted_kda_state(
     stride_key_dim,
     BT: tl.constexpr,
     USE_TENSOR_CORES: tl.constexpr,
+    HISTORY_UNROLL: tl.constexpr,
 ):
     decay = tl.load(decay_ptrs, mask=mask_k, other=1.0)
     state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
@@ -620,7 +626,10 @@ def _recover_weighted_kda_state(
         )
         state = tl.dot(corrections, keys, acc=state, input_precision="tf32x3")
     else:
-        for token in tl.range(0, history_len, num_stages=3):
+        # Unroll short speculative recovery without changing update order.
+        for token in tl.range(
+            0, history_len, num_stages=3, loop_unroll_factor=HISTORY_UNROLL
+        ):
             correction = tl.load(
                 correction_ptr
                 + token * stride_correction_token

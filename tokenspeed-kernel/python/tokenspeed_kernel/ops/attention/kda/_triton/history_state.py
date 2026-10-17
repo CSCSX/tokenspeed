@@ -103,6 +103,7 @@ def _materialize_history_kernel(
                 stride_key_dim,
                 BT,
                 USE_TENSOR_CORES,
+                1,
             )
         else:
             result = tl.load(state_addresses, mask=state_mask, other=0.0).to(tl.float32)

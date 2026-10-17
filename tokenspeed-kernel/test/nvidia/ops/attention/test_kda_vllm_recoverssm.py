@@ -780,7 +780,10 @@ def test_recoverssm_gate_recovery_across_layers(
 
 
 @pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
-def test_verify_derived_records_with_serving_producers(batch: int) -> None:
+@pytest.mark.parametrize("combined", [False, True])
+def test_verify_derived_records_with_serving_producers(
+    batch: int, combined: bool
+) -> None:
     """Commit each accepted prefix against an independent FP32 recurrence."""
     torch.manual_seed(814)
     heads, dim, width = (12, 128, 4)
@@ -796,20 +799,35 @@ def test_verify_derived_records_with_serving_producers(batch: int) -> None:
     bias = torch.randn(heads, dim, device="cuda") * 0.1
     indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
     captured = torch.empty_like(raw)
-    from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
-
-    captured.copy_(raw)
-    qkv = kda_verify_conv_update(
-        raw,
-        conv_weights,
-        conv_state,
-        indices,
-        num_heads=heads,
-        head_dim=dim,
-        draft_token_num=width,
-        recurrent_layout="v_major",
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_verify_conv_gate,
+        kda_verify_conv_update,
     )
-    gate = torch.nn.functional.linear(fa, fb)
+
+    if combined:
+        qkv, gate = kda_verify_conv_gate(
+            raw,
+            conv_weights,
+            conv_state,
+            indices,
+            fa,
+            fb,
+            draft_token_num=width,
+            replay_mixed_qkv=captured,
+        )
+    else:
+        captured.copy_(raw)
+        qkv = kda_verify_conv_update(
+            raw,
+            conv_weights,
+            conv_state,
+            indices,
+            num_heads=heads,
+            head_dim=dim,
+            draft_token_num=width,
+            recurrent_layout="v_major",
+        )
+        gate = torch.nn.functional.linear(fa, fb)
     torch.testing.assert_close(captured, raw, atol=0, rtol=0)
     q, k, _ = (x.float().reshape(batch, width, heads, dim) for x in qkv.chunk(3, -1))
     q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-06) * dim ** (-0.5)

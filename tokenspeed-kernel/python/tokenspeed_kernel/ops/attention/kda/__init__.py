@@ -658,6 +658,52 @@ def kda_fused_paged_verify_uses_split_producers(
     )
 
 
+def kda_verify_conv_gate(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    *,
+    draft_token_num: int,
+    replay_mixed_qkv: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce convolution rows and raw gates without changing committed state.
+
+    Args:
+        mixed_qkv: BF16 raw QKV rows, [requests * draft_token_num, 3 * channels].
+        conv_weights: Contiguous BF16 four-tap weights, [3 * channels, 4].
+        conv_states: Read-only BF16 pool, [pages, >= 3 * channels, 3].
+        read_indices: Committed page per request; -1 starts from zero state.
+        f_a_out: BF16 first gate projection, [rows, rank].
+        f_b_weight: BF16 second gate projection weights, [channels, rank].
+        draft_token_num: Candidate positions per request.
+        replay_mixed_qkv: Optional destination for original QKV rows. An exact
+            input alias needs no copy; other overlaps with inputs are invalid.
+
+    Returns:
+        BF16 convolved/SiLU QKV [rows, 3 * channels] and raw gates [rows, channels].
+        Both producers accumulate in FP32 and round once. Gate reduction order
+        may differ from a standalone matrix multiplication.
+    """
+    kernel = select_kernel(
+        "attention",
+        "kda_verify_conv_gate",
+        _attention_format_signature(q=mixed_qkv, k=mixed_qkv, v=mixed_qkv),
+    )
+    return kernel(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        read_indices,
+        f_a_out,
+        f_b_weight,
+        draft_token_num=draft_token_num,
+        replay_mixed_qkv=replay_mixed_qkv,
+    )
+
+
 def kda_verify_conv_update(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,

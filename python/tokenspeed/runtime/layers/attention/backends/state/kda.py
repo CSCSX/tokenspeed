@@ -43,7 +43,7 @@ from tokenspeed_kernel.ops.attention.kda import (
 )
 from tokenspeed_kernel.ops.attention.kda import (
     kda_replay_commit_supported,
-    kda_verify_conv_update,
+    kda_verify_conv_gate,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
@@ -61,7 +61,6 @@ from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import 
     CapacityPrefillMetadata,
 )
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
@@ -198,8 +197,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._replay_history_descriptors = None
         self._replay_history_append_offsets = None
         self._replay_commit_page_descriptors = None
-        self._verify_producer_stream: torch.cuda.Stream | None = None
-        self._verify_producer_forks: dict[int, StreamFork] = {}
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[
             int,
@@ -396,14 +393,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     device=self.device,
                 )
                 first_conv, first_ssm = self._state_components(layer_ids[0])
-                if self._verify_split_producers and first_conv.is_cuda:
-                    self._verify_producer_stream = torch.cuda.Stream(
-                        device=first_conv.device, priority=-1
-                    )
-                    self._verify_producer_forks = {
-                        layer_id: StreamFork(self._verify_producer_stream)
-                        for layer_id in layer_ids
-                    }
                 hv, head_dim = first_ssm.shape[1:3]
                 payload_shape = (len(layer_ids), rows)
                 self._replay_payloads = (
@@ -1098,26 +1087,16 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 }
             elif self._verify_split_producers:
                 heads = value_dim // attn_tp_size // head_v_dim
-                fork = self._verify_producer_forks[layer_id]
-                with fork.scope(enable=True) as producer_fork:
-                    with producer_fork.branch():
-                        g_raw = torch.nn.functional.linear(f_a_out[:rows], f_b_weight)
-                    conv_qkv = kda_verify_conv_update(
-                        mixed_qkv[:rows],
-                        conv_weights,
-                        conv_comp,
-                        state_in_blocks[:batch_size],
-                        num_heads=heads,
-                        head_dim=head_v_dim,
-                        draft_token_num=draft_token_num,
-                        recurrent_layout=self.kda_recurrent_layout,
-                        replay_mixed_qkv=qkv[:rows, : mixed_qkv.shape[-1]],
-                    )
-                # Eager allocations on the producer stream stay live through
-                # the consumer's verify. Graph capture owns its allocations.
-                if not torch.cuda.is_current_stream_capturing():
-                    consumer_stream = torch.cuda.current_stream()
-                    g_raw.record_stream(consumer_stream)
+                conv_qkv, g_raw = kda_verify_conv_gate(
+                    mixed_qkv[:rows],
+                    conv_weights,
+                    conv_comp,
+                    state_in_blocks[:batch_size],
+                    f_a_out[:rows],
+                    f_b_weight,
+                    draft_token_num=draft_token_num,
+                    replay_mixed_qkv=qkv[:rows, : mixed_qkv.shape[-1]],
+                )
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
                 # NVIDIA saves FP32 corrections and BF16 unnormalized K/raw gates.
                 # Request rows, not pool block IDs, size the per-round cache.

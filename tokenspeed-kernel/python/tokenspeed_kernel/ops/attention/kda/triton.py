@@ -251,6 +251,42 @@ def _nvidia_fused_verify(
 
 @register_kernel(
     "attention",
+    "kda_verify_conv_gate",
+    name="triton_nvidia_kda_verify_conv_gate",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+)
+def triton_nvidia_kda_verify_conv_gate(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    *,
+    draft_token_num: int,
+    replay_mixed_qkv: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.ops.attention.kda._triton.verify_producers import (
+        verify_conv_gate,
+    )
+
+    return verify_conv_gate(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        read_indices,
+        f_a_out,
+        f_b_weight,
+        draft_token_num=draft_token_num,
+        replay_mixed_qkv=replay_mixed_qkv,
+    )
+
+
+@register_kernel(
+    "attention",
     "kda_verify_conv_update",
     name="triton_nvidia_kda_verify_conv_update",
     solution="triton",
