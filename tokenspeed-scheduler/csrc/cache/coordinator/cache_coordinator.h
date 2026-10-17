@@ -169,10 +169,10 @@ public:
             std::int32_t num_common_tokens{0};
             // The full pages below it: num_common_tokens less the tail.
             std::int32_t full_page_tokens{0};
-            // The KV groups' own boundary before the State groups shortened
+            // The closed groups' own boundary before the others shortened
             // it: the junction a chunk may be cut at so the next prompt
             // resumes there.
-            std::int32_t kv_tokens{0};
+            std::int32_t closed_tokens{0};
             // Hits over group_keys (the full pages), relative to the tier's
             // floor.
             std::vector<GroupPrefixProbe> per_group;
@@ -200,9 +200,9 @@ public:
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
-        // The KV groups' boundary when it exceeds the admitted one (a State
-        // group had no checkpoint there): the junction a later chunk is cut
-        // at so its natural checkpoint lands where the KV is already cached.
+        // The closed groups' boundary when it exceeds the admitted one: the
+        // junction a later chunk is cut at so its natural checkpoint lands
+        // where the KV is already cached.
         std::int32_t junction_tokens{0};
         // The D role: every State group's prompt-end checkpoint was claimed,
         // so the peer omits the state transfer.
@@ -293,13 +293,17 @@ public:
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
     // that exist now plus the slots CacheCompletedBlocks(progress) would
-    // register (the single publication rule, completedBlockRanges). The
+    // register (the single publication rule, completedBlockRange). The
     // victim probe reads the image's L2/pool split off this before the
     // retraction publishes, so it sees exactly what StartRetractionStores
     // will see afterwards. Without completed pages it is PublishedDataSlots.
     std::vector<std::vector<ImageSlot>> PublishedDataSlotsAfter(std::span<const BlockTable> tables,
                                                                 std::int32_t num_tokens,
                                                                 const RequestProgress& progress) const;
+    // The first prefix page publishing `completed` registers an entry under (a
+    // natural checkpoint's window or state can lie before the new pages);
+    // prefix_hashes.size() when only the tail is touched.
+    std::int32_t FirstPublishedPrefixPage(const CompletedPages& completed) const;
 
     // A retracted request's KV image plus the Device -> snapshot-pool copies
     // that fill its snapshot-pool slots. The pairs pin the Device sources
@@ -569,11 +573,11 @@ private:
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
-    // the window behind the newest boundary of a sliding group, slot 1 of a
+    // the window behind a non-chunk point of a sliding group, slot 1 of a
     // State group at a non-chunk point, nothing for a replayable one.
     // The one source for cacheCompletedBlocksForGroup and for
     // PublishedDataSlotsAfter.
-    std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    std::optional<PublishedRange> completedBlockRange(std::size_t group_index, const CompletedPages& completed) const;
     // The key of table slot `block` of a History group at a publication point:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;

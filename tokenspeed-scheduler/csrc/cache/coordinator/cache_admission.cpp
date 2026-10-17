@@ -580,7 +580,7 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 }
 
 // The same progress without the tail it would publish: the full pages still
-// publish; the tail, the owner's move off it and the state checkpoint keyed
+// publish; the tail, the owner's move off it and the windows and state keyed
 // by it are dropped. Nothing left to publish leaves no CompletedPages.
 RequestProgress withoutTailPublication(const RequestProgress& progress) {
     RequestProgress out = progress;
@@ -662,7 +662,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // past a tail it publishes needs a fresh copy of every published block;
     // when the pool cannot fund those copies the owner keeps its partial
     // block private instead and publishes nothing at this point -- neither
-    // the tail nor the state checkpoint keyed by it -- so a request whose
+    // the tail nor the windows and state keyed by it -- so a request whose
     // reserve covers its generation never waits on a block it did not
     // reserve. Its finish publishes the frontier later.
     RequestProgress effective = progress;
@@ -694,13 +694,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const std::int32_t host_tail_tokens = plan.prefix.host.tail ? plan.prefix.host.tail->tail_tokens : 0;
     const std::int32_t admitted_tokens =
         std::max(plan.prefix.device.num_common_tokens, plan.prefix.host.num_common_tokens);
-    const std::int32_t kv_tokens = std::max(plan.prefix.device.kv_tokens, plan.prefix.host.kv_tokens);
+    const std::int32_t closed_tokens = std::max(plan.prefix.device.closed_tokens, plan.prefix.host.closed_tokens);
     const bool state_prefix_cached = plan.prefix.state_at_prompt_end.has_value();
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
-        .junction_tokens = kv_tokens > admitted_tokens ? kv_tokens : 0,
+        .junction_tokens = closed_tokens > admitted_tokens ? closed_tokens : 0,
         .state_prefix_cached = state_prefix_cached,
         .access_epoch = access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),

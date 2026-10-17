@@ -66,8 +66,7 @@ inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<Bloc
 }
 
 // Publishes the newly hashed pages [first_new_prefix_page, prefix_hashes.size())
-// at a page-aligned point; publish_state marks it a natural checkpoint of the
-// State groups (their slot 1 is registered under the last page's hash).
+// at a page-aligned point; publish_state marks it a natural checkpoint.
 inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                         std::span<const std::string> prefix_hashes, std::uint64_t access_epoch,
                                         std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,

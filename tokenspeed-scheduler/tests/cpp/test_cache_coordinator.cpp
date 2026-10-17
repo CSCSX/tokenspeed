@@ -300,8 +300,8 @@ TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
 
     const std::vector<std::string> hashes = ContentHashes({std::vector<std::int32_t>(8, 7)});
     CacheCompletedBlocksForTest(coordinator, tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
-                                /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
-                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+                                /*num_computed_tokens=*/8, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 1)));
@@ -1537,12 +1537,14 @@ TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
     const CacheBlockLocation reclaimed = tables[0].Blocks()[0]->Location();
 
     std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{4}}};
+    // The prompt end publishes the window behind 8.
     const RequestProgress progress{
         .completed_pages =
             CompletedPages{
                 .prefix_hashes = hashes,
                 .first_new_prefix_page = 0,
-                .boundary_kind = CacheBoundaryKind::kChunk,
+                .publish_state = true,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
             },
         .num_computed_tokens = 8,
     };
@@ -2439,10 +2441,16 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
-    CacheFullBlocksForTest(coordinator, tables, hashes, /*first_slot=*/0);
+    // The prompt end at 4 queues the full pages and the window [1, 4).
+    const auto publish = [&] {
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
+                                    /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/true, /*publish_state=*/true);
+    };
+    publish();
     std::vector<CacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
 
-    ASSERT_EQ(pending.size(), 2u);  // sliding-window group only; full-attention deferred
+    ASSERT_EQ(pending.size(), 4u);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
     for (const BlockTable& table : tables) {
         for (const CacheBlockRef& block_ref : table.Blocks()) {
@@ -2452,17 +2460,43 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     // Typed keys keep the group distinct without changing the content hash.
     std::unordered_set<CacheKey, CacheKeyHash> keys;
     for (const auto& c : pending) keys.insert(c.key);
-    EXPECT_EQ(keys.size(), 2u);
-    for (std::size_t i = 0; i < pending.size(); ++i) {
-        EXPECT_EQ(pending[i].key, Key(hashes[i], /*group_id=*/1)) << "candidate " << i;
-    }
+    EXPECT_EQ(keys, (std::unordered_set<CacheKey, CacheKeyHash>{Key(hashes[0], 0), Key(hashes[1], 0), Key(hashes[0], 1),
+                                                                Key(hashes[1], 1)}));
 
     // Re-registering the same hashes yields nothing new (IsCached skip).
-    CacheFullBlocksForTest(coordinator, tables, hashes, 0);
+    publish();
     EXPECT_TRUE(coordinator.TakePendingStores().empty());
 
     coordinator.Free(tables);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 12);  // four Manager-owned cache entries remain resident
+}
+
+// A chunk point publishes and streams only the full group's pages.
+TEST(CacheCoordinatorStoreCandidates, AChunkPointPublishesNoSlidingWindow) {
+    BlockPool pool(/*num_lcm_blocks=*/16, {1, 1});
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 4,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
+    };
+    BlockPool host_pool(4, {1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+
+    CacheCompletedBlocksForTest(coordinator, tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
+                                /*num_computed_tokens=*/4, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/true, /*publish_state=*/false);
+    std::unordered_set<CacheKey, CacheKeyHash> keys;
+    for (const auto& c : coordinator.TakePendingStores()) keys.insert(c.key);
+    EXPECT_EQ(keys, (std::unordered_set<CacheKey, CacheKeyHash>{Key(hashes[0], 0), Key(hashes[1], 0)}));
+    EXPECT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 0);
+    coordinator.Free(tables);
 }
 
 TEST(CacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
@@ -3231,7 +3265,8 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
                 .prefix_hashes = ch,
                 // Only page 3 is new; the two-page resume tail crosses the prior chunk.
                 .first_new_prefix_page = 3,
-                .boundary_kind = CacheBoundaryKind::kChunk,
+                .publish_state = true,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
             },
         .num_computed_tokens = 16,
     };
@@ -3255,12 +3290,21 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/14));
     std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    const std::vector<std::int32_t> tail_rows{3, 3};
+    const TailPublication tail{
+        .tail_tokens = 2,
+        .hash = HashPrefixPage(token_span(tail_rows.data(), tail_rows.size()), hashes.back()),
+    };
     std::vector<GroupDemand> demands{{.table = &tables[0]}};
+    // The window behind the prompt end at 14 spans pages 1-2 and the tail.
     const RequestProgress progress{
         .completed_pages =
             CompletedPages{
                 .prefix_hashes = hashes,
                 .first_new_prefix_page = 0,
+                .tail = tail,
+                .owner_continues = true,
+                .publish_state = true,
                 .boundary_kind = CacheBoundaryKind::kEndpoint,
             },
         .num_computed_tokens = 14,
@@ -3270,6 +3314,7 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[2], 0)));
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(tail.hash, 0)));
     coord.Free(tables);
 }
 
@@ -3331,7 +3376,7 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverConstrainsTheCommonBoundary) 
     }
     const CacheCoordinator::PrefixProbe probe = coord.ProbePrefix(hashes);
     EXPECT_EQ(probe.device.num_common_tokens, 12);
-    EXPECT_EQ(probe.device.kv_tokens, 12);
+    EXPECT_EQ(probe.device.closed_tokens, 12);
     EXPECT_EQ(probe.device.per_group[0].hits, (std::vector<std::uint8_t>{1, 1, 1}));
     EXPECT_TRUE(probe.device.per_group[1].hits.empty());
 
@@ -3918,9 +3963,12 @@ protected:
                                    hashes_.empty() ? std::string{} : hashes_.back()),
         };
         const RequestProgress progress{
-            .completed_pages =
-                CompletedPages{
-                    .prefix_hashes = hashes_, .first_new_prefix_page = 0, .tail = tail, .owner_continues = false},
+            .completed_pages = CompletedPages{.prefix_hashes = hashes_,
+                                              .first_new_prefix_page = 0,
+                                              .tail = tail,
+                                              .owner_continues = false,
+                                              .publish_state = true,
+                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
             .num_computed_tokens = num_computed_tokens,
         };
         coordinator_.CacheCompletedBlocks(tables, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
@@ -4010,16 +4058,11 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     coordinator_.Free(tables);
     // The sliding group (W=3 over 2-token blocks) needs the rows [T-2, T)
     // behind a boundary: behind the tail at 11 the blocks [8, 10) and
-    // [10, 11), behind the page boundary 8 the block [6, 8). Evict the
-    // latter alone.
-    CacheBlockLocation location{};
-    {
-        const CacheBlockRef victim = coordinator_.GroupPrefixIndex(2).Find(pool_, Key(hashes_[1], 2, 1));
-        ASSERT_TRUE(static_cast<bool>(victim));
-        location = victim->Location();
-    }
-    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 2, location));
+    // [10, 11), behind the page boundary 8 the block [6, 8). Only the former
+    // are published.
+    EXPECT_TRUE(Cached(2, tail.hash, 0));
     EXPECT_TRUE(Cached(2, tail.hash, 1));
+    EXPECT_FALSE(Cached(2, hashes_[1], 1));
 
     const CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(
         CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 11});
@@ -4028,12 +4071,26 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     EXPECT_EQ(probe.device.tail->hash, tail.hash);
     EXPECT_EQ(probe.device.tail->per_group[2].hits, (std::vector<std::uint8_t>{1, 1}));
 
-    // Below the tail the page boundary 8 is not resumable for the sliding
-    // group, and a sliding group publishes only its newest boundary's
-    // lookback, so nothing below 8 is resumable either.
+    // Below the tail nothing is resumable for the sliding group; the full
+    // groups' coverage 8 is the junction.
     const CacheCoordinator::PrefixProbe below = coordinator_.ProbePromptPrefix(
         CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 10});
     EXPECT_EQ(below.device.num_common_tokens, 0);
+    EXPECT_EQ(below.device.closed_tokens, 8);
+}
+
+TEST_F(TailPublicationTest, TheDecodeRoleRecordsNoJunction) {
+    std::vector<BlockTable> tables(3);
+    const std::vector<std::int32_t> tokens = MakeTokens(12);
+    PublishFinal(tables, tokens, /*num_computed_tokens=*/11);
+    coordinator_.Free(tables);
+    // A local prefill cuts a junction at 8; the D's landing never cuts one.
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 10};
+    EXPECT_EQ(coordinator_.ProbePromptPrefix(prompt).device.closed_tokens, 8);
+    const CacheCoordinator::PrefixProbe landing =
+        coordinator_.ProbeDecodeDevicePrefix(prompt, /*prompt_end_tokens=*/12);
+    EXPECT_EQ(landing.device.num_common_tokens, 0);
+    EXPECT_EQ(landing.device.closed_tokens, 0);
 }
 
 // Oracle: whatever the page size P, the block size g and the window W, a
@@ -4080,7 +4137,11 @@ TEST(SlidingWindowOracleTest, AHitterHoldsEveryBlockOfTheWindowBehindAnUnaligned
                                    hashes.empty() ? std::string{} : hashes.back()),
         };
         const RequestProgress progress{
-            .completed_pages = CompletedPages{.prefix_hashes = hashes, .first_new_prefix_page = 0, .tail = tail},
+            .completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                              .first_new_prefix_page = 0,
+                                              .tail = tail,
+                                              .publish_state = true,
+                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
             .num_computed_tokens = T,
         };
         coord.CacheCompletedBlocks(owner, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coord));
