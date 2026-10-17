@@ -115,6 +115,7 @@ def _commit(
     conv_stride,
     metadata,
     stamps,
+    lower_bound,
 ):
     batched_recoverssm_commit(
         descriptors,
@@ -134,7 +135,7 @@ def _commit(
         conv_width=4,
         record_metadata=metadata,
         record_stamps=stamps,
-        lower_bound=-5.0,
+        lower_bound=lower_bound,
         history=history,
     )
 
@@ -142,7 +143,10 @@ def _commit(
 @pytest.mark.parametrize("capacity", [8, 16, 32])
 @pytest.mark.parametrize("captured", [False, True])
 @pytest.mark.parametrize("batch", [8, 32])
-def test_fused_t1_history_lifecycle(capacity: int, captured: bool, batch: int) -> None:
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+def test_fused_t1_history_lifecycle(
+    capacity: int, captured: bool, batch: int, lower_bound: float | None
+) -> None:
     """Compare real fused decode across acceptance, page reuse and graph replay."""
     torch.manual_seed(70031)
     heads, dim = 12, 128
@@ -222,7 +226,7 @@ def test_fused_t1_history_lifecycle(capacity: int, captured: bool, batch: int) -
             history,
             raw,
             output,
-            -5.0,
+            lower_bound,
             u,
             kd,
             metadata,
@@ -241,6 +245,7 @@ def test_fused_t1_history_lifecycle(capacity: int, captured: bool, batch: int) -
             conv.stride(0),
             metadata,
             stamps,
+            lower_bound,
         )
 
     step()
@@ -337,7 +342,7 @@ def test_fused_t1_history_lifecycle(capacity: int, captured: bool, batch: int) -
             num_heads=heads,
             head_dim=dim,
             cu_seqlens=qsl,
-            lower_bound=-5.0,
+            lower_bound=lower_bound,
             recurrent_layout="v_major",
         )
         assert expected is not None

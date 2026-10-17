@@ -44,11 +44,12 @@ FP32 registers. It writes FP32 correction, normalized key and decay records;
 records. Accepted commit copies normalized factors without another transform.
 Both producers use the same cache-owned history and acceptance lifecycle.
 
-The tiled recurrence preserves the fused decode reduction groups and rounds
-products before their sums. Candidate factors stay in separate scratch while
-all value tiles read the previous accepted history. Only the first value tile
-writes shared key/decay records. Convolution publication remains after verify,
-so an in-place update cannot race another tile reading the old window.
+One thread block handles each head, preserving the original fused decode's
+reduction layout. Empty and nonempty histories share the same dense-state
+load; an empty history runs no recovery iterations. Candidate factors stay in
+separate scratch while verify reads the previous accepted history.
+Convolution publication remains after verify, so every reader sees the old
+window until verification completes.
 
 Zero acceptance can still publish a consolidated base or copy a checkpoint to
 its private destination. Current record stamps distinguish that case from an

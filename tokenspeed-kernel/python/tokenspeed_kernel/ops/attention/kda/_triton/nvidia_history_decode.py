@@ -26,29 +26,6 @@ from tokenspeed_kernel.ops.attention.kda import KdaReplayRecords
 from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import _recover_kda_history
 
 
-@triton.jit
-def _fused_decode_dot(state, vector, BV: tl.constexpr, BK: tl.constexpr):
-    # Match the full-head fused decode's eight-product reduction groups.
-    # Round each product before addition; contraction changes the correction.
-    product = tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[state, vector[None, :]],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    even, odd = tl.split(tl.reshape(product, (BV, BK // 2, 2)))
-    e0, e2 = tl.split(tl.reshape(even, (BV, BK // 4, 2)))
-    o1, o3 = tl.split(tl.reshape(odd, (BV, BK // 4, 2)))
-    even_pairs = e0 + e2
-    odd_pairs = o1 + o3
-    e02, e46 = tl.split(tl.reshape(even_pairs, (BV, BK // 8, 2)))
-    o13, o57 = tl.split(tl.reshape(odd_pairs, (BV, BK // 8, 2)))
-    partial = (e02 + e46) + (o13 + o57)
-    return tl.sum(partial, axis=1)
-
-
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -246,30 +223,28 @@ def _fused_history_decode_kernel(
     p_h0 += o_v[:, None] * K + o_k[None, :]
     length = tl.load(history_lengths + b_read * stride_length, mask=b_read > 0, other=0)
     tl.device_assert((length >= 0) & (length <= CAPACITY), "invalid history length")
-    if length > 0:
-        b_h = _recover_kda_history(
-            p_h0,
-            mask_h,
-            history_u + b_read * stride_hu_page + i_hv * stride_hu_head,
-            history_key + b_read * stride_hk_page + i_hv * stride_hk_head,
-            history_decay + b_read * stride_hd_page + i_hv * stride_hd_head,
-            o_k,
-            o_v,
-            mask_k,
-            mask_v,
-            length,
-            stride_hu_token,
-            stride_hu_dim,
-            stride_hk_token,
-            stride_hk_dim,
-            stride_hd_token,
-            stride_hd_dim,
-            triton.next_power_of_2(CAPACITY),
-            False,
-            1,
-        )
-    else:
-        b_h = tl.load(p_h0, mask=mask_h & read_ok, other=0.0).to(tl.float32)
+    # The same load handles an empty history; its recovery loop then runs zero times.
+    b_h = _recover_kda_history(
+        p_h0,
+        mask_h & read_ok,
+        history_u + b_read * stride_hu_page + i_hv * stride_hu_head,
+        history_key + b_read * stride_hk_page + i_hv * stride_hk_head,
+        history_decay + b_read * stride_hd_page + i_hv * stride_hd_head,
+        o_k,
+        o_v,
+        mask_k,
+        mask_v,
+        length,
+        stride_hu_token,
+        stride_hu_dim,
+        stride_hk_token,
+        stride_hk_dim,
+        stride_hd_token,
+        stride_hd_dim,
+        triton.next_power_of_2(CAPACITY),
+        False,
+        2,
+    )
     flush = ((length + 1 > CAPACITY) | (b_read != b_write)) & (b_write > 0)
     offset = tl.where(flush, 0, length)
     if flush:
@@ -278,12 +253,12 @@ def _fused_history_decode_kernel(
         tl.store(append_offsets + i_n * stride_offsets, offset)
 
     b_h *= tl.exp(b_gk)[None, :]
-    b_v = b_v - _fused_decode_dot(b_h, b_k, BV, BK)
+    b_v = b_v - tl.sum(b_h * b_k[None, :], axis=1)
     b_beta = tl.load(beta + bos * stride_beta_tok + i_hv).to(tl.float32)
     b_beta = tl.sigmoid(b_beta)
     b_v *= b_beta
     b_h += b_v[:, None] * b_k[None, :]
-    b_o = _fused_decode_dot(b_h, b_q, BV, BK)
+    b_o = tl.sum(b_h * b_q[None, :], axis=1)
     tl.store(
         o + (bos * HV + i_hv) * V + o_v,
         b_o.to(o.dtype.element_ty),
@@ -345,7 +320,8 @@ def fused_history_decode(
         dtype=mixed_qkv.dtype,
         device=mixed_qkv.device,
     )
-    tile = 16
+    # Match the original fused decode's full-head reduction layout.
+    tile = 128
     _fused_history_decode_kernel[(batch * heads * triton.cdiv(dim, tile),)](
         qkv_raw=mixed_qkv,
         conv_w=conv_weights,
