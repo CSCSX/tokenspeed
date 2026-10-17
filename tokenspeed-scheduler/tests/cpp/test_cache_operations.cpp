@@ -890,11 +890,24 @@ TEST_F(AsyncStorageTailTest, FirstPageTailNeedsNoFullPageHash) {
 
 TEST_F(AsyncStorageTailTest, QueryBudgetKeepsTailGroupsTogether) {
     const auto prefix = prompt(11, true);
-    const auto query = coordinator.MissingStorageKeys(prefix, 12);
+    // The tail needs nine objects, while the preceding aligned boundary
+    // needs seven. Eight credits must not include a partial tail group set.
+    const auto query = coordinator.MissingStorageKeys(prefix, 8);
     EXPECT_EQ(query.max_tokens, 8);
-    EXPECT_EQ(query.keys.size(), 10u);
+    EXPECT_EQ(query.keys.size(), 7u);
     EXPECT_TRUE(
         std::ranges::none_of(query.keys, [&](const auto& key) { return key.content_hash == prefix.tail->hash; }));
+}
+
+TEST_F(AsyncStorageTailTest, QueryBudgetPrioritizesTheCompleteTail) {
+    const auto prefix = prompt(11, true);
+    const auto query = coordinator.MissingStorageKeys(prefix, 12);
+    EXPECT_EQ(query.max_tokens, 11);
+    EXPECT_LE(query.keys.size(), 12u);
+    const auto reservation = coordinator.ReserveStoragePrefix(prefix, query.keys, 9);
+    ASSERT_TRUE(reservation.tail);
+    EXPECT_EQ(reservation.tail->hash, prefix.tail->hash);
+    EXPECT_EQ(reservation.blocks.size(), 9u);
 }
 
 TEST_F(AsyncStorageTailTest, HostBudgetRetriesTheImmediatelyPrecedingAlignedBoundary) {

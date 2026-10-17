@@ -110,8 +110,12 @@ adds no ordering between the two executors: tickets express the dependencies.
    minimum, bypasses L3. Otherwise it considers a bounded extension of that
    prefix, respecting replay/logprob limits and group geometry. It expands
    full prefix boundaries and matching tails from the local `TailTable`, plus
-   the exact reusable request bound. Each boundary's group keys enter the
-   query together or not at all when the key budget is exhausted.
+   the exact reusable request bound. Query credits first cover the longest
+   boundary whose complete missing dependencies fit: Full history, the SWA
+   window and each State checkpoint at that boundary. Shorter fallback
+   boundaries contribute their distinct missing keys only when the whole
+   additional set fits. Historical State checkpoints cannot crowd out the
+   prompt-end checkpoint needed for the longest restore.
 2. the storage subset of `plan.cache` carries a query with a monotonically increasing operation
    ID and immutable keys. Querying reserves no Device pages or batch slots.
 3. After all owners report existence, C++ runs the existing group matcher
@@ -140,6 +144,13 @@ Tail discovery is local and bounded. A cold instance can probe the reusable
 request bound, but cannot discover an arbitrary older nonaligned checkpoint
 in a longer prompt without a local hint. There is no shared tail directory
 or scan of every token position. These misses use ordinary computation.
+
+Query planning uses the same matcher masks and key traversal as reservation,
+with temporary existence assumptions and no cache-block allocation. It may
+skip history below the aligned local Device/Host coverage, but considers only
+boundaries beyond the complete local hit. Reservation always matches again
+from the Device floor and pins the real Host dependencies before allocation;
+eviction between QUERY and GET can shorten the restore, never establish a hit.
 
 `max_host_blocks` counts logical references across all groups and outstanding
 storage operations, including recurrent-state checkpoints. It is neither a

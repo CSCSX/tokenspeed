@@ -1726,20 +1726,46 @@ CacheBlockRef CacheCoordinator::AcquireHostCachedBlock(const CacheKey& key) {
     return host_pool_ == nullptr ? CacheBlockRef{} : groups_.at(key.group_id).Index().Find(*host_pool_, key);
 }
 
+template <typename Visit>
+void CacheCoordinator::forEachStorageDependency(const PrefixProbe::Tier& probe,
+                                                std::span<const std::vector<CacheKey>> group_keys,
+                                                std::int32_t floor_tokens, const Visit& visit) const {
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const auto begin = floor_tokens / prefix_granularity_ * BlocksPerBoundary(static_cast<std::int32_t>(i));
+        for (std::size_t j = 0; j < probe.per_group[i].hits.size(); ++j) {
+            if (probe.per_group[i].hits[j]) {
+                visit(group_keys[i][static_cast<std::size_t>(begin) + j], begin + static_cast<std::int32_t>(j));
+            }
+        }
+        if (!probe.tail) continue;
+        const auto& tail = *probe.tail;
+        const auto full_blocks =
+            probe.full_page_tokens / (GroupIsState(i) ? prefix_granularity_ : geometry_[i].BlockGranularity());
+        for (std::size_t j = 0; j < tail.per_group[i].hits.size(); ++j) {
+            if (tail.per_group[i].hits[j]) {
+                visit(tail.group_keys[i][j], full_blocks + static_cast<std::int32_t>(j));
+            }
+        }
+    }
+}
+
 CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const PromptPrefix& prompt,
                                                                     std::size_t max_keys) const {
     const PrefixProbe local = ProbePromptPrefix(prompt);
     StorageQuery query;
-    query.max_tokens = local.device.num_common_tokens;
+    const auto local_tokens = std::max(local.device.num_common_tokens, local.host.num_common_tokens);
+    const auto floor = std::max(local.device.full_page_tokens, local.host.full_page_tokens);
+    query.max_tokens = local_tokens;
+    if (max_keys == 0 || prompt.max_tokens <= local_tokens) return query;
     struct Candidate {
         std::int32_t full_tokens;
         std::int32_t tail_tokens;
         ContentHash hash;
     };
     std::vector<Candidate> candidates;
-    forEachCandidateBoundary(prompt, local.device.full_page_tokens, prompt.max_tokens,
+    forEachCandidateBoundary(prompt, floor, prompt.max_tokens,
                              [&](std::int32_t full_tokens, std::int32_t tail_tokens, const ContentHash& hash) {
-                                 if (full_tokens + tail_tokens <= local.device.num_common_tokens) return true;
+                                 if (full_tokens + tail_tokens <= local_tokens) return true;
                                  if (tail_tokens > 0) {
                                      const ContentHash prior =
                                          full_tokens == 0 ? ContentHash{}
@@ -1750,29 +1776,53 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
                                  candidates.push_back({full_tokens, tail_tokens, hash});
                                  return true;
                              });
-    // Expand each boundary once, in increasing order. Roll back a whole
-    // boundary when credits run out, including its tail/state dependencies.
-    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
-        const auto previous_size = query.keys.size();
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            if (GroupIsReplayable(static_cast<std::int32_t>(i))) continue;
-            const auto per_prefix = BlocksPerBoundary(static_cast<std::int32_t>(i));
-            const auto page = static_cast<std::size_t>(it->full_tokens / prefix_granularity_);
-            const auto tail_keys =
-                it->tail_tokens > 0 ? tailKeysForGroup(i, it->hash, it->tail_tokens) : std::vector<CacheKey>{};
-            const auto keys = it->tail_tokens > 0 ? std::span<const CacheKey>{tail_keys}
-                                                  : std::span<const CacheKey>{local.group_keys[i]}.subspan(
-                                                        (page - 1) * per_prefix, per_prefix);
-            for (const auto& key : keys) {
-                if (ContainsHostCachedBlock(key)) continue;
-                if (query.keys.size() == max_keys) {
-                    query.keys.resize(previous_size);
-                    return query;
-                }
-                query.keys.push_back(key);
+
+    // Temporary assumptions let the ordinary matcher enumerate a complete
+    // candidate's Full history, SWA window and endpoint State. They never
+    // become published hits or acquire any Host references.
+    std::unordered_set<CacheKey, CacheKeyHash> possible;
+    for (const std::size_t i : match_order_) {
+        const auto per_prefix = BlocksPerBoundary(static_cast<std::int32_t>(i));
+        const auto begin = static_cast<std::size_t>(floor / prefix_granularity_ * per_prefix);
+        const auto end = static_cast<std::size_t>(prompt.max_tokens / prefix_granularity_ * per_prefix);
+        for (std::size_t j = begin; j < end; ++j) possible.insert(local.group_keys[i][j]);
+        for (const auto& candidate : candidates) {
+            if (candidate.tail_tokens > 0) {
+                for (const auto& key : tailKeysForGroup(i, candidate.hash, candidate.tail_tokens)) possible.insert(key);
             }
         }
-        query.max_tokens = it->full_tokens + it->tail_tokens;
+    }
+
+    // Complete local coverage certifies history below this aligned floor
+    // only for candidates above local_tokens, including nonmonotone SWA.
+    // ReserveStoragePrefix still matches again from the Device floor.
+    std::unordered_set<CacheKey, CacheKeyHash> selected;
+    for (const auto& boundary : candidates) {
+        auto candidate = prompt;
+        candidate.max_tokens = boundary.full_tokens + boundary.tail_tokens;
+        candidate.tail =
+            boundary.tail_tokens > 0
+                ? std::optional{TailPublication{.tail_tokens = boundary.tail_tokens, .hash = boundary.hash}}
+                : std::nullopt;
+        const auto probe =
+            probeTier<CacheTier::kHost>(candidate, local.group_keys, match_order_, floor, true, &possible);
+        _assert(probe.num_common_tokens == candidate.max_tokens, "an optimistic candidate must match completely");
+        std::vector<CacheKey> additional;
+        std::unordered_set<CacheKey, CacheKeyHash> distinct;
+        bool fits = true;
+        forEachStorageDependency(probe, local.group_keys, floor, [&](const CacheKey& key, std::int32_t) {
+            if (!fits || ContainsHostCachedBlock(key) || selected.contains(key) || !distinct.insert(key).second) return;
+            if (additional.size() == max_keys - query.keys.size()) {
+                fits = false;
+                return;
+            }
+            additional.push_back(key);
+        });
+        if (!fits) continue;
+        query.max_tokens = std::max(query.max_tokens, candidate.max_tokens);
+        selected.insert(additional.begin(), additional.end());
+        query.keys.insert(query.keys.end(), additional.begin(), additional.end());
+        if (query.keys.size() == max_keys) break;
     }
     return query;
 }
@@ -1801,23 +1851,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
             }
         };
         // Pin every warm dependency before any allocation can evict another hit.
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const auto begin = floor / prefix_granularity_ * BlocksPerBoundary(static_cast<std::int32_t>(i));
-            for (std::size_t j = 0; j < probe.per_group[i].hits.size(); ++j) {
-                if (!probe.per_group[i].hits[j]) continue;
-                const auto& key = local.group_keys[i][static_cast<std::size_t>(begin) + j];
-                pin(key, begin + static_cast<std::int32_t>(j));
-            }
-            if (probe.tail) {
-                const auto& tail = *probe.tail;
-                const auto full_blocks =
-                    probe.full_page_tokens / (GroupIsState(i) ? prefix_granularity_ : geometry_[i].BlockGranularity());
-                for (std::size_t j = 0; j < tail.per_group[i].hits.size(); ++j) {
-                    if (tail.per_group[i].hits[j])
-                        pin(tail.group_keys[i][j], full_blocks + static_cast<std::int32_t>(j));
-                }
-            }
-        }
+        forEachStorageDependency(probe, local.group_keys, floor, pin);
         if (probe.tail) {
             result.tail_prior = probe.full_page_tokens == 0
                                     ? ContentHash{}

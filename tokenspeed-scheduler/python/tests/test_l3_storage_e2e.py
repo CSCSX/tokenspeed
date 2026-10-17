@@ -161,10 +161,8 @@ def test_sparse_state_hit_uses_existing_group_matcher(state_groups):
         )
     )
     q = submit(s)
-    final_states = {
-        tuple([key for key in q.keys if key[0] == gid][-1])
-        for gid in range(1, state_groups + 1)
-    }
+    checkpoint = s.prefix_hashes_for_tokens(list(range(8)))[-1]
+    final_states = {(gid, checkpoint, 0) for gid in range(1, state_groups + 1)}
     flags = [int(key[0] == 0 or tuple(key) in final_states) for key in q.keys]
     get_plan = read(s, q, flags)
     get = storage_ops(get_plan)[0]

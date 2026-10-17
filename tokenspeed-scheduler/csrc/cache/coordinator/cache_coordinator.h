@@ -520,6 +520,11 @@ private:
     PrefixProbe::Tier probeTier(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
                                 std::span<const std::size_t> match_order, std::int32_t floor_tokens, bool claim_partial,
                                 const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
+    // The complete dependency set selected by a matcher, with each key's
+    // absolute logical block index (including holes before an SWA window).
+    template <typename Visit>
+    void forEachStorageDependency(const PrefixProbe::Tier& probe, std::span<const std::vector<CacheKey>> group_keys,
+                                  std::int32_t floor_tokens, const Visit& visit) const;
     std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
                                      bool claim_partial) const;
