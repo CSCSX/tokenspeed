@@ -18,39 +18,40 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Validated limits shared by the storage executor and C++ cache owner."""
+"""Storage scheduling limits and Python worker settings, parsed once at startup."""
 
+from __future__ import annotations
+
+import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-from tokenspeed.runtime.cache.l3.mooncake import parse_extra_config
+if TYPE_CHECKING:
+    from tokenspeed_scheduler import StorageConfig
 
 
 @dataclass(frozen=True, slots=True)
-class L3AsyncConfig:
-    max_operations: int
-    max_keys_per_operation: int
-    max_host_blocks: int
-    metadata_entries: int
-    max_prefetch_tokens: int
-    min_prefetch_tokens: int
-    wait_timeout_ms: int
-    ready_timeout_ms: int
+class StorageRuntimeConfig:
+    """Own worker settings and the shared, read-only scheduler contract.
+
+    Scheduling limits live only in ``scheduler``. The executor and replica
+    hooks read that same contract instead of keeping a Python mirror.
+    Backend connection settings remain inside the selected storage backend.
+    """
+
+    scheduler: StorageConfig
     query_workers: int
     read_workers: int
     write_workers: int
     failure_threshold: int
     recovery_interval_ms: int
-    queue_high_operations: int
-    queue_low_operations: int
-    queue_high_bytes: int
-    queue_low_bytes: int
-    operation_high_age_ms: int
-    operation_low_age_ms: int
 
     @classmethod
     def from_extra_config(
         cls, raw: str | None, *, host_blocks: int, prefix_granularity: int
-    ):
+    ) -> StorageRuntimeConfig:
+        from tokenspeed_scheduler import StorageConfig, StoragePressure
+
         knobs = parse_extra_config(raw).get("async", {})
         if not isinstance(knobs, dict):
             raise ValueError("L3 async config must be an object")
@@ -103,32 +104,60 @@ class L3AsyncConfig:
         ):
             if values[low] >= values[high]:
                 raise ValueError(f"L3 {low} must be smaller than {high}")
+        # Match the scheduler's int32 contract before crossing the binding,
+        # rather than exposing a nanobind conversion error at startup.
+        for name in (
+            "max_operations",
+            "max_keys_per_operation",
+            "max_host_blocks",
+            "metadata_entries",
+            "max_prefetch_tokens",
+            "min_prefetch_tokens",
+        ):
+            if values[name] > 2**31 - 1:
+                raise ValueError(f"L3 {name} exceeds the scheduler's int32 limit")
         if values["max_host_blocks"] > host_blocks:
             raise ValueError("L3 max_host_blocks exceeds usable Host parents")
         if values["min_prefetch_tokens"] > values["max_prefetch_tokens"]:
             raise ValueError("L3 minimum prefetch must fit the maximum")
-        return cls(**values)
-
-    def scheduler_config(self):
-        from tokenspeed_scheduler import StorageConfig, StoragePressure
-
-        return StorageConfig(
-            self.max_operations,
-            self.max_keys_per_operation,
-            self.max_host_blocks,
-            self.metadata_entries,
-            self.max_prefetch_tokens,
-            self.min_prefetch_tokens,
-            self.wait_timeout_ms * 1000,
-            self.ready_timeout_ms * 1000,
-            StoragePressure(
-                self.queue_high_operations,
-                self.queue_high_bytes,
-                self.operation_high_age_ms * 1000,
+        return cls(
+            scheduler=StorageConfig(
+                values["max_operations"],
+                values["max_keys_per_operation"],
+                values["max_host_blocks"],
+                values["metadata_entries"],
+                values["max_prefetch_tokens"],
+                values["min_prefetch_tokens"],
+                values["wait_timeout_ms"] * 1000,
+                values["ready_timeout_ms"] * 1000,
+                StoragePressure(
+                    values["queue_high_operations"],
+                    values["queue_high_bytes"],
+                    values["operation_high_age_ms"] * 1000,
+                ),
+                StoragePressure(
+                    values["queue_low_operations"],
+                    values["queue_low_bytes"],
+                    values["operation_low_age_ms"] * 1000,
+                ),
             ),
-            StoragePressure(
-                self.queue_low_operations,
-                self.queue_low_bytes,
-                self.operation_low_age_ms * 1000,
-            ),
+            query_workers=values["query_workers"],
+            read_workers=values["read_workers"],
+            write_workers=values["write_workers"],
+            failure_threshold=values["failure_threshold"],
+            recovery_interval_ms=values["recovery_interval_ms"],
         )
+
+
+def parse_extra_config(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "--kvstore-storage-backend-extra-config must be a JSON object"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("--kvstore-storage-backend-extra-config must be a JSON object")
+    return parsed

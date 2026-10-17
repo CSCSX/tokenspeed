@@ -45,12 +45,12 @@ from tokenspeed.runtime.cache.l3.backend import (
     storage_key_prefix,
     storage_object_key,
 )
-from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
+from tokenspeed.runtime.cache.l3.config import parse_extra_config
+from tokenspeed.runtime.cache.l3.factory import create_storage_backend
 from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeKvStore,
     MooncakeStoreConfig,
-    parse_extra_config,
 )
 
 
@@ -1570,17 +1570,17 @@ class TestL3HostStoreTest:
 
 class TestFactoryTest:
     def test_memory_and_unknown_backend(self):
-        backend = create_kvstore_storage_backend(
+        backend = create_storage_backend(
             "memory", None, host_buffer=object(), tp_size=1, pp_size=1
         )
         assert isinstance((backend), (MemoryKvStore))
         assert (
-            create_kvstore_storage_backend(
+            create_storage_backend(
                 None, None, host_buffer=object(), tp_size=1, pp_size=1
             )
         ) is None
         with pytest.raises((ValueError), match=("unsupported")):
-            create_kvstore_storage_backend(
+            create_storage_backend(
                 "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
             )
 

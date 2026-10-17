@@ -32,7 +32,7 @@ import pytest
 from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.l3.executor import StorageJob
-from tokenspeed.runtime.cache.l3.factory import build_l3_cache
+from tokenspeed.runtime.cache.l3.factory import create_l3_executor
 from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
 from tokenspeed.runtime.cache.transfer.layout import CacheField, CacheGroupLayout
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
@@ -139,9 +139,9 @@ def complete(executor):
 
 def test_factory_roundtrips_through_the_shared_host_resource(construction):
     args, model, host, inputs = construction
-    config, executor = build_l3_cache(args, model, None, **inputs)
+    executor = create_l3_executor(args, model, None, **inputs)
     try:
-        assert config.max_host_blocks <= host.num_host_lcm_blocks
+        assert executor.config.scheduler.max_host_blocks <= host.num_host_lcm_blocks
         host.host_buffer[:4] = b"KV01"
         key = executor.store.object_key("prefix", 0, 0)
         executor.submit(StorageJob(1, "put", (key,), (0,), (4,)))
@@ -158,7 +158,7 @@ def test_factory_roundtrips_through_the_shared_host_resource(construction):
 
 def test_factory_freezes_namespace_inputs_before_weight_version_switch(construction):
     args, model, _, inputs = construction
-    _, executor = build_l3_cache(args, model, None, **inputs)
+    executor = create_l3_executor(args, model, None, **inputs)
     try:
         original = executor.store.key_prefix
         executor.set_weight_version("v2")
@@ -172,7 +172,7 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
         )
         executor.set_weight_version("v2")
         assert executor.store.key_prefix == expected
-        _, changed = build_l3_cache(args, model, None, **inputs)
+        changed = create_l3_executor(args, model, None, **inputs)
         try:
             changed.set_weight_version("v2")
             assert changed.store.key_prefix != expected
@@ -189,8 +189,8 @@ def test_factory_includes_the_draft_checkpoint_identity(construction, tmp_path):
     draft = ModelConfig(
         str(path), server_args=args, model_override_args="{}", dtype="bfloat16"
     )
-    _, target_only = build_l3_cache(args, model, None, **inputs)
-    _, with_draft = build_l3_cache(args, model, draft, **inputs)
+    target_only = create_l3_executor(args, model, None, **inputs)
+    with_draft = create_l3_executor(args, model, draft, **inputs)
     try:
         assert target_only.store.key_prefix != with_draft.store.key_prefix
     finally:
@@ -215,7 +215,7 @@ def test_factory_refuses_head_partitioned_payload_on_cyclic_owners(construction)
         inputs["host_cache"], ownership=ownership, transfer_schema=schema
     )
     with pytest.raises(ValueError, match="k is head-partitioned"):
-        build_l3_cache(args, model, None, **inputs)
+        create_l3_executor(args, model, None, **inputs)
 
 
 def test_factory_validates_limits_against_actual_host_capacity(construction):
@@ -224,20 +224,20 @@ def test_factory_validates_limits_against_actual_host_capacity(construction):
         {"async": {"max_host_blocks": host.num_host_lcm_blocks + 1}}
     )
     with pytest.raises(ValueError, match="exceeds usable Host parents"):
-        build_l3_cache(args, model, None, **inputs)
+        create_l3_executor(args, model, None, **inputs)
 
 
 def test_unconfigured_storage_needs_neither_host_memory_nor_checkpoint_io(construction):
     args, model, _, _ = construction
     args.kvstore_storage_backend = None
     Path(model.model_path, "model.safetensors").unlink()
-    assert build_l3_cache(args, model, None, host_cache=None, world_cpu_group=None) == (
-        None,
-        None,
+    assert (
+        create_l3_executor(args, model, None, host_cache=None, world_cpu_group=None)
+        is None
     )
 
 
 def test_configured_storage_requires_host_memory(construction):
     args, model, _, _ = construction
     with pytest.raises(ValueError, match="requires a Host L2 allocation"):
-        build_l3_cache(args, model, None, host_cache=None, world_cpu_group=None)
+        create_l3_executor(args, model, None, host_cache=None, world_cpu_group=None)

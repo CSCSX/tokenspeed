@@ -223,8 +223,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                       std::int64_t, tokenspeed::StoragePressure, tokenspeed::StoragePressure>(),
              nb::arg("max_operations"), nb::arg("max_keys_per_operation"), nb::arg("max_host_blocks"),
              nb::arg("metadata_entries"), nb::arg("max_prefetch_tokens"), nb::arg("min_prefetch_tokens"),
-             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("pressure_high"),
-             nb::arg("pressure_low"));
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("pressure_high"), nb::arg("pressure_low"))
+        .def_ro("max_operations", &tokenspeed::StorageConfig::max_operations)
+        .def_ro("max_keys_per_operation", &tokenspeed::StorageConfig::max_keys_per_operation)
+        .def_ro("max_host_blocks", &tokenspeed::StorageConfig::max_host_blocks)
+        .def_ro("metadata_entries", &tokenspeed::StorageConfig::metadata_entries)
+        .def_ro("max_prefetch_tokens", &tokenspeed::StorageConfig::max_prefetch_tokens)
+        .def_ro("min_prefetch_tokens", &tokenspeed::StorageConfig::min_prefetch_tokens)
+        .def_ro("wait_timeout_us", &tokenspeed::StorageConfig::wait_timeout_us)
+        .def_ro("ready_timeout_us", &tokenspeed::StorageConfig::ready_timeout_us)
+        .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
+        .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)

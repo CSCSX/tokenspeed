@@ -44,7 +44,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     copy_host_bytes,
     write_host_bytes,
 )
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import L3Executor
 from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
@@ -182,7 +182,7 @@ def test_cold_tail_restores_actual_put_bytes(
     )
     shared = MemoryKvStore()
     namespace = f"tail-roundtrip-{uuid.uuid4().hex}"
-    async_config = L3AsyncConfig.from_extra_config(
+    async_config = StorageRuntimeConfig.from_extra_config(
         None, host_blocks=31, prefix_granularity=2
     )
 

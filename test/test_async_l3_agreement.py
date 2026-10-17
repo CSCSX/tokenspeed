@@ -28,7 +28,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.io_types import StorageCompletion, StoragePoll
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 
@@ -82,13 +82,13 @@ def worker(rank, path):
         timeout=timedelta(seconds=20),
     )
     try:
-        config = L3AsyncConfig.from_extra_config(
+        config = StorageRuntimeConfig.from_extra_config(
             None, host_blocks=16, prefix_granularity=2
         )
         hooks = L3CacheHooks(
             SimpleNamespace(),
             Device(rank),
-            config=config,
+            config=config.scheduler,
             attn_tp_size=2,
             attn_tp_cpu_group=dist.group.WORLD,
             pp_size=1,
@@ -154,13 +154,13 @@ def idle_worker(rank, path):
         raise AssertionError("An idle L3 round serialized an object payload")
 
     try:
-        config = L3AsyncConfig.from_extra_config(
+        config = StorageRuntimeConfig.from_extra_config(
             None, host_blocks=16, prefix_granularity=2
         )
         hooks = L3CacheHooks(
             SimpleNamespace(),
             IdleDevice(),
-            config=config,
+            config=config.scheduler,
             attn_tp_size=2,
             attn_tp_cpu_group=dist.group.WORLD,
             pp_size=1,
@@ -234,9 +234,9 @@ def pressure_worker(rank, path):
         hooks = L3CacheHooks(
             SimpleNamespace(),
             PressureDevice(rank),
-            config=L3AsyncConfig.from_extra_config(
+            config=StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=16, prefix_granularity=2
-            ),
+            ).scheduler,
             attn_tp_size=2,
             attn_tp_cpu_group=dist.group.WORLD,
             pp_size=1,
@@ -311,9 +311,9 @@ def malformed_worker(rank, path, invalid_field):
         hooks = L3CacheHooks(
             SimpleNamespace(),
             MalformedDevice(rank, invalid_field),
-            config=L3AsyncConfig.from_extra_config(
+            config=StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=16, prefix_granularity=2
-            ),
+            ).scheduler,
             attn_tp_size=2,
             attn_tp_cpu_group=dist.group.WORLD,
             pp_size=1,
@@ -371,9 +371,9 @@ def object_failure_worker(rank, path):
         hooks = L3CacheHooks(
             SimpleNamespace(),
             ObjectFailureDevice(rank),
-            config=L3AsyncConfig.from_extra_config(
+            config=StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=16, prefix_granularity=2
-            ),
+            ).scheduler,
             attn_tp_size=2,
             attn_tp_cpu_group=dist.group.WORLD,
             pp_size=1,

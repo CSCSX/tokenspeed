@@ -29,7 +29,7 @@ import tokenspeed_scheduler as ts
 from prometheus_client import CollectorRegistry
 
 from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.metrics import L3Metrics
@@ -103,7 +103,7 @@ class _ControlledMemoryStore(MemoryKvStore):
 
 @pytest.fixture
 def runtime():
-    config = L3AsyncConfig.from_extra_config(
+    config = StorageRuntimeConfig.from_extra_config(
         '{"async":{"read_workers":1,"max_operations":2}}',
         host_blocks=31,
         prefix_granularity=2,
@@ -134,7 +134,7 @@ def _scheduler(config):
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 16
     cfg.enable_l3_storage = True
-    cfg.storage_config = config.scheduler_config()
+    cfg.storage_config = config.scheduler
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="kv",
@@ -152,7 +152,7 @@ def _hooks(scheduler, executor, config, metrics):
     return L3CacheHooks(
         scheduler,
         executor,
-        config=config,
+        config=config.scheduler,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
         pp_size=1,
@@ -236,6 +236,34 @@ def _get_descriptor(config, backend, store):
     operation = storage_ops(scheduler.next_execution_plan())[0]
     assert operation.kind == ts.StorageKind.Get
     return scheduler, operation, keys
+
+
+def test_parsed_storage_deadline_controls_scheduler_admission():
+    config = StorageRuntimeConfig.from_extra_config(
+        '{"async":{"wait_timeout_ms":7,"metadata_entries":124}}',
+        host_blocks=31,
+        prefix_granularity=2,
+    )
+    scheduler = _scheduler(config)
+    query = _query(scheduler, "deadline")
+    _send(
+        scheduler,
+        ts.Cache.StorageTick(7000, True, True, ts.StoragePressure(0, 0, 0)),
+    )
+    assert not any(
+        batch.request_ids for batch in scheduler.next_execution_plan().forward
+    )
+    _send(
+        scheduler,
+        ts.Cache.StorageTick(7002, True, True, ts.StoragePressure(0, 0, 0)),
+    )
+    plan = scheduler.next_execution_plan()
+    assert [rid for batch in plan.forward for rid in batch.request_ids] == ["deadline"]
+    assert scheduler.storage_stats().wait_timeouts == 1
+    cancellations = storage_ops(plan)
+    assert len(cancellations) == 1
+    assert cancellations[0].kind == ts.StorageKind.Cancel
+    assert cancellations[0].op_id == query.op_id
 
 
 def test_local_completion_is_reported_once_and_does_not_select_a_prefix(runtime):

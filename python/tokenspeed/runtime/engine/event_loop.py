@@ -32,10 +32,9 @@ import torch
 import torch.distributed as dist
 import zmq
 from tokenspeed_kernel.compile_monitor import compile_stats
-from tokenspeed_scheduler import Scheduler
+from tokenspeed_scheduler import Scheduler, StorageConfig
 
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
-from tokenspeed.runtime.cache.l3.factory import build_l3_cache
+from tokenspeed.runtime.cache.l3.factory import create_l3_executor
 from tokenspeed.runtime.cache.l3.metrics import L3Metrics
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -164,7 +163,7 @@ def scheduler_config_from_args(
     server_args,
     specs,
     *,
-    l3_config: L3AsyncConfig | None,
+    storage_config: StorageConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
     decode_input_tokens: int,
@@ -178,7 +177,7 @@ def scheduler_config_from_args(
         server_args: The resolved server arguments.
         specs: The ``DeviceSpecs`` of the built device side: the cache
             geometry, the cache groups and the Host tiers' page counts.
-        l3_config: Limits returned by Host-storage construction, or None
+        storage_config: Shared storage scheduling limits, or None
             when no storage backend is configured.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
@@ -200,9 +199,7 @@ def scheduler_config_from_args(
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
         max_retracted_requests=specs.max_retracted_requests,
-        storage_config=(
-            l3_config.scheduler_config() if l3_config is not None else None
-        ),
+        storage_config=storage_config,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
@@ -308,7 +305,7 @@ class EventLoop:
             max_batch_size=per_rank_max_batch,
         )
         self._device = device.handle
-        l3_config, self._l3 = build_l3_cache(
+        self._l3 = create_l3_executor(
             server_args,
             self.model_config,
             draft_model_config,
@@ -319,6 +316,7 @@ class EventLoop:
                 else None
             ),
         )
+        storage_config = self._l3.config.scheduler if self._l3 is not None else None
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
@@ -429,7 +427,7 @@ class EventLoop:
         scheduler_cfg = scheduler_config_from_args(
             server_args,
             specs,
-            l3_config=l3_config,
+            storage_config=storage_config,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
             decode_input_tokens=decode_input_tokens,
@@ -459,7 +457,7 @@ class EventLoop:
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             self._l3,
-            config=l3_config,
+            config=storage_config,
             attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,

@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("tokenspeed_scheduler")
 
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     resolve_dspark_prefix_replay_tokens,
@@ -146,9 +146,9 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=(
-            L3AsyncConfig.from_extra_config(
+            StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2
-            ).scheduler_config()
+            ).scheduler
             if enable_l3_storage
             else None
         ),

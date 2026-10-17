@@ -25,7 +25,7 @@ from __future__ import annotations
 import time
 
 from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
@@ -100,7 +100,9 @@ def test_source_owner_one_restores_on_destination_owner_zero():
     writers = [store(backend, host, rank) for rank, host in enumerate(source)]
     target = [Host(), Host()]
     readers = [store(backend, host, rank) for rank, host in enumerate(target)]
-    cfg = L3AsyncConfig.from_extra_config(None, host_blocks=32, prefix_granularity=2)
+    cfg = StorageRuntimeConfig.from_extra_config(
+        None, host_blocks=32, prefix_granularity=2
+    )
     for kind, stores, block in (("put", writers, 2), ("get", readers, 3)):
         for host_store in stores:
             executor = L3Executor(
@@ -128,7 +130,9 @@ def test_async_nonowner_is_neutral_and_counts_no_io_bytes():
     backend = Backend()
     host = Host()
     owned = store(backend, host, 1)
-    cfg = L3AsyncConfig.from_extra_config(None, host_blocks=32, prefix_granularity=2)
+    cfg = StorageRuntimeConfig.from_extra_config(
+        None, host_blocks=32, prefix_granularity=2
+    )
     executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
     try:
         keys, offsets, sizes = owned.page_ranges([(0, 3, "h", 0)])
@@ -151,7 +155,9 @@ def test_empty_owner_job_cannot_recover_an_unhealthy_backend():
     backend = Backend()
     backend.fail_query = True
     owned = store(backend, Host(), 1)
-    cfg = L3AsyncConfig.from_extra_config(None, host_blocks=32, prefix_granularity=2)
+    cfg = StorageRuntimeConfig.from_extra_config(
+        None, host_blocks=32, prefix_granularity=2
+    )
     executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
     try:
         executor.submit(StorageJob(1, "query", (owned.object_key("h", 0, 0),), (), ()))
@@ -175,7 +181,9 @@ def test_mixed_owner_results_keep_object_failures_in_logical_order():
         [(0, 2, "absent-peer", 0), (0, 3, "absent-local", 0), (1, 1, "state", 0)]
     )
     backend.batch_put_from([keys[2]], bytearray(b"DATA"), [0], [4])
-    cfg = L3AsyncConfig.from_extra_config(None, host_blocks=32, prefix_granularity=2)
+    cfg = StorageRuntimeConfig.from_extra_config(
+        None, host_blocks=32, prefix_granularity=2
+    )
     executor = L3Executor(owned, config=cfg, prefix_for_weight_version=None)
     try:
         executor.submit(StorageJob(1, "get", tuple(keys), tuple(offsets), tuple(sizes)))
@@ -195,7 +203,7 @@ def test_backend_failure_and_cooldown_preserve_nonowner_neutrality():
     backend.fail_get = True
     owned = store(backend, Host(), 0)
     keys, offsets, sizes = owned.page_ranges([(0, 2, "peer", 0), (0, 3, "local", 0)])
-    cfg = L3AsyncConfig.from_extra_config(
+    cfg = StorageRuntimeConfig.from_extra_config(
         '{"async": {"recovery_interval_ms": 60000}}',
         host_blocks=32,
         prefix_granularity=2,

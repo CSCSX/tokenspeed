@@ -42,7 +42,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 pytest.importorskip("tokenspeed_scheduler")
 
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.event_loop import (  # noqa: E402
     scheduler_config_from_args,
 )
@@ -60,15 +60,15 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
 
 
 def _config(args: ServerArgs, specs):
-    l3_config = None
+    storage_config = None
     if args.kvstore_storage_backend is not None:
-        l3_config = L3AsyncConfig.from_extra_config(
+        storage_config = StorageRuntimeConfig.from_extra_config(
             None, host_blocks=specs.num_host_pages - 1, prefix_granularity=16
-        )
+        ).scheduler
     return scheduler_config_from_args(
         args,
         specs,
-        l3_config=l3_config,
+        storage_config=storage_config,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
         decode_input_tokens=1,

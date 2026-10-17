@@ -179,7 +179,7 @@ class TestL3FlatKvRoundTripTest:
         )
 
     def _l3_executor(self, executor, *, store, namespace, prefix_granularity):
-        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+        from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
         from tokenspeed.runtime.cache.l3.executor import L3Executor
         from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
@@ -192,7 +192,7 @@ class TestL3FlatKvRoundTripTest:
                 ownership=None,
             ),
             prefix_for_weight_version=lambda version: f"{namespace}-{version}",
-            config=L3AsyncConfig.from_extra_config(
+            config=StorageRuntimeConfig.from_extra_config(
                 None,
                 host_blocks=executor.host_storage.num_host_lcm_blocks,
                 prefix_granularity=prefix_granularity,

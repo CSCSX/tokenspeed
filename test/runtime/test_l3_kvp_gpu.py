@@ -45,7 +45,7 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
 
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
-    from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
     from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
     from tokenspeed.runtime.cache.l3.host_store import L3HostStore
     from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
@@ -137,7 +137,7 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     )
     l3 = L3Executor(
         store,
-        config=L3AsyncConfig.from_extra_config(
+        config=StorageRuntimeConfig.from_extra_config(
             None, host_blocks=4, prefix_granularity=1
         ),
         prefix_for_weight_version=None,

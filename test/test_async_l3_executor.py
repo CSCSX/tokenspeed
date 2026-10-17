@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import queue
 import threading
 import time
@@ -32,7 +33,7 @@ from unittest.mock import patch
 import pytest
 
 from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.executor import (
     L3Executor,
     StorageJob,
@@ -43,7 +44,9 @@ from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
 
 
 def config():
-    return L3AsyncConfig.from_extra_config(None, host_blocks=32, prefix_granularity=2)
+    return StorageRuntimeConfig.from_extra_config(
+        None, host_blocks=32, prefix_granularity=2
+    )
 
 
 def executor(backend, *, cfg, data=None):
@@ -193,7 +196,12 @@ def test_global_store_roundtrip_between_independent_host_executors():
 
 
 def test_operation_credits_bound_queue_and_undelivered_results():
-    e = executor(MemoryKvStore(), cfg=replace(config(), max_operations=1))
+    e = executor(
+        MemoryKvStore(),
+        cfg=StorageRuntimeConfig.from_extra_config(
+            '{"async":{"max_operations":1}}', host_blocks=32, prefix_granularity=2
+        ),
+    )
     try:
         e.submit(StorageJob(1, "query", ("a",), (), ()))
         with pytest.raises(RuntimeError, match="operation credits"):
@@ -201,6 +209,42 @@ def test_operation_credits_bound_queue_and_undelivered_results():
         wait_results(e, 1)
     finally:
         e.shutdown(timeout_s=2)
+
+
+def test_executor_applies_the_parsed_storage_key_limit():
+    cfg = StorageRuntimeConfig.from_extra_config(
+        '{"async":{"max_keys_per_operation":2}}',
+        host_blocks=32,
+        prefix_granularity=2,
+    )
+    e = executor(MemoryKvStore(), cfg=cfg)
+    try:
+        with pytest.raises(ValueError, match="job descriptor"):
+            e.submit(StorageJob(1, "query", ("a", "b", "c"), (), ()))
+        e.submit(StorageJob(1, "query", ("a", "b"), (), ()))
+        assert wait_results(e, 1)[0].success == (False, False)
+    finally:
+        e.close(timeout_s=2)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "max_operations",
+        "max_keys_per_operation",
+        "max_host_blocks",
+        "metadata_entries",
+        "max_prefetch_tokens",
+        "min_prefetch_tokens",
+    ],
+)
+def test_storage_limits_reject_values_outside_the_scheduler_integer_range(name):
+    with pytest.raises(ValueError, match="int32 limit"):
+        StorageRuntimeConfig.from_extra_config(
+            json.dumps({"async": {"metadata_entries": 128, name: 2**31}}),
+            host_blocks=2**32,
+            prefix_granularity=2,
+        )
 
 
 def test_retired_get_miss_does_not_open_backend_circuit():
@@ -394,16 +438,19 @@ def test_pressure_config_rejects_invalid_hysteresis(overrides):
     import json
 
     with pytest.raises(ValueError):
-        L3AsyncConfig.from_extra_config(
+        StorageRuntimeConfig.from_extra_config(
             json.dumps({"async": overrides}), host_blocks=32, prefix_granularity=2
         )
 
 
 def test_pressure_config_one_credit_can_recover_on_an_empty_queue():
-    cfg = L3AsyncConfig.from_extra_config(
+    cfg = StorageRuntimeConfig.from_extra_config(
         '{"async":{"max_operations":1}}', host_blocks=32, prefix_granularity=2
     )
-    assert cfg.queue_high_operations == 1 and cfg.queue_low_operations == 0
+    assert (
+        cfg.scheduler.pressure_high.queued_operations == 1
+        and cfg.scheduler.pressure_low.queued_operations == 0
+    )
 
 
 @pytest.mark.parametrize("retired", ["pending", 1])

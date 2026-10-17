@@ -26,9 +26,8 @@ import time
 
 import torch
 import torch.distributed as dist
-from tokenspeed_scheduler import Cache, ForwardEvent, StoragePressure
+from tokenspeed_scheduler import Cache, ForwardEvent, StorageConfig, StoragePressure
 
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
 from tokenspeed.runtime.cache.l3.metrics import L3Metrics
 
 
@@ -38,7 +37,7 @@ class L3CacheHooks:
         scheduler,
         l3,
         *,
-        config: L3AsyncConfig | None,
+        config: StorageConfig | None,
         attn_tp_size: int,
         attn_tp_cpu_group,
         pp_size: int,

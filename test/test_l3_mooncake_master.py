@@ -42,7 +42,7 @@ from pathlib import Path
 
 import pytest
 
-from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
+from tokenspeed.runtime.cache.l3.factory import create_storage_backend
 from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
 
@@ -308,7 +308,7 @@ class TestMooncakeMasterLiveTest:
         }
 
     def test_global_objects_survive_async_writer_shutdown(self, request) -> None:
-        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+        from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
         from tokenspeed.runtime.cache.l3.executor import (
             L3Executor,
             StorageJob,
@@ -323,7 +323,7 @@ class TestMooncakeMasterLiveTest:
         )
         request.addfinalizer(owner.close)
         clients = dict(self._extra_config(), global_segment_size=0)
-        config = L3AsyncConfig.from_extra_config(
+        config = StorageRuntimeConfig.from_extra_config(
             None, host_blocks=8, prefix_granularity=64
         )
         key = f"global-async-{time.monotonic_ns()}"
@@ -373,13 +373,13 @@ class TestMooncakeMasterLiveTest:
             reader.store.close()
 
     def test_l3_host_store_round_trips_through_mooncake_master(self) -> None:
-        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+        from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
         from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 
         host = _Host(nbytes=4096, page=64)
         payload = b"mooncake-l3-bytes"
         host.host_buffer[0 : len(payload)] = payload
-        backend = create_kvstore_storage_backend(
+        backend = create_storage_backend(
             "mooncake",
             json.dumps(self._extra_config()),
             host_buffer=host.host_buffer,
@@ -390,7 +390,7 @@ class TestMooncakeMasterLiveTest:
         l3 = L3HostStore(backend, host, key_prefix="live", rank=0, ownership=None)
         executor = L3Executor(
             l3,
-            config=L3AsyncConfig.from_extra_config(
+            config=StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=8, prefix_granularity=64
             ),
             prefix_for_weight_version=None,
@@ -440,7 +440,7 @@ class TestMooncakeMasterLiveTest:
         """
         from dataclasses import replace
 
-        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+        from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
         from tokenspeed.runtime.cache.l3.executor import (
             L3Executor,
             StorageJob,
@@ -491,7 +491,7 @@ class TestMooncakeMasterLiveTest:
                 backend, host, key_prefix="master-restart", rank=0, ownership=None
             ),
             config=replace(
-                L3AsyncConfig.from_extra_config(
+                StorageRuntimeConfig.from_extra_config(
                     None, host_blocks=8, prefix_granularity=64
                 ),
                 recovery_interval_ms=50,

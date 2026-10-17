@@ -253,11 +253,11 @@ def test_make_config_states_the_snapshot_pool_on_every_role():
 
 
 def test_make_config_requires_storage_limits_exactly_with_l3():
-    from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 
-    limits = L3AsyncConfig.from_extra_config(
+    limits = StorageRuntimeConfig.from_extra_config(
         None, host_blocks=7, prefix_granularity=2
-    ).scheduler_config()
+    ).scheduler
     with pytest.raises(ValueError, match="storage_config"):
         _config(storage_config=limits)
     with pytest.raises(ValueError, match="storage_config"):

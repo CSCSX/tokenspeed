@@ -27,7 +27,6 @@ Mirrors SGLang HiCache ``MooncakeStore`` / vLLM ``MooncakeStoreConnector``:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -345,17 +344,3 @@ class MooncakeKvStore:
         closer = getattr(store, "close", None)
         if callable(closer):
             closer()
-
-
-def parse_extra_config(raw: str | None) -> dict[str, Any]:
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "--kvstore-storage-backend-extra-config must be a JSON object"
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("--kvstore-storage-backend-extra-config must be a JSON object")
-    return parsed

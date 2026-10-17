@@ -33,15 +33,18 @@ purge remains a synchronous management call.
 Device construction returns a complete DeviceHandle and a startup-only
 `HostCacheBuild`: shared Host storage, owner translation and immutable
 layout/partition/producer facts, with no Device buffers or L2 executor.
-The startup caller constructs L3 separately through `cache/l3/factory.py`.
+The startup caller constructs L3 separately through
+`create_l3_executor` in `cache/l3/factory.py`. Its lower-level
+`create_storage_backend` selects only the byte-storage client.
 `DeviceSpecs` contains no L3 configuration; scheduler configuration receives
-the factory's limits explicitly. Without a storage backend the factory returns
+the executor's storage limits explicitly. Without a storage backend the factory returns
 before checkpoint I/O, client registration, workers or collectives. Checkpoint
 agreement uses the caller's explicit Gloo world group, never a default device
 process group.
-If construction fails after PD starts its background threads, readiness EOF
-triggers bounded process reaping. It does not set a deadline on healthy model
-loading or checkpoint agreement.
+If construction fails after PD starts its background threads, the worker closes
+its ready pipe. Readiness reports failure immediately without joining or killing
+the worker; the existing launcher owns subprocess teardown and its budget.
+This does not set a deadline on healthy model loading or checkpoint agreement.
 The loop captures `plan.cache` once, submits its Host-storage subset to L3 and
 passes its Device-copy subset explicitly to DeviceHandle from the same plan,
 including frozen-round cleanup. L3 hooks poll the L3 executor directly
@@ -56,6 +59,16 @@ because they bind Device buffers, streams and slot-state exporters.
 
 No additional HiCacheEngine is needed: C++ owns policy, the existing loop owns
 round sequencing, and the shared Host resource owns its allocation.
+
+`StorageConfig` is the read-only scheduling contract: credits, prefetch limits,
+deadlines and pressure watermarks. `StorageRuntimeConfig` contains that contract
+plus Python worker counts and backend-health settings; it does not duplicate
+the scheduling fields. The executor and replica hooks read the same parsed
+limits that are passed to the scheduler, which takes its normal value snapshot.
+`MooncakeStoreConfig` stays inside the backend and contains only connection
+and storage-segment settings. L3 names the cache tier; Storage names its
+backend-neutral operations and scheduling contract. Neither selects a second
+execution mode. The existing JSON `async` object supplies runtime tuning values.
 
 A request waiting for QUERY/GET is in the main FSM's `Prefetching` state,
 not in `Submitted` with a second readiness flag. It owns no Device pages or

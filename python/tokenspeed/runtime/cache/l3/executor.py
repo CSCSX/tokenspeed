@@ -29,7 +29,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 from tokenspeed.runtime.cache.l3.io_types import (
     StorageCompletion,
@@ -144,7 +144,7 @@ class L3Executor:
         self,
         store: L3HostStore,
         *,
-        config: L3AsyncConfig,
+        config: StorageRuntimeConfig,
         prefix_for_weight_version: Callable[[str], str] | None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -162,7 +162,8 @@ class L3Executor:
         self._jobs: dict[int, _JobState] = {}
         self._results: queue.SimpleQueue[StorageCompletion] = queue.SimpleQueue()
         self._queues = {
-            kind: queue.Queue(config.max_operations) for kind in ("query", "get", "put")
+            kind: queue.Queue(config.scheduler.max_operations)
+            for kind in ("query", "get", "put")
         }
         self._stopping = threading.Event()
         self._unsafe_io = False
@@ -257,7 +258,7 @@ class L3Executor:
         if (
             job.kind not in self._queues
             or not job.keys
-            or len(job.keys) > self.config.max_keys_per_operation
+            or len(job.keys) > self.config.scheduler.max_keys_per_operation
         ):
             raise ValueError("Invalid L3 job descriptor")
         if job.kind != "query" and not (
@@ -270,7 +271,7 @@ class L3Executor:
             if job.op_id <= self._last_submitted:
                 raise ValueError("L3 operation ids must increase")
             self._last_submitted = job.op_id
-            if len(self._jobs) >= self.config.max_operations:
+            if len(self._jobs) >= self.config.scheduler.max_operations:
                 # The scheduler bounds all accepted operations; exceeding that
                 # bound is a protocol fault, not a silent dropped completion.
                 raise RuntimeError("L3 scheduler exceeded operation credits")

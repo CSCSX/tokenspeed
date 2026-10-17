@@ -26,18 +26,18 @@ import copy
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, MemoryKvStore
+from tokenspeed.runtime.cache.l3.config import parse_extra_config
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
-    from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
     from tokenspeed.runtime.cache.l3.executor import L3Executor
     from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def create_kvstore_storage_backend(
+def create_storage_backend(
     backend_name: str | None,
     extra_config: str | None,
     *,
@@ -60,10 +60,7 @@ def create_kvstore_storage_backend(
     if name == "memory":
         return MemoryKvStore()
     if name == "mooncake":
-        from tokenspeed.runtime.cache.l3.mooncake import (
-            MooncakeKvStore,
-            parse_extra_config,
-        )
+        from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
 
         return MooncakeKvStore(
             extra_config=parse_extra_config(extra_config),
@@ -74,14 +71,14 @@ def create_kvstore_storage_backend(
     raise ValueError(f"unsupported KVStore storage backend {backend_name!r}")
 
 
-def build_l3_cache(
+def create_l3_executor(
     server_args: ServerArgs,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
     *,
     host_cache: HostCacheBuild | None,
     world_cpu_group: ProcessGroup | None,
-) -> tuple[L3AsyncConfig | None, L3Executor | None]:
+) -> L3Executor | None:
     """Build an independent L3 executor without retaining device capabilities.
 
     Args:
@@ -94,13 +91,13 @@ def build_l3_cache(
             None in a single-process deployment.
 
     Returns:
-        Async limits and their Host-only executor. No L2 executor, device handle
-        or attention buffer is retained. Namespace inputs are frozen before
-        the backend is created and workers start. Both values are None when
-        no storage backend is configured; no client, worker or collective runs.
+        Host-only executor, carrying its storage configuration. No L2 executor,
+        device handle or attention buffer is retained. Namespace inputs are
+        frozen before the backend is created and workers start. Returns None
+        without a storage backend; no client, worker or collective runs.
     """
     if server_args.kvstore_storage_backend is None:
-        return None, None
+        return None
     if host_cache is None:
         raise ValueError("L3 construction requires a Host L2 allocation")
     host_storage = host_cache.storage
@@ -124,13 +121,13 @@ def build_l3_cache(
     attention_backend_name = host_cache.attention_backend_name
     draft_attention_backend_name = host_cache.draft_attention_backend_name
     from tokenspeed.runtime.cache.l3.backend import cache_layout_signature
-    from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 
     cache_signature = cache_layout_signature(
         host_cache,
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
     )
-    l3_config = L3AsyncConfig.from_extra_config(
+    config = StorageRuntimeConfig.from_extra_config(
         server_args.kvstore_storage_backend_extra_config,
         host_blocks=host_storage.num_host_lcm_blocks,
         prefix_granularity=host_cache.prefix_granularity,
@@ -239,7 +236,7 @@ def build_l3_cache(
     from tokenspeed.runtime.cache.l3.host_store import L3HostStore
 
     key_prefix = prefix_for_weight_version(server_args.weight_version)
-    storage_backend = create_kvstore_storage_backend(
+    storage_backend = create_storage_backend(
         server_args.kvstore_storage_backend,
         server_args.kvstore_storage_backend_extra_config,
         host_buffer=host_storage.host_buffer,
@@ -255,8 +252,8 @@ def build_l3_cache(
     )
     l3_executor = L3Executor(
         l3_store,
-        config=l3_config,
+        config=config,
         prefix_for_weight_version=prefix_for_weight_version,
     )
 
-    return l3_config, l3_executor
+    return l3_executor
