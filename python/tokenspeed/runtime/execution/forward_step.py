@@ -306,6 +306,7 @@ class ForwardStepRunner:
         }
 
         self.graphs: dict[tuple[str, int], object] = {}
+        self.commit_graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
@@ -420,6 +421,7 @@ class ForwardStepRunner:
         global global_graph_memory_pool
 
         self.graphs.clear()
+        self.commit_graphs.clear()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
         # The tables name no arena; only the graphs and their pool go.
@@ -501,6 +503,21 @@ class ForwardStepRunner:
             active_bs=active_bs,
             padded_bs=padded_bs,
             decode_width=self.max_tokens_per_req,
+        )
+
+    def _commit_state(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        self.attn_backend.commit_state_after_acceptance(
+            accepted_lengths,
+            num_extends=num_extends,
+            accepted_path=(
+                self.sampling_backend.accepted_path(
+                    accepted_lengths.shape[0], self.config.spec_num_tokens
+                )
+                if self.config.spec_topk > 1 and num_extends == 0
+                else None
+            ),
         )
 
     def _capture_one(
@@ -620,7 +637,9 @@ class ForwardStepRunner:
                 # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
-                run_once()
+                warm_output = run_once()
+                if self.attn_backend.supports_captured_state_commit:
+                    self._commit_state(warm_output[1], num_extends=0)
             # Order the reset below after the last warmup's stateful kernels.
             self.device_module.synchronize()
 
@@ -650,13 +669,26 @@ class ForwardStepRunner:
         global global_graph_memory_pool
         graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
         # The kernel state captured launches need lives as long as the graph.
-        with observer, capture_session(graph), self.device_module.graph(
-            graph,
-            pool=global_graph_memory_pool,
-            stream=self.stream,
-            **graph_kwargs,
-        ):
-            out = run_once()
+        with observer:
+            with capture_session(graph), self.device_module.graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                **graph_kwargs,
+            ):
+                out = run_once()
+            if self.attn_backend.supports_captured_state_commit:
+                # The forward graph owns accepted counts; both graphs retain
+                # the full padded buffer. Refresh masks unused physical pages.
+                commit_graph = graph_cls()
+                with capture_session(commit_graph), self.device_module.graph(
+                    commit_graph,
+                    pool=graph.pool(),
+                    stream=self.stream,
+                    **graph_kwargs,
+                ):
+                    self._commit_state(out[1], num_extends=0)
+                self.commit_graphs[(variant, bs)] = commit_graph
 
         self.device_module.synchronize()
         dist.barrier()
@@ -1197,17 +1229,10 @@ class ForwardStepRunner:
             ctx.bs = bs
             ctx.output_layout = live_output_layout
 
-        if self.drafter is not None and (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
-            self.attn_backend.commit_speculative_state_after_verify(
-                result[1],
-                num_extends=ctx.num_extends,
-                accepted_path=(
-                    self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
-                    if self.config.spec_topk > 1 and ctx.num_extends == 0
-                    else None
-                ),
-            )
+        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            if use_graph and graph_key in self.commit_graphs:
+                self.commit_graphs[graph_key].replay()
+            else:
+                self._commit_state(result[1], num_extends=ctx.num_extends)
 
         return result

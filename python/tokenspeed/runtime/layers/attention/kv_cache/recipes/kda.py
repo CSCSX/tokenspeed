@@ -24,9 +24,96 @@ import torch
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    cache_dtype_name,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
 )
+
+
+def kda_replay_history_capacity(config: AttnConfig) -> int:
+    """Return the physical accepted-history capacity for the selected kernels.
+
+    The representation is the same for prefill, standard decode and speculation,
+    so a transferred or prefix-matched block has one meaning on every engine.
+    """
+    if torch.device(config.device).type != "cuda":
+        return 0
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_fused_paged_verify_uses_split_producers,
+        kda_recurrent_layout,
+    )
+
+    linear = config.component(LinearAttnConfig)
+    heads, head_dim, _ = linear.temporal_state_shape
+    supported = kda_fused_paged_verify_uses_split_producers(
+        config.dtype,
+        store_states=False,
+        recurrent_layout=kda_recurrent_layout(),
+        num_heads=heads,
+        head_dim=head_dim,
+    )
+    return 8 if supported else 0
+
+
+def kda_state_fields(
+    layer_id: int,
+    plane_id: str,
+    *,
+    conv_shape: tuple[int, int],
+    recurrent_shape: tuple[int, int, int],
+    history_capacity: int,
+) -> tuple[CacheFieldSpec, ...]:
+    """Declare one cache-owned convolution and recurrent endpoint.
+
+    With retained history, the dense recurrent field is a base checkpoint.
+    Its correction, weighted key, decay and length fields reconstruct the same
+    endpoint as the convolution field and must move with that cache block.
+    """
+    fields = (
+        CacheFieldSpec(
+            f"layer.{layer_id}.conv_state",
+            plane_id,
+            conv_shape,
+            cache_dtype_name(torch.bfloat16),
+            exact_page_stride=False,
+        ),
+        CacheFieldSpec(
+            f"layer.{layer_id}.recurrent_state",
+            plane_id,
+            recurrent_shape,
+            cache_dtype_name(torch.float32),
+            exact_page_stride=False,
+        ),
+    )
+    if history_capacity:
+        heads, value_dim, key_dim = recurrent_shape
+        fields += tuple(
+            CacheFieldSpec(
+                f"layer.{layer_id}.{name}",
+                plane_id,
+                shape,
+                cache_dtype_name(dtype),
+                exact_page_stride=False,
+            )
+            for name, shape, dtype in (
+                (
+                    "replay_correction",
+                    (heads, history_capacity, value_dim),
+                    torch.float32,
+                ),
+                (
+                    "replay_weighted_key",
+                    (heads, history_capacity, key_dim),
+                    torch.float32,
+                ),
+                ("replay_decay", (heads, key_dim), torch.float32),
+                ("replay_length", (1,), torch.int32),
+            )
+        )
+    return fields
 
 
 def kda_replay_supported(config: AttnConfig) -> bool:
@@ -80,7 +167,11 @@ def kda_verify_workspace_bytes(
         return (
             config.max_bs
             * (draft_token_num + 1)
-            * sum(field.payload_bytes for field in state_fields)
+            * sum(
+                field.payload_bytes
+                for field in state_fields
+                if field.field_id.endswith((".conv_state", ".recurrent_state"))
+            )
         )
 
     from tokenspeed_kernel.ops.attention.kda import (
@@ -124,13 +215,20 @@ def kda_verify_workspace_bytes(
         )
     group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
     metadata_bytes = 0
-    if draft_token_num > 1:
+    retained_history = any(
+        field.field_id.endswith(".replay_length") for field in state_fields
+    )
+    if draft_token_num > 1 or retained_history:
         metadata_bytes = len(conv_fields) * (10 * 8 + 4)
-        metadata_bytes += group_count * 4 * 8
+        metadata_bytes += group_count * (
+            config.max_bs * 2 * 8 if retained_history else 4 * 8
+        )
         metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
         if records:
             metadata_bytes += config.max_bs * 3 * 8
             metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
+        if retained_history:
+            metadata_bytes += len(conv_fields) * (4 * 8 + config.max_bs * 4)
     return (
         conv_bytes
         + len(conv_fields) * config.max_bs * draft_token_num * row_bytes

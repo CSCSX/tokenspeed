@@ -219,13 +219,13 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
 def test_hybrid_factory_selects_gdn_only_for_local_state(
     monkeypatch, is_qwen4, has_linear_config, has_local_state
 ):
-    # Load the subclass before replacing its base class with a constructor mock.
+    # Replace the concrete GDN constructor used by this factory.
     import_module("tokenspeed.runtime.layers.attention.backends.state.kda")
     full = SimpleNamespace(device="cpu", spec_num_tokens=1)
-    gdn = SimpleNamespace(set_kv_pool=Mock(), commit_verified_state=Mock())
+    gdn = SimpleNamespace(set_kv_pool=Mock(), commit_state_after_acceptance=Mock())
     factory = Mock(return_value=gdn)
     monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.state.mamba.MambaAttnBackend",
+        "tokenspeed.runtime.layers.attention.backends.state.gdn.GdnAttnBackend",
         factory,
     )
     config = _config(is_draft=False, width=1)
@@ -267,10 +267,12 @@ def test_hybrid_factory_selects_gdn_only_for_local_state(
         factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
         gdn.set_kv_pool.assert_not_called()
         accepted = torch.tensor([1, 3], dtype=torch.int32)
-        backend.commit_speculative_state_after_verify(
+        backend.commit_state_after_acceptance(
             accepted, num_extends=0, accepted_path=None
         )
-        gdn.commit_verified_state.assert_called_once_with(accepted, accepted_path=None)
+        gdn.commit_state_after_acceptance.assert_called_once_with(
+            accepted, num_extends=0, accepted_path=None
+        )
     else:
         factory.assert_not_called()
         assert attention is full

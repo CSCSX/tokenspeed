@@ -68,11 +68,89 @@ def _kda_recurrent_step(
     return state + correction[:, None] * normalized_k[None, :], correction
 
 
+@triton.jit
+def _load_kda_candidate_window(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    raw_g_ptr,
+    raw_beta_ptr,
+    bos,
+    query_len,
+    pid_h,
+    offs_k,
+    offs_v,
+    mask_k,
+    mask_v,
+    stride_q_token,
+    stride_k_token,
+    stride_v_token,
+    stride_g_token,
+    stride_beta_token,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    LOAD_FP32: tl.constexpr,
+):
+    inputs = ()
+    for token_offset in tl.static_range(SPEC_QUERY_LEN):
+        token_valid = token_offset < query_len
+        token = bos + token_offset
+        q = tl.load(
+            q_ptr + token * stride_q_token + pid_h * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        k = tl.load(
+            k_ptr + token * stride_k_token + pid_h * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        v = tl.load(
+            v_ptr + token * stride_v_token + pid_h * V + offs_v,
+            mask=token_valid & mask_v,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        raw_g = tl.load(
+            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        raw_beta = tl.load(
+            raw_beta_ptr + token * stride_beta_token + pid_h,
+            mask=token_valid,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+
+        if LOAD_FP32:
+            q = q.to(tl.float32)
+            k = k.to(tl.float32)
+            v = v.to(tl.float32)
+            raw_g = raw_g.to(tl.float32)
+            raw_beta = raw_beta.to(tl.float32)
+        inputs += ((q, k, v, raw_g, raw_beta),)
+
+    return inputs
+
+
 @triton.heuristics(
     {
         "BV": lambda args: min(
             triton.next_power_of_2(args["V"]),
-            4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16,
+            (
+                16
+                if args["HISTORY_USE_TENSOR_CORES"]
+                else (
+                    (16 if args["SPEC_QUERY_LEN"] == 1 else 8)
+                    if args["HISTORY_CAPACITY"]
+                    else (4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16)
+                )
+            ),
         )
     }
 )
@@ -95,6 +173,26 @@ def _kda_recoverssm_verify_kernel(
     record_stamps_ptr,
     RECORD_CAPACITY: tl.constexpr,
     RECORD_SLOTS,
+    history_correction_ptr,
+    history_key_ptr,
+    history_decay_ptr,
+    history_lengths_ptr,
+    history_write_indices_ptr,
+    history_append_offsets_ptr,
+    stride_history_correction_block,
+    stride_history_correction_head,
+    stride_history_correction_pos,
+    stride_history_correction_dim,
+    stride_history_key_block,
+    stride_history_key_head,
+    stride_history_key_pos,
+    stride_history_key_dim,
+    stride_history_decay_block,
+    stride_history_decay_head,
+    stride_history_decay_dim,
+    stride_history_length,
+    HISTORY_CAPACITY: tl.constexpr,
+    HISTORY_USE_TENSOR_CORES: tl.constexpr,
     lower_bound,
     null_block_id,
     stride_q_token,
@@ -190,52 +288,119 @@ def _kda_recoverssm_verify_kernel(
         mask=mask_k,
         other=0.0,
     ).to(tl.float32)
-    state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
-
-    # Load the candidate window before the recurrence stores its outputs and
-    # replay records. This lets independent token loads overlap instead of
-    # waiting behind each preceding token's stores.
-    inputs = ()
-    for token_offset in tl.static_range(SPEC_QUERY_LEN):
-        token_valid = token_offset < query_len
-        token = bos + token_offset
-        q = tl.load(
-            q_ptr + token * stride_q_token + pid_h * K + offs_k,
-            mask=token_valid & mask_k,
-            other=0.0,
-            eviction_policy="evict_last",
-        ).to(tl.float32)
-        k = tl.load(
-            k_ptr + token * stride_k_token + pid_h * K + offs_k,
-            mask=token_valid & mask_k,
-            other=0.0,
-            eviction_policy="evict_last",
-        ).to(tl.float32)
-        v = tl.load(
-            v_ptr + token * stride_v_token + pid_h * V + offs_v,
-            mask=token_valid & mask_v,
-            other=0.0,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
-        raw_g = tl.load(
-            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
-            mask=token_valid & mask_k,
-            other=0.0,
-            eviction_policy="evict_last",
-        ).to(tl.float32)
-        raw_beta = tl.load(
-            raw_beta_ptr + token * stride_beta_token + pid_h,
-            mask=token_valid,
-            other=0.0,
-            eviction_policy="evict_last",
-        ).to(tl.float32)
-
-        inputs += ((q, k, v, raw_g, raw_beta),)
+    PRELOAD_INPUTS: tl.constexpr = history_lengths_ptr is not None and (
+        SPEC_QUERY_LEN == 1 or BATCH <= 16
+    )
+    if PRELOAD_INPUTS:
+        # Overlap candidate loads with reconstruction when register pressure permits.
+        inputs = _load_kda_candidate_window(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            raw_g_ptr,
+            raw_beta_ptr,
+            bos,
+            query_len,
+            pid_h,
+            offs_k,
+            offs_v,
+            mask_k,
+            mask_v,
+            stride_q_token,
+            stride_k_token,
+            stride_v_token,
+            stride_g_token,
+            stride_beta_token,
+            K,
+            V,
+            SPEC_QUERY_LEN,
+            LOAD_FP32=not PRELOAD_INPUTS,
+        )
+    if history_lengths_ptr is not None:
+        history_len = tl.load(history_lengths_ptr + state_idx * stride_history_length)
+        tl.device_assert(
+            (history_len >= 0) & (history_len <= HISTORY_CAPACITY),
+            "invalid retained KDA interval",
+        )
+        write_idx = tl.load(history_write_indices_ptr + pid_b).to(tl.int64)
+        if history_len > 0:
+            state = _recover_weighted_kda_state(
+                state_ptrs,
+                mask_state,
+                history_correction_ptr
+                + state_idx * stride_history_correction_block
+                + pid_h * stride_history_correction_head,
+                history_key_ptr
+                + state_idx * stride_history_key_block
+                + pid_h * stride_history_key_head,
+                history_decay_ptr
+                + state_idx * stride_history_decay_block
+                + pid_h * stride_history_decay_head
+                + offs_k * stride_history_decay_dim,
+                offs_k,
+                offs_v,
+                mask_k,
+                mask_v,
+                history_len,
+                stride_history_correction_pos,
+                stride_history_correction_dim,
+                stride_history_key_pos,
+                stride_history_key_dim,
+                max(8, triton.next_power_of_2(HISTORY_CAPACITY)),
+                HISTORY_USE_TENSOR_CORES,
+            )
+        else:
+            state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+        flush = (history_len + SPEC_QUERY_LEN > HISTORY_CAPACITY) | (
+            write_idx != state_idx
+        )
+        if flush:
+            output_state_ptrs = (
+                state_ptrs + (write_idx - state_idx) * stride_state_block
+            )
+            tl.store(
+                output_state_ptrs, state, mask=mask_state & (write_idx > null_block_id)
+            )
+        if pid_v == 0 and pid_h == 0:
+            tl.store(
+                history_append_offsets_ptr + pid_b, tl.where(flush, 0, history_len)
+            )
+    else:
+        state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+    if not PRELOAD_INPUTS:
+        inputs = _load_kda_candidate_window(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            raw_g_ptr,
+            raw_beta_ptr,
+            bos,
+            query_len,
+            pid_h,
+            offs_k,
+            offs_v,
+            mask_k,
+            mask_v,
+            stride_q_token,
+            stride_k_token,
+            stride_v_token,
+            stride_g_token,
+            stride_beta_token,
+            K,
+            V,
+            SPEC_QUERY_LEN,
+            LOAD_FP32=not PRELOAD_INPUTS,
+        )
 
     for token_offset in tl.static_range(SPEC_QUERY_LEN):
         token_valid = token_offset < query_len
         token = bos + token_offset
         q, k, v, raw_g, raw_beta = inputs[token_offset]
+        q = q.to(tl.float32)
+        k = k.to(tl.float32)
+        v = v.to(tl.float32)
+        raw_g = raw_g.to(tl.float32)
+        raw_beta = raw_beta.to(tl.float32)
         q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
         updated_state, correction = _kda_recurrent_step(
             state,
@@ -248,8 +413,11 @@ def _kda_recoverssm_verify_kernel(
             lower_bound,
             USE_LOWER_BOUND,
         )
-        if SPEC_QUERY_LEN == 4 and K == 128 and V == 128 and BV == 16:
-            # Valid tokens form a prefix, and verify never publishes this state.
+        if history_lengths_ptr is not None or (
+            SPEC_QUERY_LEN == 4 and K == 128 and V == 128 and BV == 16
+        ):
+            # The checkpoint flush happened before candidates. Valid tokens
+            # form a prefix; no candidate state is published by this kernel.
             # Masked suffix tokens cannot write outputs or records, so keeping
             # the old state live only increases register pressure. Other tiles
             # retain their measured predicated-update schedule.
@@ -409,6 +577,64 @@ def _commit_kda_num_warps(args: dict[str, Any]) -> int:
 @triton.jit
 def _recoverssm_decay_product(left, right):
     return left * right
+
+
+@triton.jit
+def _recover_weighted_kda_state(
+    state_ptrs,
+    mask_state,
+    correction_ptr,
+    key_ptr,
+    decay_ptrs,
+    offs_k,
+    offs_v,
+    mask_k,
+    mask_v,
+    history_len,
+    stride_correction_token,
+    stride_correction_dim,
+    stride_key_token,
+    stride_key_dim,
+    BT: tl.constexpr,
+    USE_TENSOR_CORES: tl.constexpr,
+):
+    decay = tl.load(decay_ptrs, mask=mask_k, other=1.0)
+    state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+    state *= decay[None, :]
+    if USE_TENSOR_CORES:
+        tokens = tl.arange(0, BT)
+        live = tokens < history_len
+        corrections = tl.load(
+            correction_ptr
+            + tokens[None, :] * stride_correction_token
+            + offs_v[:, None] * stride_correction_dim,
+            mask=mask_v[:, None] & live[None, :],
+            other=0.0,
+        )
+        keys = tl.load(
+            key_ptr
+            + tokens[:, None] * stride_key_token
+            + offs_k[None, :] * stride_key_dim,
+            mask=live[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        state = tl.dot(corrections, keys, acc=state, input_precision="tf32x3")
+    else:
+        for token in tl.range(0, history_len, num_stages=3):
+            correction = tl.load(
+                correction_ptr
+                + token * stride_correction_token
+                + offs_v * stride_correction_dim,
+                mask=mask_v,
+                other=0.0,
+            )
+            key = tl.load(
+                key_ptr + token * stride_key_token + offs_k * stride_key_dim,
+                mask=mask_k,
+                other=0.0,
+            )
+            state += correction[:, None] * key[None, :]
+    return state
 
 
 @triton.heuristics({"BV": _commit_kda_value_block, "num_warps": _commit_kda_num_warps})
@@ -690,6 +916,13 @@ def kda_recoverssm_verify(
     out: torch.Tensor,
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
+    history_correction: torch.Tensor | None,
+    history_key: torch.Tensor | None,
+    history_decay: torch.Tensor | None,
+    history_lengths: torch.Tensor | None,
+    history_write_indices: torch.Tensor | None,
+    history_append_offsets: torch.Tensor | None,
+    history_use_tensor_cores: bool,
 ) -> torch.Tensor:
     """Verify a KDA speculative window without modifying its checkpoint."""
     if q.ndim != 4 or q.shape[0] != 1:
@@ -813,6 +1046,22 @@ def kda_recoverssm_verify(
         record_stamps,
         capacity,
         correction_cache.shape[0],
+        history_correction,
+        history_key,
+        history_decay,
+        history_lengths,
+        history_write_indices,
+        history_append_offsets,
+        *(
+            history_correction.stride()
+            if history_correction is not None
+            else (0, 0, 0, 0)
+        ),
+        *(history_key.stride() if history_key is not None else (0, 0, 0, 0)),
+        *(history_decay.stride() if history_decay is not None else (0, 0, 0)),
+        0 if history_lengths is None else history_lengths.stride(0),
+        0 if history_correction is None else history_correction.shape[2],
+        history_use_tensor_cores,
         lower_bound,
         NULL_BLOCK_ID,
         q.stride(1),
@@ -841,7 +1090,7 @@ def kda_recoverssm_verify(
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
         BATCH=triton.next_power_of_2(batch),
-        num_warps=1,
+        num_warps=(2 if batch <= 8 else 4) if history_use_tensor_cores else 1,
         # Keep explicit replay metadata assertions without instrumenting every
         # integer operation. The four-token, 16-row tile no longer keeps the
         # old state live, so its compiler-selected registers avoid spills.
@@ -850,7 +1099,8 @@ def kda_recoverssm_verify(
         sanitize_overflow=False,
         maxnreg=(
             None
-            if batch > 8 and spec_query_len == 4 and key_dim == value_dim == 128
+            if history_correction is not None
+            or (batch > 8 and spec_query_len == 4 and key_dim == value_dim == 128)
             else 168
         ),
         num_stages=2,

@@ -108,6 +108,53 @@ class KdaPrefillResult:
 
 
 @dataclass(frozen=True)
+class KdaReplayHistory:
+    """A recurrent checkpoint represented by a base plus accepted updates.
+
+    For history length h, the logical recurrent state is base * total_decay
+    + correction[:h].T @ weighted_key[:h], independently for each head.
+    correction and weighted_key are FP32 [page, head, capacity, channel].
+    Keys are normalized before absorption and include all subsequent accepted
+    decays. total_decay is FP32 [page, head, key]; lengths is INT32 [page].
+    Length zero means the base state alone, regardless of unused field bytes.
+
+    write_indices selects private pages. Verify writes a reconstructed base
+    on rotation or capacity flush, before candidates, and records the retained
+    length in fixed append_offsets scratch. Commit absorbs only accepted
+    records. A published page, including its factors, remains immutable.
+    use_tensor_cores explicitly selects the reconstruction arithmetic.
+    Floating-point grouping can differ from token-by-token replay.
+    """
+
+    correction: torch.Tensor
+    weighted_key: torch.Tensor
+    total_decay: torch.Tensor
+    lengths: torch.Tensor
+    write_indices: torch.Tensor
+    append_offsets: torch.Tensor
+    use_tensor_cores: bool
+
+
+@dataclass(frozen=True)
+class KdaReplayHistoryBatch:
+    """Stable addresses and field geometry for all recurrent layers.
+
+    descriptors is UINT64 [layers, 4]: correction, weighted key, total decay,
+    and length addresses. append_offsets is INT32 [layers, max_batch], written
+    by verify. Page strides count elements. Records within each page are
+    contiguous [head, capacity, channel], and decay is [head, key].
+    """
+
+    descriptors: torch.Tensor
+    append_offsets: torch.Tensor
+    capacity: int
+    correction_page_stride: int
+    key_page_stride: int
+    decay_page_stride: int
+    length_page_stride: int
+
+
+@dataclass(frozen=True)
 class KdaReplayRecords:
     """Current-round recovery destinations and record metadata.
 
@@ -126,6 +173,64 @@ class KdaReplayRecords:
     stamps: torch.Tensor
     key_gate: torch.Tensor
     query_start_loc: torch.Tensor
+    history: KdaReplayHistory | None = None
+
+
+def kda_materialize_history(
+    base_state: torch.Tensor,
+    correction: torch.Tensor,
+    weighted_key: torch.Tensor,
+    total_decay: torch.Tensor,
+    lengths: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    use_tensor_cores: bool,
+) -> torch.Tensor:
+    """Reconstruct dense initial states without modifying cache checkpoints.
+
+    Args:
+        base_state: FP32 [blocks, heads, value, key] base checkpoints.
+        correction: FP32 [blocks, heads, capacity, value] accepted corrections.
+        weighted_key: FP32 [blocks, heads, capacity, key] decay-weighted keys.
+        total_decay: FP32 [blocks, heads, key] accepted decay products.
+        lengths: INT32 [blocks] retained lengths; zero selects the base alone.
+        read_indices: One block per output row; nonpositive blocks produce zero.
+        out: FP32 [rows, heads, value, key] destination for dense scan inputs.
+        use_tensor_cores: Whether reconstruction uses TF32x3 matrix products.
+
+    Returns:
+        The supplied output tensor. All cache tensors remain unchanged.
+    """
+    kernel = select_kernel(
+        "attention",
+        "kda_materialize_history",
+        _attention_format_signature(state=base_state),
+    )
+    return kernel(
+        base_state,
+        correction,
+        weighted_key,
+        total_decay,
+        lengths,
+        read_indices,
+        out=out,
+        use_tensor_cores=use_tensor_cores,
+    )
+
+
+def kda_clear_history(lengths: torch.Tensor, write_indices: torch.Tensor) -> None:
+    """Mark newly stored dense endpoints as having no retained factors.
+
+    Args:
+        lengths: INT32 [blocks] retained lengths, with arbitrary block stride.
+        write_indices: Private blocks whose dense states were already stored;
+            nonpositive indices are padding and remain untouched.
+    """
+    kernel = select_kernel(
+        "attention", "kda_clear_history", _attention_format_signature(lengths=lengths)
+    )
+    kernel(lengths, write_indices)
 
 
 def kda_recurrent_layout() -> str:
@@ -563,6 +668,7 @@ def kda_verify_conv_update(
     head_dim: int,
     draft_token_num: int,
     recurrent_layout: str,
+    replay_mixed_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialize the convolution producer used by split KDA verification.
 
@@ -575,6 +681,8 @@ def kda_verify_conv_update(
         head_dim: KDA head width.
         draft_token_num: Verify positions per request.
         recurrent_layout: Committed recurrent-state layout.
+        replay_mixed_qkv: Optional destination for the original projection rows
+            consumed by accepted convolution commit.
 
     Returns:
         Convolved and SiLU-activated QKV rows.
@@ -602,6 +710,7 @@ def kda_verify_conv_update(
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
+        replay_qkv=replay_mixed_qkv,
     )
 
 
@@ -835,6 +944,8 @@ import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 __all__ = [
     "KdaPrefillResult",
     "kda_recurrent_layout",
+    "kda_materialize_history",
+    "kda_clear_history",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",

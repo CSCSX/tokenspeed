@@ -188,7 +188,17 @@ def _partition_for_field(
         return CacheFieldPartition(0, text_config.linear_num_value_heads)
 
     linear_config = getattr(text_config, "linear_attn_config", None)
-    if suffix in ("conv_state", "recurrent_state") and linear_config is not None:
+    if (
+        suffix
+        in (
+            "conv_state",
+            "recurrent_state",
+            "replay_correction",
+            "replay_weighted_key",
+            "replay_decay",
+        )
+        and linear_config is not None
+    ):
         num_heads = int(linear_config["num_heads"])
         head_dim = int(linear_config["head_dim"])
         if suffix == "conv_state":

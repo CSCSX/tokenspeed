@@ -14,7 +14,11 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaPrefillResult,
+    KdaReplayHistoryBatch,
+    KdaReplayRecords,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -24,6 +28,59 @@ _DENSE_HALF_SIGNATURES = format_signatures(
 )
 # Descriptor addresses are dereferenced as bf16, so registrations exclude fp16.
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
+
+
+@register_kernel(
+    "attention",
+    "kda_materialize_history",
+    name="triton_nvidia_kda_materialize_history",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures(("state",), "dense", {torch.float32}),
+    priority=Priority.SPECIALIZED,
+)
+def triton_nvidia_kda_materialize_history(
+    base_state: torch.Tensor,
+    correction: torch.Tensor,
+    weighted_key: torch.Tensor,
+    total_decay: torch.Tensor,
+    lengths: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    use_tensor_cores: bool,
+) -> torch.Tensor:
+    from tokenspeed_kernel.ops.attention.kda._triton.history_state import (
+        materialize_history,
+    )
+
+    return materialize_history(
+        base_state,
+        correction,
+        weighted_key,
+        total_decay,
+        lengths,
+        read_indices,
+        out=out,
+        use_tensor_cores=use_tensor_cores,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_clear_history",
+    name="triton_nvidia_kda_clear_history",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures(("lengths",), "dense", {torch.int32}),
+    priority=Priority.SPECIALIZED,
+)
+def triton_nvidia_kda_clear_history(
+    lengths: torch.Tensor, write_indices: torch.Tensor
+) -> None:
+    from tokenspeed_kernel.ops.attention.kda._triton.history_state import clear_history
+
+    clear_history(lengths, write_indices)
 
 
 def kda_recurrent_decode_mtp(
@@ -215,6 +272,7 @@ def triton_nvidia_kda_verify_conv_update(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    replay_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialize the NVIDIA split-verify convolution producer."""
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
@@ -229,6 +287,7 @@ def triton_nvidia_kda_verify_conv_update(
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
+        replay_qkv=replay_qkv,
     )
 
 
@@ -419,6 +478,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
             out=torch.empty_like(v),
             record_metadata=replay_records.metadata,
             record_stamps=replay_records.stamps,
+            history=replay_records.history,
         )
     return _nvidia_fused_verify(
         mixed_qkv,
@@ -624,6 +684,7 @@ def triton_nvidia_kda_batched_replay_commit(
     lower_bound: float,
     record_metadata: torch.Tensor,
     record_stamps: torch.Tensor,
+    history: KdaReplayHistoryBatch | None = None,
 ) -> None:
     """Recover every KDA layer from FP32 U and BF16 K/raw-gate records.
 
@@ -645,6 +706,7 @@ def triton_nvidia_kda_batched_replay_commit(
         gate_stride: Shared adapter field; no gate scratch is read here.
         conv_width: Width of the depthwise convolution kernel.
         lower_bound: Bound used to transform saved raw gates during commit.
+        history: Persistent accepted-record destinations; omit for immediate recovery.
 
     Returns:
         None.
@@ -674,6 +736,7 @@ def triton_nvidia_kda_batched_replay_commit(
         conv_width=conv_width,
         record_metadata=record_metadata,
         record_stamps=record_stamps,
+        history=history,
         lower_bound=lower_bound,
     )
 
@@ -702,6 +765,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noq
     capture_replay_payload,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
+    commit_resolved_state_groups,
     commit_state_groups,
     commit_state_pages,
     verify_state_blocks,

@@ -974,6 +974,8 @@ def fused_kda_verify_conv_update_kernel(
     conv_pool,
     read_indices,
     out,
+    replay_qkv,
+    stride_replay_tok,
     stride_raw_tok: tl.constexpr,
     stride_out_tok: tl.constexpr,
     stride_conv_page: tl.constexpr,
@@ -999,11 +1001,18 @@ def fused_kda_verify_conv_update_kernel(
             mask=mask_c & ~from_raw & (b_read >= 0),
             other=0.0,
         ).to(tl.float32)
-        b_raw = tl.load(
+        raw_value = tl.load(
             qkv_raw + (i_n * T + i_raw) * stride_raw_tok + o_c,
             mask=mask_c & from_raw,
             other=0.0,
-        ).to(tl.float32)
+        )
+        if replay_qkv is not None:
+            if i_w == 3:
+                # The last tap reads this row's original projection exactly once.
+                tl.store(
+                    replay_qkv + i_row * stride_replay_tok + o_c, raw_value, mask=mask_c
+                )
+        b_raw = raw_value.to(tl.float32)
         b_w = tl.load(conv_w + o_c * 4 + i_w, mask=mask_c, other=0.0).to(tl.float32)
         acc += tl.where(from_raw, b_raw, b_state) * b_w
     acc = acc * tl.sigmoid(acc)
@@ -1024,6 +1033,7 @@ def fused_kda_verify_conv_update(
     head_dim: int,
     draft_token_num: int,
     out: torch.Tensor | None = None,
+    replay_qkv: torch.Tensor | None = None,
     block_c: int = 256,
     num_warps: int = 4,
 ) -> torch.Tensor:
@@ -1037,6 +1047,8 @@ def fused_kda_verify_conv_update(
         num_heads/head_dim: Per-rank head geometry (P = num_heads*head_dim).
         draft_token_num: Draft positions per request (T).
         out: Optional ``[N*T, 3*P]`` bf16 output tensor.
+        replay_qkv: Optional same-shaped destination for the original rows.
+            Exact input aliases need no copy; other overlapping buffers are invalid.
         block_c: Number of feature channels handled by each program.
         num_warps: Number of warps used by each program.
 
@@ -1082,6 +1094,45 @@ def fused_kda_verify_conv_update(
         raise ValueError(f"out must have shape [{total}, {C}] and last stride 1")
     elif out.dtype != qkv_raw.dtype:
         raise ValueError(f"out must have dtype {qkv_raw.dtype}, got {out.dtype}")
+    if replay_qkv is not None:
+        if replay_qkv.shape != qkv_raw.shape or replay_qkv.stride(-1) != 1:
+            raise ValueError(
+                f"replay_qkv must have shape [{total}, {C}] and last stride 1"
+            )
+        if replay_qkv.dtype != qkv_raw.dtype:
+            raise ValueError(f"replay_qkv must have dtype {qkv_raw.dtype}")
+        if (
+            replay_qkv.data_ptr() == qkv_raw.data_ptr()
+            and replay_qkv.stride() == qkv_raw.stride()
+        ):
+            # The original rows are already retained. Avoid stores racing with
+            # other convolution programs that read those same rows.
+            replay_qkv = None
+        else:
+            begin = replay_qkv.data_ptr()
+            end = (
+                begin
+                + ((total - 1) * replay_qkv.stride(0) + C) * replay_qkv.element_size()
+            )
+            for tensor in (qkv_raw, conv_pool, out):
+                source_begin = tensor.data_ptr()
+                source_end = (
+                    source_begin
+                    + (
+                        1
+                        + sum(
+                            (size - 1) * stride
+                            for size, stride in zip(
+                                tensor.shape, tensor.stride(), strict=True
+                            )
+                        )
+                    )
+                    * tensor.element_size()
+                )
+                if begin < source_end and source_begin < end:
+                    raise ValueError(
+                        "replay_qkv must not overlap convolution inputs or output"
+                    )
     grid = (total, triton.cdiv(C, block_c))
     fused_kda_verify_conv_update_kernel[grid](
         qkv_raw=qkv_raw,
@@ -1089,6 +1140,8 @@ def fused_kda_verify_conv_update(
         conv_pool=conv_pool,
         read_indices=read_indices,
         out=out,
+        replay_qkv=replay_qkv,
+        stride_replay_tok=0 if replay_qkv is None else replay_qkv.stride(0),
         stride_raw_tok=qkv_raw.stride(0),
         stride_out_tok=out.stride(0),
         stride_conv_page=conv_pool.stride(0),

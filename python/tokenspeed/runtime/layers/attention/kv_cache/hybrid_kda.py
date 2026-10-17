@@ -54,6 +54,10 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     ):
         self._layer_types = tuple(layer_types)
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._replay_correction: list[torch.Tensor | None] = []
+        self._replay_weighted_key: list[torch.Tensor | None] = []
+        self._replay_decay: list[torch.Tensor | None] = []
+        self._replay_length: list[torch.Tensor | None] = []
         self.requires_page_zeroing = True
 
         if len(self._layer_types) != kwargs["layer_num"]:
@@ -70,6 +74,10 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
         "recurrent_state": "_recurrent_state",
+        "replay_correction": "_replay_correction",
+        "replay_weighted_key": "_replay_weighted_key",
+        "replay_decay": "_replay_decay",
+        "replay_length": "_replay_length",
     }
 
     def _bind_layer_planes(self) -> None:
@@ -97,7 +105,14 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
                 for layer_id, label in enumerate(self._layer_types)
                 if label in STATE_LAYER_TYPES
             ),
-            state_field_suffixes=("conv_state", "recurrent_state"),
+            state_field_suffixes=(
+                "conv_state",
+                "recurrent_state",
+                "replay_correction",
+                "replay_weighted_key",
+                "replay_decay",
+                "replay_length",
+            ),
         )
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
@@ -112,6 +127,17 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             return conv
         if component_name == "recurrent_state":
             return recurrent
+        histories = {
+            "replay_correction": self._replay_correction,
+            "replay_weighted_key": self._replay_weighted_key,
+            "replay_decay": self._replay_decay,
+            "replay_length": self._replay_length,
+        }
+        if component_name in histories:
+            component = histories[component_name][layer_id]
+            if component is not None:
+                return component
+            raise ValueError(f"layer {layer_id} has no retained KDA history")
         raise ValueError(f"unknown KDA component {component_name!r}")
 
     def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:

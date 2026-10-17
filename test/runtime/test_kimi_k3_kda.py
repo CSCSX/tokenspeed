@@ -233,6 +233,11 @@ class _StubContractPool:
             }
             for layer_id in self._groups
         }
+        self.layer_fields = {
+            (layer_id, name): f"layer.{layer_id}.{name}"
+            for layer_id, fields in self._components.items()
+            for name in fields
+        }
 
     @property
     def state_group_by_layer(self) -> dict[int, str]:

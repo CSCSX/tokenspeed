@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -41,7 +41,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_replay_history_capacity,
     kda_replay_supported,
+    kda_state_fields,
     kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -59,8 +61,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 GLM53_FLASH_LOGICAL_BLOCK_TOKENS = 64
 
-# Full-attention pages per LCM parent, keyed by (attn tp size, MLA cache
-# element size). The compressed KPool index is a companion field of the same
+# Minimum full-attention pages per LCM parent, keyed by (attn tp size, MLA
+# cache element size). Retained KDA history can increase this count. The compressed KPool index is a companion field of the same
 # 64-token CacheBlock and therefore shares this packing and block table. KDA
 # state groups always pack one checkpoint per parent; the bounded raw KPool
 # tail is request-local workspace and has no scheduler-facing packing.
@@ -112,9 +114,9 @@ def glm53_flash_packing_counts(
     *,
     tp_size: int,
     mla_element_size: int,
-    state_group_ids: Sequence[str] = (),
+    groups: tuple[CacheGroupDeclaration, ...],
 ) -> dict[str, int]:
-    """Look up the LCM packing for one GLM-5.3-Flash parallel/dtype shape."""
+    """Fit each KDA checkpoint inside an integer number of dense MLA pages."""
     try:
         full = _PACKING[(int(tp_size), int(mla_element_size))]
     except KeyError:
@@ -123,6 +125,26 @@ def glm53_flash_packing_counts(
             f"with a {mla_element_size}-byte MLA cache; supported shapes are "
             f"{sorted(_PACKING)}"
         ) from None
+    mla_page_bytes = next(
+        field.payload_bytes
+        for spec, fields in groups
+        if spec.group_id == FULL_ATTENTION
+        for field in fields
+        if field.exact_page_stride
+    )
+    state_plane_bytes: dict[tuple[str, str], int] = {}
+    state_group_ids = []
+    for spec, fields in groups:
+        if spec.attn_kind != "state":
+            continue
+        state_group_ids.append(spec.group_id)
+        for field in fields:
+            key = (spec.group_id, field.plane_id)
+            state_plane_bytes[key] = state_plane_bytes.get(key, 0) + field.payload_bytes
+    # The MLA kernel uses payload-sized page strides. Grow its packing, not
+    # its page stride, when retained history widens a shared state plane.
+    state_bytes = max(state_plane_bytes.values(), default=0)
+    full = max(full, -(-state_bytes // mla_page_bytes))
     packing = {FULL_ATTENTION: full}
     packing.update(dict.fromkeys(state_group_ids, 1))
     return packing
@@ -198,6 +220,7 @@ def declare_glm53_flash_groups(
         for group_id in group_ids
     )
     target_layers = len(target_layer_types)
+    history_capacity = kda_replay_history_capacity(attn_config)
 
     def fields_for_layer(
         layer_id: int, group_id: str, occurrence: int
@@ -224,21 +247,12 @@ def declare_glm53_flash_groups(
                     scatter_stored_dtype_name(config.kv_cache_dtype),
                 ),
             )
-        return (
-            CacheFieldSpec(
-                f"layer.{layer_id}.conv_state",
-                plane_id,
-                target_linear.conv_state_shape,
-                cache_dtype_name(torch.bfloat16),
-                exact_page_stride=False,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.recurrent_state",
-                plane_id,
-                target_linear.temporal_state_shape,
-                cache_dtype_name(torch.float32),
-                exact_page_stride=False,
-            ),
+        return kda_state_fields(
+            layer_id,
+            plane_id,
+            conv_shape=target_linear.conv_state_shape,
+            recurrent_shape=target_linear.temporal_state_shape,
+            history_capacity=history_capacity,
         )
 
     base = group(
@@ -339,20 +353,19 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
-        state_group_ids = [
-            spec.group_id
-            for spec, _ in groups
-            if spec.group_id.startswith(LINEAR_ATTENTION)
-        ]
         return glm53_flash_packing_counts(
             tp_size=self._dsa_config.attn_tp_size,
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
-            state_group_ids=state_group_ids,
+            groups=groups,
         )
 
     @override
     def verify_scratch_in_pool(self) -> bool:
         return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
+
+    @cached_property
+    def replay_history_capacity(self) -> int:
+        return kda_replay_history_capacity(self.attn_config)
 
     @cached_property
     def replay_kda(self) -> bool:
@@ -363,11 +376,13 @@ class Glm53FlashRecipe(CacheRecipe):
     def workspace_bytes(self) -> int:
         """Shared KPool tails plus the target's KDA verification staging."""
         tail_bytes = self.pool_options().workspace_bytes
-        width = self.attn_config.speculative_num_draft_tokens
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-            or width <= 1
+        width = (
+            self.attn_config.speculative_num_draft_tokens
+            if self.server_args.speculative_algorithm is not None
+            else 1
+        )
+        if self.server_args.disaggregation_mode == "prefill" or (
+            width <= 1 and not self.replay_history_capacity
         ):
             return tail_bytes
         return tail_bytes + kda_verify_workspace_bytes(

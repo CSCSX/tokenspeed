@@ -232,6 +232,28 @@ null slot 0 also means "read slot 1" for the rows the runtime fabricates
 commits the accepted state into slot 1 unconditionally
 (`commit_state_pages`).
 
+KDA can represent that endpoint as a composite checkpoint. The block holds
+its convolution window, a dense recurrent base, and a bounded accepted
+history of FP32 corrections, decay-weighted normalized keys, total decay and
+length. The recurrent endpoint is `base * decay + correction @ weighted_key`;
+a zero history length means the base alone. These are fields of the same
+state block, so prefix reuse, zeroing, copying, retraction and PD transfer
+carry all of them together. The physical history capacity is independent of
+the engine role and speculative width. Head-valued fields follow attention
+TP partitioning; the accepted length is replicated.
+Kimi and GLM size shared state planes from all of these fields. If a checkpoint
+outgrows the current plane, the recipe increases the number of full-attention
+pages per parent while preserving each MLA page's exact payload-sized stride.
+
+Verify reconstructs the input endpoint and publishes a new base only into the
+private live block, before evaluating candidates, when ownership changes or
+the next window needs more history capacity. Acceptance appends only retained
+tokens. The convolution window and composite recurrent endpoint thus describe
+the same accepted token count at every publication. Prefill reconstructs a
+resumed composite endpoint into its dense scan inputs and clears the output
+history length after storing the final state. No consumer may treat the dense
+base alone as the endpoint while retained history is nonempty.
+
 A slot's state block is a whole snapshot, so the token count that keys it
 must be exactly the tokens it consumed. The device therefore ends a request
 where the control plane does: the sampling epilogue cuts every round's
@@ -281,8 +303,9 @@ any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
 and both sides omit the group from the manifest (`pd/cache_protocol.py`).
 
 Speculative KDA verification stores no per-position recurrent states: it
-captures each window's raw projections in a compact payload and commits by
-replaying the accepted prefix from the committed block. The Kimi-K3 and
+captures each window's projections and corrections in a compact payload.
+Commit either reconstructs the accepted endpoint or appends its factors to
+the cache-owned retained history described above. The Kimi-K3 and
 GLM-5.3-Flash recipes share this workspace calculation and reserve it before
 sizing the arena -- the transient conv rows plus the per-layer capture
 payloads. GLM also reserves its target/draft-shared KPool tails once, so state

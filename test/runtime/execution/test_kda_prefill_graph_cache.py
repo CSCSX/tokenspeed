@@ -255,6 +255,7 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
     )
 
     backend = object.__new__(KdaAttnBackend)
+    backend._reset_replay_state()
     configure_prefill(backend)
     backend.cache_pool = object()
     original = metadata("cuda", 1)
@@ -311,6 +312,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     initial_conv, initial_states = conv.clone(), states.clone()
     raw = torch.randn(bucket, 3 * channels, device="cuda", dtype=torch.bfloat16)
     backend = object.__new__(KdaAttnBackend)
+    backend._reset_replay_state()
     configure_prefill(backend)
     backend.__dict__.update(
         is_draft=False,

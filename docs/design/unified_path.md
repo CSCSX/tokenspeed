@@ -313,9 +313,21 @@ refresh every state group's decode blocks in one prep-tape launch, up to eight
 groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the
 captured `state_in` buffers. The commit enqueued after the replay reads those
-buffers before the next refresh rewrites them. Verify keeps `state_out` at
-`pad_slot_id` and refills it only after a decode refresh has written live
-blocks into the same per-bs buffer.
+buffers before the next refresh rewrites them. The same refresh resolves the
+live destination into `state_out`; both buffers use `pad_slot_id` for padding.
+This lets a retained KDA checkpoint materialize into its private destination
+before verify, without mutating a published source.
+
+A backend may declare `supports_captured_state_commit` when its acceptance hook
+uses only persistent buffers. The forward runner then captures a separate commit
+graph over the forward graph's full accepted-count buffer, in the same memory
+pool and batch bucket. It replays that graph after sampling and stop clipping,
+before returning the round. Eager execution calls the same acceptance hook.
+Capture binds negative physical page IDs but must still record the commit kernels;
+an unset host verify context must not turn capture into an empty graph. The commit
+reads stable physical source/destination buffers, not scheduler table allocations.
+Rebinding releases both graphs together. Standard decode is a one-token window
+of this protocol; it does not require a drafter.
 
 After verification, GDN, KDA and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
@@ -942,8 +954,8 @@ recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
-The runner calls `commit_speculative_state_after_verify` once on the target
-after drafted decode/mixed execution or graph replay, with live acceptance
+The runner calls `commit_state_after_acceptance` once on the target
+after decode/mixed execution or graph replay, with acceptance
 and `num_extends`. Since forward mode is derived from the extend count,
 zero means decode at this entry. Hybrid commits GDN/KDA only then; the
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
@@ -1733,6 +1745,13 @@ attention family (GPU DSA), device and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
 
 ## Non-goals
+
+A mixed recurrent batch uses the existing prefill scan for extend rows and
+ordinary verify metadata and kernels for speculative decode rows. Its decode
+records, state-page indices, and accepted counts all use decode-local row
+indices. The acceptance hook commits only those decode rows; prefill states
+are already final. Mixed T=1 rows remain ordinary prefill scans. These are
+partitions of the existing operations, not a separate recurrence algorithm.
 
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.

@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
@@ -33,6 +35,14 @@ from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
     _prepare_commit_plan_kernel,
     kda_recoverssm_verify,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.kda import (
+        KdaReplayHistory,
+        KdaReplayHistoryBatch,
+        KdaReplayRecords,
+    )
+
 
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
@@ -82,6 +92,7 @@ def vllm_triton_kda_recoverssm_verify(
     out: torch.Tensor,
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
+    history: KdaReplayHistory | None = None,
 ) -> torch.Tensor:
     """Verify candidates and save current-window recovery records.
 
@@ -101,7 +112,10 @@ def vllm_triton_kda_recoverssm_verify(
     Records use position % capacity; verify stamps each written candidate.
     Both may be None only for standalone unstamped kernel diagnostics.
 
-    Return out after writing verify results. The checkpoint is unchanged.
+    If history is supplied, reconstruct the accepted input endpoint before
+    candidates. A capacity flush or page rotation writes that endpoint into
+    the private output page; candidate records remain uncommitted.
+    Return out after writing verify results.
     """
     return kda_recoverssm_verify(
         q,
@@ -121,6 +135,13 @@ def vllm_triton_kda_recoverssm_verify(
         out=out,
         record_metadata=record_metadata,
         record_stamps=record_stamps,
+        history_correction=None if history is None else history.correction,
+        history_key=None if history is None else history.weighted_key,
+        history_decay=None if history is None else history.total_decay,
+        history_lengths=None if history is None else history.lengths,
+        history_write_indices=None if history is None else history.write_indices,
+        history_append_offsets=None if history is None else history.append_offsets,
+        history_use_tensor_cores=False if history is None else history.use_tensor_cores,
     )
 
 
@@ -318,6 +339,7 @@ def batched_recoverssm_commit(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     lower_bound: float | None,
+    history: KdaReplayHistoryBatch | None = None,
 ) -> None:
     """Recover all layers from request-major raw records and commit conv.
 
@@ -351,7 +373,11 @@ def batched_recoverssm_commit(
     FP32 U by normalized keys weighted by subsequent decays, then adds the
     decayed checkpoint. Buffer capacity does not select the implementation;
     accepted lengths remain GPU inputs. Selection is fixed during graph capture.
-    Return None after recurrent and convolution commits on the caller stream.
+    With history, verify already handled any checkpoint materialization.
+    Commit appends accepted records across all layers in one launch and
+    commits convolution state at the same endpoint. A verify window wider
+    than the retained capacity commits a dense endpoint and clears its length.
+    Return None after record/state and convolution commits on the caller stream.
     """
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         batched_kda_commit_conv_window_kernel,
@@ -409,63 +435,99 @@ def batched_recoverssm_commit(
             raise ValueError(
                 "record metadata must be contiguous INT64 on the descriptor device"
             )
-    grid = lambda meta: (triton.cdiv(head_dim, meta["BV"]), batch, layers * num_heads)
-    typed = torch.empty(0, dtype=torch.float32, device=descriptors.device)
-    key_typed = torch.empty(0, dtype=torch.bfloat16, device=descriptors.device)
-    _commit_kda_state_kernel[grid](
-        typed,
-        descriptors[:, 8],
-        state_stride,
-        typed,
-        descriptors[:, 3],
-        capacity * correction_stride,
-        key_typed,
-        descriptors[:, 5],
-        capacity * key_gate_stride,
-        read_indices,
-        accepted_length,
-        write_indices,
-        None,
-        None,
-        NULL_BLOCK_ID,
-        head_dim * head_dim,
-        head_dim,
-        1,
-        head_dim,
-        correction_stride,
-        1,
-        2 * head_dim,
-        key_gate_stride,
-        1,
-        read_indices.stride(1),
-        group_indices,
-        read_indices.stride(0),
-        descriptors.stride(0),
-        record_metadata,
-        record_stamps,
-        0 if record_stamps is None else record_stamps.stride(0),
-        capacity,
-        slots,
-        a_ptr=descriptors[:, 6],
-        bias_ptr=descriptors[:, 7],
-        USE_GATE_BASE_ADDRESSES=True,
-        lower_bound=lower_bound,
-        USE_LOWER_BOUND=lower_bound is not None,
-        K=head_dim,
-        V=head_dim,
-        BK=triton.next_power_of_2(head_dim),
-        BT=max(8, triton.next_power_of_2(draft_token_num)),
-        USE_TENSOR_CORES=_use_tensor_cores_for_commit(
-            draft_token_num, head_dim, head_dim, batch * layers * num_heads
-        ),
-        NUM_HEADS=num_heads,
-        ALIGN_MODE=False,
-        BATCH=batch,
-        LAUNCH_DEPENDENT_KERNELS=False,
-        debug=True,
-        sanitize_overflow=False,
-        num_stages=2,
-    )
+    if history is not None and (record_metadata is None or record_stamps is None):
+        raise ValueError("persistent history requires stamped candidate records")
+    if history is not None and draft_token_num <= history.capacity:
+        _append_batched_recoverssm_history(
+            descriptors,
+            group_indices,
+            write_indices,
+            accepted_length,
+            record_metadata,
+            record_stamps,
+            history,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            correction_stride=correction_stride,
+            key_gate_stride=key_gate_stride,
+            lower_bound=lower_bound,
+        )
+    else:
+        # A window wider than history capacity was flushed into its private
+        # base before verify. Recover its accepted prefix directly there.
+        recurrent_reads = write_indices if history is not None else read_indices
+        grid = lambda meta: (
+            triton.cdiv(head_dim, meta["BV"]),
+            batch,
+            layers * num_heads,
+        )
+        typed = torch.empty(0, dtype=torch.float32, device=descriptors.device)
+        key_typed = torch.empty(0, dtype=torch.bfloat16, device=descriptors.device)
+        _commit_kda_state_kernel[grid](
+            typed,
+            descriptors[:, 8],
+            state_stride,
+            typed,
+            descriptors[:, 3],
+            capacity * correction_stride,
+            key_typed,
+            descriptors[:, 5],
+            capacity * key_gate_stride,
+            recurrent_reads,
+            accepted_length,
+            write_indices,
+            None,
+            None,
+            NULL_BLOCK_ID,
+            head_dim * head_dim,
+            head_dim,
+            1,
+            head_dim,
+            correction_stride,
+            1,
+            2 * head_dim,
+            key_gate_stride,
+            1,
+            recurrent_reads.stride(1),
+            group_indices,
+            recurrent_reads.stride(0),
+            descriptors.stride(0),
+            record_metadata,
+            record_stamps,
+            0 if record_stamps is None else record_stamps.stride(0),
+            capacity,
+            slots,
+            a_ptr=descriptors[:, 6],
+            bias_ptr=descriptors[:, 7],
+            USE_GATE_BASE_ADDRESSES=True,
+            lower_bound=lower_bound,
+            USE_LOWER_BOUND=lower_bound is not None,
+            K=head_dim,
+            V=head_dim,
+            BK=triton.next_power_of_2(head_dim),
+            BT=max(8, triton.next_power_of_2(draft_token_num)),
+            USE_TENSOR_CORES=_use_tensor_cores_for_commit(
+                draft_token_num, head_dim, head_dim, batch * layers * num_heads
+            ),
+            NUM_HEADS=num_heads,
+            ALIGN_MODE=False,
+            BATCH=batch,
+            LAUNCH_DEPENDENT_KERNELS=False,
+            debug=True,
+            sanitize_overflow=False,
+            num_stages=2,
+        )
+    if history is not None and draft_token_num > history.capacity:
+        from tokenspeed_kernel.ops.attention.kda._triton.history_state import (
+            clear_batched_history,
+        )
+
+        clear_batched_history(
+            history.descriptors,
+            group_indices,
+            write_indices,
+            length_page_stride=history.length_page_stride,
+        )
     batched_kda_commit_conv_window_kernel[
         layers, batch, triton.cdiv(3 * num_heads * head_dim, 128)
     ](
@@ -481,6 +543,156 @@ def batched_recoverssm_commit(
         CONV_DIM=3 * num_heads * head_dim,
         BLOCK=128,
         num_warps=1,
+    )
+
+
+def _append_batched_recoverssm_history(
+    descriptors: torch.Tensor,
+    group_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    record_metadata: torch.Tensor,
+    record_stamps: torch.Tensor,
+    history: KdaReplayHistoryBatch,
+    *,
+    num_heads: int,
+    head_dim: int,
+    correction_stride: int,
+    key_gate_stride: int,
+    lower_bound: float | None,
+) -> None:
+    from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
+        append_kda_history_kernel,
+    )
+
+    batch = accepted_length.numel()
+    layers = descriptors.shape[0]
+    capacity = record_stamps.shape[2]
+    append_kda_history_kernel[batch, layers * num_heads](
+        None,
+        None,
+        record_metadata,
+        record_stamps,
+        None,
+        None,
+        None,
+        None,
+        write_indices,
+        history.append_offsets,
+        accepted_length,
+        None,
+        None,
+        descriptors,
+        history.descriptors,
+        group_indices,
+        batch,
+        record_stamps.stride(0),
+        history.append_offsets.stride(0),
+        num_heads,
+        capacity * correction_stride,
+        head_dim,
+        correction_stride,
+        1,
+        capacity * key_gate_stride,
+        2 * head_dim,
+        key_gate_stride,
+        1,
+        history.correction_page_stride,
+        history.capacity * head_dim,
+        head_dim,
+        1,
+        history.key_page_stride,
+        history.capacity * head_dim,
+        head_dim,
+        1,
+        history.decay_page_stride,
+        head_dim,
+        1,
+        history.length_page_stride,
+        lower_bound,
+        lower_bound is not None,
+        RECORD_CAPACITY=capacity,
+        HISTORY_CAPACITY=history.capacity,
+        K=head_dim,
+        V=head_dim,
+        BT=triton.next_power_of_2(capacity),
+        BH=triton.next_power_of_2(history.capacity),
+        BD=triton.next_power_of_2(head_dim),
+        num_warps=1 if history.capacity <= 16 else 2,
+        debug=True,
+        sanitize_overflow=False,
+    )
+
+
+def commit_recoverssm_history(
+    records: KdaReplayRecords,
+    accepted_length: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+) -> None:
+    """Absorb accepted raw records into the weighted composite after sampling.
+
+    records.history owns the persistent page-indexed buffers. Verify must
+    have populated append_offsets on the caller stream. accepted_length
+    contains the stop-clipped count including the target input, with zero
+    for padding. A_log, dt_bias and lower_bound must match verify's gate.
+    Normalize accepted keys in FP32, apply their later accepted decays, and
+    rescale the older factors once. The caller commits convolution state at
+    the same endpoint. All buffers must exist before graph capture.
+    """
+    from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
+        append_kda_history_kernel,
+    )
+
+    history = records.history
+    if history is None:
+        raise ValueError("history commit requires persistent record destinations")
+    batch = accepted_length.numel()
+    if batch == 0:
+        return
+    _, heads, capacity, value_dim = records.correction.shape
+    key_dim = records.key_gate.shape[-1] // 2
+    append_kda_history_kernel[batch, heads](
+        records.correction,
+        records.key_gate,
+        records.metadata,
+        records.stamps,
+        history.correction,
+        history.weighted_key,
+        history.total_decay,
+        history.lengths,
+        history.write_indices,
+        history.append_offsets,
+        accepted_length,
+        A_log,
+        dt_bias,
+        None,
+        None,
+        None,
+        batch,
+        0,
+        0,
+        heads,
+        *records.correction.stride(),
+        *records.key_gate.stride(),
+        *history.correction.stride(),
+        *history.weighted_key.stride(),
+        *history.total_decay.stride(),
+        history.lengths.stride(0),
+        lower_bound,
+        lower_bound is not None,
+        RECORD_CAPACITY=capacity,
+        HISTORY_CAPACITY=history.correction.shape[2],
+        K=key_dim,
+        V=value_dim,
+        BT=triton.next_power_of_2(capacity),
+        BH=triton.next_power_of_2(history.correction.shape[2]),
+        BD=triton.next_power_of_2(max(key_dim, value_dim)),
+        num_warps=1 if history.correction.shape[2] <= 16 else 2,
+        debug=True,
+        sanitize_overflow=False,
     )
 
 

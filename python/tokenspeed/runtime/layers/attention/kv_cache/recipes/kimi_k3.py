@@ -22,7 +22,7 @@
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
-KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
+KDA checkpoint, including its retained history; the state groups match the MLA plane's
 byte width so no parent is wasted.
 """
 
@@ -45,13 +45,14 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_replay_history_capacity,
     kda_replay_supported,
+    kda_state_fields,
     kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
-    cache_dtype_name,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -249,21 +250,12 @@ class KimiK3Recipe(CacheRecipe):
                 ),
             )
         conv_shape, recurrent_shape = self._kda_shapes
-        return (
-            CacheFieldSpec(
-                f"layer.{layer_id}.conv_state",
-                plane_id,
-                conv_shape,
-                cache_dtype_name(torch.bfloat16),
-                exact_page_stride=False,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.recurrent_state",
-                plane_id,
-                recurrent_shape,
-                cache_dtype_name(torch.float32),
-                exact_page_stride=False,
-            ),
+        return kda_state_fields(
+            layer_id,
+            plane_id,
+            conv_shape=conv_shape,
+            recurrent_shape=recurrent_shape,
+            history_capacity=self.replay_history_capacity,
         )
 
     # ---- packing: state groups match the MLA plane's byte width ----
@@ -282,9 +274,9 @@ class KimiK3Recipe(CacheRecipe):
         )
         # The smallest packing whose plane width covers one per-layer KDA
         # state, so the state page rides inside the MLA plane at the least
-        # parent granularity. Attn tp=8 gives the historical 12; attention-DP
-        # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
-        # while larger tp shrinks the state and the parent with it.
+        # parent granularity. Retained history and wider TP-local state grow
+        # the required plane together; larger TP shrinks both the state and
+        # the minimum parent packing.
         mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
         linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
         return {
@@ -316,9 +308,16 @@ class KimiK3Recipe(CacheRecipe):
     # ---- extras ----
 
     @cached_property
+    def replay_history_capacity(self) -> int:
+        return kda_replay_history_capacity(self.attn_config)
+
+    @cached_property
     def replay_kda(self) -> bool:
         """Whether verify commits by replaying from one conv checkpoint row."""
-        if self.server_args.speculative_algorithm is None:
+        if (
+            self.server_args.speculative_algorithm is None
+            and not self.replay_history_capacity
+        ):
             return False
         return kda_replay_supported(self.attn_config)
 
@@ -331,15 +330,19 @@ class KimiK3Recipe(CacheRecipe):
         """KDA verify staging reserved outside the cache arena."""
         if (
             self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-        ):
+            and not self.replay_history_capacity
+        ) or self.server_args.disaggregation_mode == "prefill":
             # Verify staging exists for the target's verify step; the prefill
             # role only ever writes committed prompt state.
             return 0
         return kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
-            draft_token_num=int(self.server_args.speculative_num_draft_tokens),
+            draft_token_num=(
+                int(self.server_args.speculative_num_draft_tokens)
+                if self.server_args.speculative_algorithm is not None
+                else 1
+            ),
             replay_kda=self.replay_kda,
         )
 

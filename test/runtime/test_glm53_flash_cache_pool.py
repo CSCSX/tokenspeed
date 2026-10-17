@@ -37,7 +37,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail(
+    tp_size: int, cache_dtype: torch.dtype
+) -> None:
     text_config = Glm53FlashTextConfig(
         num_hidden_layers=4,
         layer_types=[
@@ -61,7 +65,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         num_attention_heads=text_config.num_attention_heads,
         num_kv_heads=text_config.num_key_value_heads,
         head_dim=text_config.qk_head_dim,
-        attn_tp_size=4,
+        attn_tp_size=tp_size,
         cache_layer_types=tuple(text_config.paged_cache_layer_types),
         kv_lora_rank=text_config.kv_lora_rank,
         qk_nope_head_dim=text_config.qk_nope_head_dim,
@@ -82,12 +86,12 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         head_v_dim=text_config.linear_head_dim,
         conv_kernel_size=text_config.linear_conv_kernel_dim,
         layer_ids=tuple(text_config.linear_layer_ids),
-        tp_size=4,
+        tp_size=tp_size,
     )
     attn_config = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_dtype=cache_dtype,
         kv_cache_quant_method="none",
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
@@ -105,15 +109,10 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         draft_attn_config=draft_attn_config,
         draft_layers=1,
     )
-    state_group_ids = [
-        spec.group_id
-        for spec, _ in groups
-        if spec.group_id.startswith(LINEAR_ATTENTION)
-    ]
     packing = glm53_flash_packing_counts(
-        tp_size=4,
-        mla_element_size=torch.float8_e4m3fn.itemsize,
-        state_group_ids=state_group_ids,
+        tp_size=tp_size,
+        mla_element_size=cache_dtype.itemsize,
+        groups=groups,
     )
     plan = pack(
         groups,
@@ -147,7 +146,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     pool = HybridGlm53FlashTokenToKVPool(
         arena=arena,
         model_dtype=torch.bfloat16,
-        dtype=torch.float8_e4m3fn,
+        dtype=cache_dtype,
         quant_method=None,
         kv_lora_rank=text_config.kv_lora_rank,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
@@ -159,7 +158,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     draft_pool = HybridGlm53FlashTokenToKVPool(
         arena=arena,
         model_dtype=torch.bfloat16,
-        dtype=torch.float8_e4m3fn,
+        dtype=cache_dtype,
         quant_method=None,
         kv_lora_rank=text_config.kv_lora_rank,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
@@ -222,8 +221,8 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     assert draft_tail_k.data_ptr() != tail_k.data_ptr()
 
     conv, recurrent = pool.get_state_buffers(0)
-    assert tuple(conv.shape[1:]) == (3 * 64 * 128 // 4, 3)
-    assert tuple(recurrent.shape[1:]) == (64 // 4, 128, 128)
+    assert tuple(conv.shape[1:]) == (3 * 64 * 128 // tp_size, 3)
+    assert tuple(recurrent.shape[1:]) == (64 // tp_size, 128, 128)
     assert (
         conv.untyped_storage().data_ptr()
         == recurrent.untyped_storage().data_ptr()
@@ -240,6 +239,6 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     actual_nope, actual_rope = pool.get_mla_kv_buffer(
         layer, loc, dst_dtype=torch.bfloat16
     )
-    expected_nope = cache_k_nope.to(torch.float8_e4m3fn).to(torch.bfloat16)
+    expected_nope = cache_k_nope.to(cache_dtype).to(torch.bfloat16)
     assert torch.equal(actual_nope, expected_nope)
     assert actual_rope.numel() == 0
