@@ -504,7 +504,11 @@ def test_cuda_quantized_projection_forward():
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
     expected = reference(hidden, ids, mask)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-    assert model.wkv.weight.dtype == torch.float8_e4m3fn
+    # Hopper uses BF16 projection weights; other supported GPUs retain FP8.
+    expected_dtype = (
+        torch.bfloat16 if v41.current_platform().is_hopper else torch.float8_e4m3fn
+    )
+    assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):
         model(hidden, ids, mask)
     torch.cuda.synchronize()
