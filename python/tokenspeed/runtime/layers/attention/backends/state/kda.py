@@ -413,8 +413,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 raise ValueError(
                     "KDA commit requires INT32 tables with contiguous columns"
                 )
-            # The scheduler uploads fresh packed storage each round. Keep
-            # relative table geometry so changing its base needs no upload.
+            # Packed tables can move without changing their relative geometry.
+            # Masking stopped rows allocates each table separately, so those
+            # offsets can change even when the batch shape stays the same.
             table_base = rows[0]
             table_descriptors = tuple(
                 (
@@ -427,12 +428,16 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 for group, table in zip(self._replay_group_ids, rows, strict=True)
             )
             if table_descriptors != self._replay_commit_table_descriptors_host:
+                # Keep the forward thread ahead of the GPU. The pinned allocator
+                # retains this staging allocation until the async copy completes.
                 self._replay_commit_tables.copy_(
                     torch.tensor(
                         table_descriptors,
                         dtype=torch.int64,
-                        device=self.device,
-                    )
+                        device="cpu",
+                        pin_memory=True,
+                    ),
+                    non_blocking=True,
                 )
                 self._replay_commit_table_descriptors_host = table_descriptors
         return tables

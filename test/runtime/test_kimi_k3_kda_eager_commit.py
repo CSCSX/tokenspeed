@@ -1121,3 +1121,85 @@ def test_commit_plan_resolves_pages_when_packed_storage_moves():
         atol=0,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("batch", [2, 5])
+def test_commit_plan_queued_table_updates_keep_each_round_pages(batch):
+    """Queued descriptor uploads preserve each round's source and live pages."""
+    harness = _Harness(eager_replay=True, seed=174, max_bs=batch, usable_pages=24)
+    group_ids = harness.backend._replay_group_ids
+    request_indices = torch.arange(batch, dtype=torch.int32, device=DEV)
+    seq_lens = torch.full((batch,), 64 + T, dtype=torch.int32, device=DEV)
+    accepted = torch.arange(batch, dtype=torch.int32, device=DEV) % (T + 2)
+    rounds = []
+    for iteration in range(12):
+        tables = {}
+        expected_reads, expected_pages = [], []
+        for group_index, group in enumerate(group_ids):
+            rows, sources, destinations = [], [], []
+            for row in range(batch):
+                live = 1 + (iteration * 3 + group_index + row) % 20
+                checkpoint = (
+                    1 + (iteration + group_index * 7 + row) % 20
+                    if (iteration + row) % 2
+                    else 0
+                )
+                if iteration % 3 == 0 and row == batch - 1:
+                    checkpoint = live = -1
+                rows.append(
+                    [checkpoint, live] + [-1] * (1 + (iteration + group_index) % 3)
+                )
+                sources.append(checkpoint if checkpoint > 0 else live)
+                destinations.append(live)
+            # Retain independently allocated, strided tables across rounds.
+            tables[group] = torch.tensor(rows, dtype=torch.int32, device=DEV)[:, :2]
+            expected_reads.append(sources)
+            expected_pages.append(destinations)
+        rounds.append((tables, expected_reads, expected_pages))
+
+    def plan(tables):
+        harness.backend.refresh_decode_metadata(
+            batch,
+            batch,
+            request_indices,
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=tables,
+        )
+        return harness.backend._resolve_verify_commit_pages(accepted, group_ids)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Compile and warm the metadata kernels before queuing delayed updates.
+        for tables, _, _ in rounds:
+            plan(tables)
+    stream.synchronize()
+
+    snapshots = []
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(100_000_000)
+        for tables, _, _ in rounds:
+            pages, steps = plan(tables)
+            reads = harness.backend._replay_commit_reads[: len(group_ids) * batch]
+            snapshots.append(
+                (pages.clone(), reads.view_as(pages).clone(), steps.clone())
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    for (_, expected_reads, expected_pages), (pages, reads, steps) in zip(
+        rounds, snapshots, strict=True
+    ):
+        torch.testing.assert_close(
+            pages,
+            torch.tensor(expected_pages, dtype=torch.int32, device=DEV),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            reads,
+            torch.tensor(expected_reads, dtype=torch.int32, device=DEV),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(steps, accepted.clamp(1, T), atol=0, rtol=0)

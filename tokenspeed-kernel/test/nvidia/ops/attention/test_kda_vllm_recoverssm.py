@@ -314,7 +314,7 @@ def test_record_chain_uses_verify_inputs() -> None:
     assert not torch.equal(results[0][2], results[1][2])
 
 
-@pytest.mark.parametrize("batch", [4, 6, 9, 17])
+@pytest.mark.parametrize("batch", [4, 6, 8, 9, 16, 17, 32])
 @pytest.mark.parametrize("captured", [False, True])
 def test_recoverssm_ragged_prefix_and_null_rows(batch: int, captured: bool) -> None:
     """Verify valid prefixes and preserve unwritten records in every value tile."""

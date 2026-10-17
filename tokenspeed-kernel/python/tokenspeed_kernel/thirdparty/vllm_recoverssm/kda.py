@@ -248,7 +248,14 @@ def _kda_recoverssm_verify_kernel(
             lower_bound,
             USE_LOWER_BOUND,
         )
-        state = tl.where(token_valid, updated_state, state)
+        if SPEC_QUERY_LEN == 4 and K == 128 and V == 128 and BV == 16:
+            # Valid tokens form a prefix, and verify never publishes this state.
+            # Masked suffix tokens cannot write outputs or records, so keeping
+            # the old state live only increases register pressure. Other tiles
+            # retain their measured predicated-update schedule.
+            state = updated_state
+        else:
+            state = tl.where(token_valid, updated_state, state)
 
         out = tl.sum(state * q[None, :], axis=1)
         tl.store(
@@ -844,11 +851,16 @@ def kda_recoverssm_verify(
         BATCH=triton.next_power_of_2(batch),
         num_warps=1,
         # Keep explicit replay metadata assertions without instrumenting every
-        # integer operation. Limit registers after preloading the token window
-        # so the one-warp CTAs retain enough occupancy.
+        # integer operation. The four-token, 16-row tile no longer keeps the
+        # old state live, so its compiler-selected registers avoid spills.
+        # Other shapes retain the measured cap after preloading their inputs.
         debug=True,
         sanitize_overflow=False,
-        maxnreg=168,
+        maxnreg=(
+            None
+            if batch > 8 and spec_query_len == 4 and key_dim == value_dim == 128
+            else 168
+        ),
         num_stages=2,
     )
     return out
