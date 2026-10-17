@@ -73,7 +73,7 @@ def test_startup_arms_the_complete_selected_fusion_window(
         nprocs_per_node=2,
         enable_allreduce_fusion=enabled,
         comm_fusion_max_num_tokens=fusion_tokens,
-        layer_boundary_norm="auto" if enabled else "unfused",
+        layer_boundary_norm="fused" if enabled else "unfused",
     )
     args.mapping.rank = 0
     ports = PortArgs(

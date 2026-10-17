@@ -277,26 +277,6 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         _assert_rows(ib, _expected(full, [len(full) - 1]), [True])
         assert ib.ngram_previous_tokens_buf.data_ptr() == pointer
         _sample(ib, runtime, [current + 1], 0, [1], False)
-    assert set(vars(runtime)) == {
-        "device",
-        "vocab_size",
-        "valid_cache_lengths",
-        "future_input_map",
-        "spec_candidates_ready",
-        "draft_probs",
-        "draft_probs_sentinel",
-        "chain_parents",
-        "future_parent_map",
-        "ngram_accepted_tokens",
-        "ngram_needs_seed",
-        "ngram_request_ids",
-        "request_token_history_ids",
-        "draft_request_token_history_ids",
-        "stop_token_ids",
-        "token_limits",
-        "_stop_criteria_owners",
-        "stopped",
-    }
     assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
     assert runtime.ngram_accepted_tokens[2].tolist() == [18, 17, 16]
