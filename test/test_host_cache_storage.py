@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tokenspeed.runtime.cache.transfer.host_storage import HostCacheStorage
+from tokenspeed.runtime.cache.host_storage import HostCacheStorage
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheField,
     CacheGroupLayout,

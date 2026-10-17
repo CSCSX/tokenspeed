@@ -125,7 +125,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     scheduler.Cache = Cache
     layerwise_load = ModuleType("tokenspeed.runtime.cache.l2.layerwise_load")
     layerwise_load.LayerwiseLoadTracker = Mock
-    storage = ModuleType("tokenspeed.runtime.cache.transfer.host_storage")
+    storage = ModuleType("tokenspeed.runtime.cache.host_storage")
     storage.HostCacheStorage = Mock
     storage.compute_host_lcm_block_bytes = Mock(return_value=1)
     layout = ModuleType("tokenspeed.runtime.cache.transfer.layout")
@@ -141,7 +141,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
         "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
         "tokenspeed_scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
-        "tokenspeed.runtime.cache.transfer.host_storage": storage,
+        "tokenspeed.runtime.cache.host_storage": storage,
         "tokenspeed.runtime.cache.transfer.lanes": lanes,
         "tokenspeed.runtime.cache.transfer.layout": layout,
         "tokenspeed.runtime.cache.transfer.ownership": ownership,
@@ -1070,7 +1070,7 @@ class TestGroupAwareWireTest:
             "tokenspeed_kernel.ops.kvcache.host_transfer",
             "tokenspeed_scheduler",
             "tokenspeed.runtime.cache.l2.layerwise_load",
-            "tokenspeed.runtime.cache.transfer.host_storage",
+            "tokenspeed.runtime.cache.host_storage",
             "tokenspeed.runtime.cache.transfer.lanes",
             "tokenspeed.runtime.cache.transfer.layout",
             "tokenspeed.runtime.cache.transfer.ownership",

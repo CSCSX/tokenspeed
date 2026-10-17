@@ -61,15 +61,15 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
 )
 from tokenspeed_scheduler import Cache
 
+from tokenspeed.runtime.cache.host_storage import (
+    HostCacheStorage,
+    compute_host_lcm_block_bytes,
+)
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     gigabytes_to_lcm_blocks,
     resolve_retraction_pool,
-)
-from tokenspeed.runtime.cache.transfer.host_storage import (
-    HostCacheStorage,
-    compute_host_lcm_block_bytes,
 )
 from tokenspeed.runtime.cache.transfer.lanes import (
     CompletionQueue,

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, MemoryKvStore
@@ -30,10 +31,33 @@ from tokenspeed.runtime.cache.l3.config import parse_extra_config
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
+    from tokenspeed.runtime.cache.host_storage import HostCacheStorage
     from tokenspeed.runtime.cache.l3.executor import L3Executor
-    from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
+    from tokenspeed.runtime.cache.transfer.layout import CacheGroupLayout
+    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
     from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+        CacheTransferSchema,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+@dataclass(frozen=True, slots=True)
+class L3CacheInputs:
+    """Host resources and resolved CPU facts consumed by L3 construction.
+
+    This is an input record, not an executor or a builder. Shared Host storage
+    remains independent of L3; no field retains Device buffers or an executor.
+    """
+
+    storage: HostCacheStorage
+    ownership: BlockOwnerTranslation
+    groups: tuple[CacheGroupLayout, ...]
+    transfer_schema: CacheTransferSchema
+    prefix_granularity: int
+    attention_backend_name: str
+    draft_attention_backend_name: str
+    eagle3_layers_to_capture: tuple[int, ...]
 
 
 def create_storage_backend(
@@ -121,7 +145,7 @@ def create_l3_executor(
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
     *,
-    host_cache: HostCacheBuild | None,
+    inputs: L3CacheInputs | None,
     world_cpu_group: ProcessGroup | None,
 ) -> L3Executor | None:
     """Build an independent L3 executor without retaining device capabilities.
@@ -130,7 +154,7 @@ def create_l3_executor(
         server_args: Resolved launch settings; numerical choices are snapshotted.
         model_config: Target checkpoint configuration, without model weights.
         draft_model_config: Draft checkpoint configuration, or None.
-        host_cache: Startup-only Host resource and resolved byte/producer facts.
+        inputs: Startup-only Host resource and resolved byte/producer facts.
             None when device construction produced no Host L2 allocation.
         world_cpu_group: The existing Gloo world group for checkpoint agreement;
             None in a single-process deployment.
@@ -143,14 +167,14 @@ def create_l3_executor(
     """
     if server_args.kvstore_storage_backend is None:
         return None
-    if host_cache is None:
+    if inputs is None:
         raise ValueError("L3 construction requires a Host L2 allocation")
-    host_storage = host_cache.storage
-    ownership = host_cache.ownership
+    host_storage = inputs.storage
+    ownership = inputs.ownership
     cache_fields = tuple(
-        tuple(field.field_id for field in group.fields) for group in host_cache.groups
+        tuple(field.field_id for field in group.fields) for group in inputs.groups
     )
-    transfer_schema = host_cache.transfer_schema
+    transfer_schema = inputs.transfer_schema
     if len(cache_fields) != len(ownership.shard_counts):
         raise ValueError("L3 field groups and Host ownership must agree")
     for fields, shards in zip(cache_fields, ownership.shard_counts, strict=True):
@@ -162,20 +186,20 @@ def create_l3_executor(
                         f"{field_id} is head-partitioned"
                     )
 
-    eagle3_layers_to_capture = host_cache.eagle3_layers_to_capture
-    attention_backend_name = host_cache.attention_backend_name
-    draft_attention_backend_name = host_cache.draft_attention_backend_name
+    eagle3_layers_to_capture = inputs.eagle3_layers_to_capture
+    attention_backend_name = inputs.attention_backend_name
+    draft_attention_backend_name = inputs.draft_attention_backend_name
     from tokenspeed.runtime.cache.l3.backend import cache_layout_signature
     from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 
     cache_signature = cache_layout_signature(
-        host_cache,
+        inputs,
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
     )
     config = StorageRuntimeConfig.from_extra_config(
         server_args.kvstore_storage_backend_extra_config,
         host_blocks=host_storage.num_host_lcm_blocks,
-        prefix_granularity=host_cache.prefix_granularity,
+        prefix_granularity=inputs.prefix_granularity,
     )
     import torch.distributed as dist
 

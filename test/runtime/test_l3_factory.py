@@ -32,8 +32,7 @@ import pytest
 from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.l3.executor import StorageJob
-from tokenspeed.runtime.cache.l3.factory import create_l3_executor
-from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
+from tokenspeed.runtime.cache.l3.factory import L3CacheInputs, create_l3_executor
 from tokenspeed.runtime.cache.transfer.layout import CacheField, CacheGroupLayout
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -108,7 +107,7 @@ def construction(tmp_path):
         dtype="bfloat16",
     )
     host = Host()
-    host_cache = HostCacheBuild(
+    cache_inputs = L3CacheInputs(
         storage=host,
         ownership=BlockOwnerTranslation(
             shard_counts=(1,),
@@ -123,7 +122,7 @@ def construction(tmp_path):
         draft_attention_backend_name="",
         eagle3_layers_to_capture=(0,),
     )
-    return args, model, host, {"host_cache": host_cache, "world_cpu_group": None}
+    return args, model, host, {"inputs": cache_inputs, "world_cpu_group": None}
 
 
 def complete(executor):
@@ -138,8 +137,8 @@ def complete(executor):
 
 
 def test_factory_roundtrips_through_the_shared_host_resource(construction):
-    args, model, host, inputs = construction
-    executor = create_l3_executor(args, model, None, **inputs)
+    args, model, host, factory_kwargs = construction
+    executor = create_l3_executor(args, model, None, **factory_kwargs)
     try:
         assert executor.config.scheduler.max_host_blocks <= host.num_host_lcm_blocks
         host.host_buffer[:4] = b"KV01"
@@ -157,8 +156,8 @@ def test_factory_roundtrips_through_the_shared_host_resource(construction):
 
 
 def test_factory_freezes_namespace_inputs_before_weight_version_switch(construction):
-    args, model, _, inputs = construction
-    executor = create_l3_executor(args, model, None, **inputs)
+    args, model, _, factory_kwargs = construction
+    executor = create_l3_executor(args, model, None, **factory_kwargs)
     try:
         original = executor.store.key_prefix
         executor.set_weight_version("v2")
@@ -167,12 +166,12 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
         executor.set_weight_version("v1")
         model.model_override_args["new_override"] = {"nested": [1, 2]}
         args.disable_tf32 = not args.disable_tf32
-        inputs["host_cache"] = replace(
-            inputs["host_cache"], eagle3_layers_to_capture=(0, 3)
+        factory_kwargs["inputs"] = replace(
+            factory_kwargs["inputs"], eagle3_layers_to_capture=(0, 3)
         )
         executor.set_weight_version("v2")
         assert executor.store.key_prefix == expected
-        changed = create_l3_executor(args, model, None, **inputs)
+        changed = create_l3_executor(args, model, None, **factory_kwargs)
         try:
             changed.set_weight_version("v2")
             assert changed.store.key_prefix != expected
@@ -183,14 +182,14 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
 
 
 def test_factory_includes_the_draft_checkpoint_identity(construction, tmp_path):
-    args, model, _, inputs = construction
+    args, model, _, factory_kwargs = construction
     path = tmp_path / "draft"
     checkpoint(path, payload=b"draft-checkpoint")
     draft = ModelConfig(
         str(path), server_args=args, model_override_args="{}", dtype="bfloat16"
     )
-    target_only = create_l3_executor(args, model, None, **inputs)
-    with_draft = create_l3_executor(args, model, draft, **inputs)
+    target_only = create_l3_executor(args, model, None, **factory_kwargs)
+    with_draft = create_l3_executor(args, model, draft, **factory_kwargs)
     try:
         assert target_only.store.key_prefix != with_draft.store.key_prefix
     finally:
@@ -199,7 +198,7 @@ def test_factory_includes_the_draft_checkpoint_identity(construction, tmp_path):
 
 
 def test_factory_refuses_head_partitioned_payload_on_cyclic_owners(construction):
-    args, model, _, inputs = construction
+    args, model, _, factory_kwargs = construction
     ownership = BlockOwnerTranslation(
         shard_counts=(2,),
         device_virtual_counts=(17,),
@@ -211,20 +210,20 @@ def test_factory_refuses_head_partitioned_payload_on_cyclic_owners(construction)
             CacheFieldTransferSpec("k", CacheFieldPartition(axis=0, global_extent=8)),
         )
     )
-    inputs["host_cache"] = replace(
-        inputs["host_cache"], ownership=ownership, transfer_schema=schema
+    factory_kwargs["inputs"] = replace(
+        factory_kwargs["inputs"], ownership=ownership, transfer_schema=schema
     )
     with pytest.raises(ValueError, match="k is head-partitioned"):
-        create_l3_executor(args, model, None, **inputs)
+        create_l3_executor(args, model, None, **factory_kwargs)
 
 
 def test_factory_validates_limits_against_actual_host_capacity(construction):
-    args, model, host, inputs = construction
+    args, model, host, factory_kwargs = construction
     args.kvstore_storage_backend_extra_config = json.dumps(
         {"async": {"max_host_blocks": host.num_host_lcm_blocks + 1}}
     )
     with pytest.raises(ValueError, match="exceeds usable Host parents"):
-        create_l3_executor(args, model, None, **inputs)
+        create_l3_executor(args, model, None, **factory_kwargs)
 
 
 def test_unconfigured_storage_needs_neither_host_memory_nor_checkpoint_io(construction):
@@ -232,12 +231,11 @@ def test_unconfigured_storage_needs_neither_host_memory_nor_checkpoint_io(constr
     args.kvstore_storage_backend = None
     Path(model.model_path, "model.safetensors").unlink()
     assert (
-        create_l3_executor(args, model, None, host_cache=None, world_cpu_group=None)
-        is None
+        create_l3_executor(args, model, None, inputs=None, world_cpu_group=None) is None
     )
 
 
 def test_configured_storage_requires_host_memory(construction):
     args, model, _, _ = construction
     with pytest.raises(ValueError, match="requires a Host L2 allocation"):
-        create_l3_executor(args, model, None, host_cache=None, world_cpu_group=None)
+        create_l3_executor(args, model, None, inputs=None, world_cpu_group=None)

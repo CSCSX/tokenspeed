@@ -22,38 +22,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-from tokenspeed.runtime.cache.transfer.layout import (
-    CacheGroupLayout,
-    CacheTransferLayout,
-)
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
-        CacheTransferSchema,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class HostCacheBuild:
-    """Startup-only Host resources and resolved payload facts.
-
-    Groups contain immutable byte geometry, never the transfer layout's Device
-    buffers. Consumers retain the shared storage independently of its GPU copy
-    executor. Backend creation and namespace policy belong to those consumers.
-    """
-
-    storage: HostCacheStorage
-    ownership: BlockOwnerTranslation
-    groups: tuple[CacheGroupLayout, ...]
-    transfer_schema: CacheTransferSchema
-    prefix_granularity: int
-    attention_backend_name: str
-    draft_attention_backend_name: str
-    eagle3_layers_to_capture: tuple[int, ...]
+from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
 
 
 def _compute_host_layout(

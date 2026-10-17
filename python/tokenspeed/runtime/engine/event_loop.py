@@ -309,7 +309,7 @@ class EventLoop:
             server_args,
             self.model_config,
             draft_model_config,
-            host_cache=device.host_cache,
+            inputs=device.l3_cache_inputs,
             world_cpu_group=(
                 pg_manager.get_process_group("gloo", mapping.world_group)
                 if mapping.world_size > 1

@@ -58,7 +58,7 @@ hold each piece:
   needs is ``server_args`` or an object this builder already owns.
 - ``encoder_model_facts`` — a startup-only callable for EPD admission,
   resolved past its gate because a text-only model has no vision tower.
-- ``host_cache`` — startup-only Host storage and immutable payload facts,
+- ``l3_cache_inputs`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
 - ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
@@ -111,7 +111,7 @@ from tokenspeed.runtime.utils.startup_timing import startup_phase
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
+    from tokenspeed.runtime.cache.l3.factory import L3CacheInputs
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
@@ -261,7 +261,7 @@ class DeviceBuild:
         specs: Plain values the control plane plans with; safe to keep.
         transfer: The PD transfer peer's control face — bootstrap
             register/abort, event polling — or None outside PD.
-        host_cache: Startup-only Host resources and immutable payload facts,
+        l3_cache_inputs: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts EPD
@@ -275,7 +275,7 @@ class DeviceBuild:
     specs: DeviceSpecs
     transfer: Any
     handle: "DeviceHandle"
-    host_cache: HostCacheBuild | None
+    l3_cache_inputs: L3CacheInputs | None
     encoder_model_facts: Any
 
 
@@ -1429,7 +1429,7 @@ def build_device_side(
     # model executor's peer: it lays out the slot-state exporters the model
     # executor lists, so it is built after it.
     host_cache_executor = None
-    host_cache = None
+    l3_cache_inputs = None
     snapshot_pool = _retraction_pool_request(
         server_args,
         views.token_to_kv_pool.arena.runtime_contract,
@@ -1468,7 +1468,7 @@ def build_device_side(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
     if host_cache_executor is not None and host_cache_executor.host_storage is not None:
-        from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
+        from tokenspeed.runtime.cache.l3.factory import L3CacheInputs
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
             build_cache_transfer_schema,
         )
@@ -1484,7 +1484,7 @@ def build_device_side(
                     eagle3_layers_to_capture = [int(layer) for layer in draft_layers]
 
         assert host_cache_executor.block_owners is not None
-        host_cache = HostCacheBuild(
+        l3_cache_inputs = L3CacheInputs(
             storage=host_cache_executor.host_storage,
             ownership=host_cache_executor.block_owners,
             groups=host_cache_executor.layout.groups,
@@ -1561,7 +1561,7 @@ def build_device_side(
         return EncoderModelFacts.from_model(target.model, device=executor.device)
 
     return DeviceBuild(
-        host_cache=host_cache,
+        l3_cache_inputs=l3_cache_inputs,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,

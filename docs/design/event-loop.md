@@ -33,7 +33,7 @@ how long the caller may hold each piece:
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
-| `host_cache` | shared Host allocation, CPU owner translation and immutable payload facts; no Device buffers or executor | consumed by Host-storage construction at startup |
+| `l3_cache_inputs` | L3 construction inputs referencing shared Host storage plus CPU ownership and compatibility facts; no Device buffers or executor | consumed by Host-storage construction at startup |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 Encoder facts describe the transferred tensor, independently of the language

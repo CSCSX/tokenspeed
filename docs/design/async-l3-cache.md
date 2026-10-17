@@ -20,7 +20,7 @@ asynchronous implementation; there is no second synchronous scheduling mode.
 Python never selects a reusable prefix or allocates scheduler blocks. Workers
 never call the scheduler, GPU APIs or collectives. Host references remain in
 C++ until every cache-owning rank proves retirement. L2 and L3 independently
-retain one Host allocation. L3 owns its backend and accepts only Host storage
+retain one Host allocation from `cache/host_storage.py`. L3 owns its backend and accepts only Host storage
 and immutable namespace facts; it has no reference to L2 or DeviceHandle.
 The standalone byte-store adapter imports no device or numerical libraries;
 the runtime supplies an owner translation when sharding is used.
@@ -31,7 +31,7 @@ queues and explicit completion/retirement protocol. Idle administrative namespac
 purge remains a synchronous management call.
 
 Device construction returns a complete DeviceHandle and a startup-only
-`HostCacheBuild`: shared Host storage, owner translation and immutable
+`L3CacheInputs` record defined beside the L3 factory: shared Host storage, owner translation and immutable
 layout/partition/producer facts, with no Device buffers or L2 executor.
 The startup caller constructs L3 separately through
 `create_l3_executor` in `cache/l3/factory.py`. Its lower-level
