@@ -26,12 +26,16 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaReplayHistory,
     KdaReplayHistoryBatch,
     KdaReplayRecords,
+    kda_clear_history,
     kda_materialize_history,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
     append_kda_history_kernel,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.history_state import (
+    _clear_history_kernel,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.nvidia_history_decode import (
     _fused_history_decode_kernel,
@@ -40,6 +44,47 @@ from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
     batched_recoverssm_commit,
 )
 from utils import assert_no_triton_compile
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("length_stride", [1, 7])
+def test_history_clear_preserves_unselected_pages(index_dtype, length_stride):
+    """Live row counts and page-table strides preserve the warmed clear path."""
+    pages = 263
+    initial = torch.arange(pages * length_stride, device="cuda", dtype=torch.int32)
+    initial = initial.remainder(32) + 1
+    storage = initial.clone()
+    lengths = storage[::length_stride]
+
+    def page_vector(rows, stride):
+        backing = torch.full((rows, stride), -7, device="cuda", dtype=index_dtype)
+        values = torch.arange(rows, device="cuda", dtype=index_dtype) * 17
+        values = values.remainder(pages - 1) + 1
+        values[::7] = 0
+        values[1::11] = -1
+        values[2::13] = 19
+        backing[:, 0] = values
+        return backing[:, 0]
+
+    kda_clear_history(lengths, page_vector(3, 2))
+    with assert_no_triton_compile(_clear_history_kernel):
+        for rows in (1, 3, 16, 32, 127, 128, 129):
+            for stride in (1, 2, 16, 31, 32):
+                indices = page_vector(rows, stride)
+                expected = initial.clone()
+                expected[indices[indices > 0].long() * length_stride] = 0
+                storage.copy_(initial)
+                kda_clear_history(lengths, indices)
+                torch.testing.assert_close(storage, expected, atol=0, rtol=0)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    kda_clear_history(lengths, indices)
+                storage.copy_(initial)
+                graph.replay()
+                # Compare all backing storage: null pages, unselected pages
+                # and the other fields between length entries must survive.
+                torch.testing.assert_close(storage, expected, atol=0, rtol=0)
 
 
 def _verify(

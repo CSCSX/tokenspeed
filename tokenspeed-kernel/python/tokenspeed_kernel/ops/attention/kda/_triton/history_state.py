@@ -161,7 +161,8 @@ def materialize_history(
     return out
 
 
-@triton.jit(do_not_specialize=["rows"])
+# Prefill can supply either a block-table column or a contiguous page vector.
+@triton.jit(do_not_specialize=["rows", "stride_indices"])
 def _clear_history_kernel(
     lengths_ptr, indices_ptr, rows, stride_length, stride_indices, BLOCK: tl.constexpr
 ):
@@ -175,13 +176,14 @@ def _clear_history_kernel(
 def clear_history(lengths: torch.Tensor, write_indices: torch.Tensor) -> None:
     rows = write_indices.numel()
     if rows:
-        _clear_history_kernel[(triton.cdiv(rows, 128),)](
+        _clear_history_kernel[(triton.cdiv(rows, 64),)](
             lengths,
             write_indices,
             rows,
             lengths.stride(0),
             write_indices.stride(0),
-            BLOCK=128,
+            BLOCK=64,
+            num_warps=1,
         )
 
 

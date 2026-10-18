@@ -1475,6 +1475,8 @@ rules remain owned by the native host. Unsupported layouts retain the public
 wrapper's capacity preparation. Token, sequence and chunk counts do not
 specialize on equality or divisibility; the power-of-two sequence tile remains
 a compile-time bucket. A different live partition must not add scalar variants.
+History clearing likewise accepts contiguous page vectors and strided block-table
+columns without specializing on their live row counts or index strides.
 
 The preparation copies every input with its capacity padding scrubbed: the
 gate projection can produce undefined padding, and the inline path has no
