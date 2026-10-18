@@ -22,7 +22,7 @@ carries what it computed since its previous admission — the prefix pages
 completed and its computed-token count — which the coordinator publishes
 and reclaims inside the same `Admit` (`AdvanceRequestProgress` in
 `scheduler/operations/progress.h` is the one place that hashes those pages
-and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrc-cache-coordinator)
 for why publication rides with admission).
 
 Decode-role remote admission covers the complete unmatched prompt in one
@@ -39,10 +39,10 @@ its ordinary admission meaning, including mixed-mode token reservations and
 retraction demand. The wait carries a `Bootstrapping` or `Submitted`
 continuation so PD bootstrap can overlap it. A completed read's bounded Ready
 hold moves with that continuation until admission acquires its Host sources.
-`StorageTransferManager` owns the native query/GET tickets, Host references
-and bounded backup queue. The
-request holds no Device pages or request-pool slot while preparing. Runtime
-workers report object and retirement facts; the C++ group matcher chooses the
+`StorageTransferManager` owns query/GET/PUT tickets, Host references and the
+bounded backup queue. The request holds no Device pages or request-pool slot
+while preparing. Runtime workers report object and retirement facts; the C++
+group matcher chooses the
 reusable boundary and ordinary admission acquires the resulting Host entries.
 A soft deadline permits recomputation without retiring native I/O. Failed GET
 rows and detached GET jobs cannot publish data. An attached, retired GET may
@@ -57,7 +57,7 @@ See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
 tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
-[cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)):
+[cache-concepts](cache-concepts.md#the-coordinator-layer-csrc-cache-coordinator)):
 the hit boundary `T` is a token count, and `extend_prefix_lens` carries it
 as is. The probe is bounded
 in tokens, and the bound is the minimum of two rules: the configured replay
@@ -1030,9 +1030,10 @@ with no request suspended both must read empty and zero.
 (`1` = the null page alone = no image ever fits, so a capacity block aborts
 the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
-many rows plus the null row) are validated together, the P role refuses a
-pool, and L3 addresses page-cyclic sharded groups through replica-stable object keys
-(`cache-concepts.md`). `debug_force_retraction_interval` (§2) is the only
+many rows plus the null row) are validated together. The P role refuses a
+snapshot pool. L3 addresses page-cyclic sharded groups through replica-stable
+object keys ([cache concepts](cache-concepts.md)).
+`debug_force_retraction_interval` (§2) is the only
 knob that chooses victims outside capacity pressure, and it is refused
 without a pool. Every diagnostic names the binding field and the server arg
 behind it (`num_snapshot_pages` from the pool the runtime resolved --
@@ -1046,14 +1047,13 @@ default beside L2 that this model's `SingleRequestGroupPages` and
 `LcmBlocksNeededFor` count) is `python/tokenspeed/runtime/cache/l2/sizing.py`.
 
 **Runtime contract.** `num_snapshot_pages` is explicit (`1` without a pool).
-The runtime executes/counts snapshot and restore ops alongside L2 copies.
-Storage operations travel separately in `CacheOperation`; their agreed
-`StorageDone`, `StorageTick` and `StorageDetach` events enter the same scheduler
-head feedback point. `Prefetching` is a request waiting state; it does not
-add a second admission or forward path. There is no device `PrefetchOp` or
-runtime retraction event. `ExecutionPlan.aborts` reports capacity aborts for the
-runtime to finish toward clients. Scheduler/runtime releases follow the
-sequence in AGENTS.md.
+The runtime executes and counts snapshot and restore ops alongside L2 copies.
+Query, GET, PUT and cancellation are Host-only variants of `CacheOperation`.
+Their `StorageDone`, `StorageTick` and `StorageDetach` events enter the same
+scheduler head feedback point. `Prefetching` is a request waiting state; it
+does not add a second admission or forward path. `ExecutionPlan.aborts` reports capacity
+aborts for the runtime to finish toward clients. The runtime and scheduler
+must use matching contracts; releases follow the sequence in AGENTS.md.
 
 ## 5. Invariants a change must preserve
 

@@ -12,84 +12,52 @@ asynchronous implementation; there is no second synchronous scheduling mode.
 | --- | --- |
 | C++ scheduler and `StorageTransferManager` | Request preparation, prefix boundaries, pressure admission, soft deadlines, operation IDs, credits, Host references, publication, cancellation and quarantine |
 | `CacheCoordinator` | Group matching, allocation and pinning; ordinary probes see published Device/Host data only |
-| Python `L3Executor` | Host job snapshots, namespace and backend lifetime, bounded query/read/write queues, completion/pressure facts, and private backend health monitoring |
+| Python `L3Executor` | Immutable Host jobs, backend and Host-buffer lifetime, bounded query/read/write queues, completion/pressure facts, and backend health monitoring |
 | `L3CacheHooks` | Replica agreement on time, permissions and completion facts; feedback to the existing event-loop head |
 | `HostCacheStorage` | Shared pinned Host allocation and CPU-only block geometry; holds no device buffers or transfer layout |
 | `DeviceHandle` / `HostCacheExecutor` | Ordered D2H/H2D and device completion fences |
 
-Python never selects a reusable prefix or allocates scheduler blocks. Workers
-never call the scheduler, GPU APIs or collectives. Host references remain in
-C++ until every cache-owning rank proves retirement. L2 and L3 independently
-retain one Host allocation from `cache/host_storage.py`. L3 owns its backend and accepts only Host storage
-and immutable namespace facts; it has no reference to L2 or DeviceHandle.
-The executor imports no device or numerical libraries; the runtime supplies
-an owner translation when sharding is used. It binds the backend and Host
-resource directly and resolves object keys and local byte ranges before
-enqueueing immutable descriptors. Workers consume only those snapshots.
-Runtime QUERY/GET/PUT use its bounded queues and explicit
-completion/retirement protocol. Idle administrative namespace
-purge remains a synchronous management call.
+The C++ cache subsystem selects reusable prefixes, allocates blocks and owns
+their references. Python workers receive immutable keys and Host byte ranges;
+they call neither the scheduler nor GPU APIs or collectives. References remain
+held until every cache-owning rank proves that native I/O has retired. L2 and
+L3 independently retain the shared Host allocation, so either can shut down
+without invalidating memory still used by the other.
 
-Device construction returns a complete DeviceHandle and startup-only
-`HostCacheResources` from `cache/host_storage.py`: shared Host storage, owner
-translation, the immutable memory/group layouts and resolved attention choices.
-This neutral record holds no Device buffers, L2 executor, L3 schema or namespace.
-The L3 factory compiles transfer partition semantics and resolves EAGLE capture
-identity only after L3 is selected; device construction imports no L3 module.
-The startup caller constructs L3 separately through
-`create_l3_executor` in `cache/l3/factory.py`. Its lower-level
-`create_storage_backend` selects only the byte-storage client.
-`DeviceSpecs` contains no L3 configuration; scheduler configuration receives
-the executor's storage limits explicitly. Without a storage backend the factory returns
-before checkpoint I/O, client registration, workers or collectives. Checkpoint
-agreement uses the caller's explicit Gloo world group, never a default device
-process group.
-If construction fails after PD starts its background threads, the worker closes
-its ready pipe. Readiness reports failure immediately without joining or killing
-the worker; the existing launcher owns subprocess teardown and its budget.
-This does not set a deadline on healthy model loading or checkpoint agreement.
-The loop captures `plan.cache` once, submits its Host-storage subset to L3 and
-passes its Device-copy subset explicitly to DeviceHandle from the same plan,
-including frozen-round cleanup. L3 hooks poll the L3 executor directly
-and return agreed facts to the existing head feedback point. RequestHandler
-coordinates namespace/version changes through that same L3 capability.
-The factory collects static checkpoint, layout and producer facts once into an
-immutable deployment identity. Producer options are structured fields; target
-compute dtype is already in the packed-cache signature. The weight-version
-callback only combines that identity with explicit target/draft generations.
-It retains no mutable launch configuration. This consolidation changes namespace
-hashes, so earlier objects remain cold; the compatibility epoch stays unchanged.
-The factory validates page-sharded payloads and constructs the backend,
-asynchronous executor with the shared Host resource. It retains no L2 executor or device
-capability. The device builder only extracts resolved facts; it neither selects
-an L3 backend nor starts storage work. L2 copies remain inside device construction
-because they bind Device buffers, streams and slot-state exporters.
+Device construction returns startup-only `HostCacheResources`: shared storage,
+owner translation, CPU cache geometry and resolved attention choices. This
+record contains no Device buffers or executor. The separate L3 factory derives
+the storage schema and immutable deployment identity, validates sharded payloads,
+and constructs the backend and executor. Static checkpoint/layout/producer facts
+are collected once; weight-version changes combine that identity with explicit
+target/draft versions. Checkpoint agreement uses the caller's explicit CPU group.
+Device construction retains responsibility for L2 copies and their Device
+buffers, streams and slot-state exporters.
 
-No additional HiCacheEngine is needed: C++ owns policy, the existing loop owns
-round sequencing, and the shared Host resource owns its allocation.
+The control plane adapts `plan.cache` once. Its immutable `CacheOperations`
+snapshot preserves order within the Device and storage subsets. The loop
+submits storage operations to L3 and passes the Device subset to both cache-op
+accounting and `DeviceHandle.execute`. The two executors depend on scheduler
+tickets rather than their submission order. Completions enter the existing
+head feedback point, including during frozen and DP-idle rounds.
 
-Device-copy and L3 teardown are attempted independently. A failed Device
-shutdown must still retire L3 workers before its backend can be closed;
-unproven native retirement retains the registered Host allocation.
-The executor exposes one `close()` operation: it first stops its workers and
-proves native retirement, then closes the backend. Worker shutdown is an
-internal step, not a second resource-management interface.
+Configuration follows the same ownership boundary. `StorageConfig` is the
+read-only scheduling contract for credits, deadlines and pressure watermarks.
+`StorageRuntimeConfig` contains that contract plus Python worker counts and
+backend-health settings. `MooncakeStoreConfig` contains connection and segment
+settings. The JSON `async` object tunes this one asynchronous path; it does
+not select another execution mode. See
+[server configuration](../configuration/server.md#host-l2-and-mooncake-store-l3)
+for settings and defaults.
 
-`StorageConfig` is the read-only scheduling contract: credits, prefetch limits,
-deadlines and pressure watermarks. `StorageRuntimeConfig` contains that contract
-plus Python worker counts and backend-health settings; it does not duplicate
-the scheduling fields. The executor and replica hooks read the same parsed
-limits that are passed to the scheduler, which takes its normal value snapshot.
-`MooncakeStoreConfig` stays inside the backend and contains only connection
-and storage-segment settings. L3 names the cache tier; Storage names its
-backend-neutral operations and scheduling contract. Neither selects a second
-execution mode. The existing JSON `async` object supplies runtime tuning values.
+## Request state
 
 A request waiting for QUERY/GET is in the main FSM's `Prefetching` state,
 not in `Submitted` with a second readiness flag. It owns no Device pages or
 request slot and never enters forward candidates, prefill token reservation
-or capacity-retraction demand. A one-shot preparation bit prevents retries
-after a miss, pressure bypass or soft timeout; it does not gate admission.
+or capacity-retraction demand. A one-shot preparation bit prevents repeated
+storage attempts after a miss, pressure bypass or soft timeout; ordinary
+admission remains available.
 
 `Prefetching` carries a typed continuation, either `Bootstrapping` or
 `Submitted`. The PD bootstrap ACK updates that continuation without ending
@@ -99,20 +67,20 @@ the pre-admission state, expires independently and remains charged to its
 storage ticket until ordinary admission acquires the Host sources. Native
 I/O and its memory references may outlive cancellation or a soft deadline;
 that lifetime stays in `StorageTransferManager`, independently of the FSM.
+
+`AdmissionResources` carries the input context, `storage_prepared` bit and
+optional Ready hold across these pre-admission transitions. The hold names
+the storage ticket; the actual Host references remain in
+`StorageTransferManager`. `storage_prepared` means the request has considered
+L3 once, not that a read succeeded. A Ready hold likewise does not promise
+a complete prefix hit.
+
 `plan.cache` contains both Device copies and four Host-only command types:
 `StorageQueryOp`, `StorageGetOp`, `StoragePutOp` and `StorageCancelOp`.
 Query carries keys, Get carries Host destinations, Put carries Host sources,
 and Cancel names the existing operation without creating another ticket.
 Their read-only `kind` is fixed by type. They share one L3 executor and
 completion protocol; storage completion never substitutes for an H2D fence.
-
-The control plane reads and validates the plan once. Its immutable
-`CacheOperations` snapshot preserves order within the Device and storage
-subsets. The cache hooks count only Device tickets, DeviceHandle receives
-that same Device tuple explicitly, and L3Executor receives the storage tuple.
-A missing executor or an unsupported operation fails explicitly. Frozen and
-DP-idle rounds still dispatch cancellation and Device cleanup. This grouping
-adds no ordering between the two executors: tickets express the dependencies.
 
 ## Read transaction
 
@@ -127,8 +95,9 @@ adds no ordering between the two executors: tickets express the dependencies.
    boundaries contribute their distinct missing keys only when the whole
    additional set fits. Historical State checkpoints cannot crowd out the
    prompt-end checkpoint needed for the longest restore.
-2. the storage subset of `plan.cache` carries a query with a monotonically increasing operation
-   ID and immutable keys. Querying reserves no Device pages or batch slots.
+2. The storage subset of `plan.cache` carries a query with a monotonically
+   increasing operation ID and immutable keys. Querying reserves no Device
+   pages or batch slots.
 3. After all owners report existence, C++ runs the existing group matcher
    with these temporary hints. It pins all warm dependencies before allocating
    Host destinations. Under shortage it shortens the boundary and re-runs the
@@ -136,9 +105,10 @@ adds no ordering between the two executors: tickets express the dependencies.
 4. A GET job receives fixed backend keys, Host offsets and lengths. No worker
    reads a mutable namespace or a later scheduler plan.
 5. `StorageDone` carries per-key success, confirmed object-failure facts,
-   and an operation-wide retirement fact. Only all-owner, full-length, retired successes publish Host entries.
-   Partial success may populate a shorter legal prefix; ordinary matching
-   determines what is actually reusable.
+   and an operation-wide retirement fact. After the operation has retired on
+   every owner, only rows with full-length success on every owner publish
+   Host entries. Successful rows may form a shorter legal prefix; ordinary
+   matching determines what is actually reusable.
 6. A short Ready hold protects the result until ordinary admission transfers
    ownership to the existing H2D ticket. Ready expiry releases the hold. H2D
    and the forward use the same execution path as every Host hit.
@@ -184,6 +154,8 @@ ends its wait and permits local admission; it does not retract the request,
 raise admission headroom, mark the backend unhealthy or release native I/O
 buffers. Detached completions cannot publish data. Another request's local
 publication may also satisfy the wait before the remote operation completes.
+Deadlines are processed at scheduler ticks; they are not hard bounds on
+end-to-end request latency or backend call duration.
 
 Client cancellation enters at the existing loop head. A fused request still
 in Submitted or Prefetching can abort immediately when C++ confirms it has no
@@ -222,7 +194,8 @@ Runtime operation/Host credits bound L3 ownership, not process RSS.
 
 Query, GET and PUT have separate bounded queues and workers. The total
 outstanding-operation limit includes queued jobs, native work and undelivered
-results. C++ separately limits key count, Host references, lookahead tokens,
+results. Completed scheduler tickets remain charged while they hold Ready
+results or quarantined references. C++ also limits key count, Host references, lookahead tokens,
 negative metadata and backup candidates. Each held CacheBlock is charged
 conservatively as one potentially pinned LCM parent, including warm
 requirements and quarantine. This can underuse packed Host capacity but cannot
@@ -253,10 +226,10 @@ same lock: the number and payload bytes of queued QUERY/GET/PUT jobs, and the
 age of the oldest queued or running job. Query payload bytes are zero. Retired
 work is excluded; detached native work remains included until it retires.
 Sampling scans at most the configured operation limit and never calls storage
-or the GPU. Metrics snapshots remain a separate, lower-frequency observation. L3 exports
-use the shared metric adapter and the process-local metrics service for the
-selected outputs. Local I/O remains labeled by TP rank; exporters do not make
-storage admission or retirement decisions.
+or the GPU. Metrics snapshots remain a separate, lower-frequency observation.
+L3 exports use the shared metric adapter and process-local metrics service.
+Local I/O remains labeled by TP rank; exporters do not make storage admission
+or retirement decisions.
 
 Hooks MAX-reduce these durations and counts across cache owners through the
 existing fixed CPU header. C++ closes a shared read/write admission gate when
@@ -296,28 +269,24 @@ credits and explicit pressure watermarks; it does not estimate per-request
 transfer benefit or auto-tune limits. Pressure does not report a backend fault,
 and a successful backend call does not override C++ pressure admission.
 
-PD bootstrap and L3 preparation may run together while the request owns no
-Device pages. Bootstrap completion does not discard a pending or Ready storage
-transaction; ordinary admission still requires both dependencies. The D role
-continues to obtain its missing prefix from the prefill peer.
-
 ## Completion agreement and ordering
 
 Every attention-TP owner sends its newly completed records once over the CPU
 group. Hooks retain partial-owner records until the other owners finish.
-Each round first exchanges a fixed CPU header containing the clock, permissions
-presence of completion/error facts, and the three pressure observations. Empty
-and pressure-only rounds need no object serialization;
-nonempty rounds exchange the bounded facts after every owner sees that header.
-The agreed tick is still delivered every round, including idle and frozen rounds.
+Each round first exchanges a named CPU header: the TP leader's monotonic clock,
+forward/storage permissions, completion count, an error flag and the three
+pressure observations. Buffer width follows these fields, independently of
+model attention heads and the number of owners. Permissions are intersected
+and pressure is MAX-reduced. Idle and pressure-only rounds exchange only
+headers; completion/error facts trigger a bounded payload exchange. The agreed
+tick is delivered every round, including idle and frozen rounds.
 Results are agreed per operation, so a slow earlier operation cannot block a
 later complete one. Per-key validity and retirement are AND-reduced;
 confirmed missing/invalid object facts are OR-reduced. A single missing shard
 invalidates the shared object, but a peer that did not read contributes no
-object-failure evidence. The
-window is bounded by operation and key credits; it is not truncated to a
-prefix of pending operations. A local polling error joins the collective
-before every owner raises the protocol error.
+object-failure evidence. The window is bounded by operation and key credits;
+it is not truncated to a prefix of pending operations. A local polling error
+joins the collective before every owner raises the protocol error.
 Local completion records are validated and captured inside that same error
 boundary, before header exchange. Success, object-failure and retirement
 fields must be actual booleans; per-key masks have equal lengths and success
@@ -334,17 +303,10 @@ keys. Startup rejects head-partitioned fields in a page-sharded group: changing
 page owner must not change what bytes an object means. The producer namespace
 also includes KVP, QCP and linear-attention TP geometry.
 
-The TP leader supplies the common monotonic clock; permissions are intersected.
-The CPU header is a named record of time, forward/storage permissions, completion
-count, an error flag and the three pressure counters. Buffer width follows that
-record, independently of model attention heads and the number of cache owners.
-Idle rounds exchange only headers; completion/error payloads are gathered only
-when an owner reports them.
 The head advance applies that tick and cancellation before completion records,
 so an already expired/detached read cannot publish a late result. The scheduler
 emits storage commands beside cache and forward operations. Storage dispatch
-bypasses the GPU FIFO; ordinary D2H → zeroing → H2D → forward ordering is
-unchanged. Frozen rounds still service the same planner with forward/storage
+bypasses the GPU FIFO; ordinary Device-copy and forward ordering is unchanged. Frozen rounds still service the same planner with forward/storage
 permissions disabled, allowing completions, expiration and cancellation.
 
 ## Retirement and maintenance
@@ -399,10 +361,10 @@ and retains the backend and Host allocation even if the runtime owner is collect
 
 With Prometheus metrics enabled, L3 exports rank-local query/GET/PUT counters,
 queue/backend cumulative durations, queued/running/completed job counts and
-their byte ranges. Completed jobs remain charged until their facts are polled.
-Separate scheduler gauges retain visibility of Ready holds and quarantined
-references after runtime completion. Waiting soft timeouts and Ready expiration
-are different counters; client detachment increments neither.
+their payload-byte totals. Completed jobs remain charged until their facts
+are polled. Separate scheduler gauges retain visibility of Ready holds and
+quarantined references after runtime completion. Waiting soft timeouts and
+Ready expiration are different counters; client detachment increments neither.
 Pressure bypasses and dropped backup candidate keys have separate counters;
 the admission gate is a mirrored scheduler gauge. These do not count unique
 remote objects or saved prefill tokens.
@@ -420,11 +382,13 @@ finish after its existence check without calling the native PUT API.
 ### Supported scope
 
 The first version supports PP=1 and the existing Host-KVStore model/cache-group
-capabilities. DCP remains excluded by Host KVStore. Fused and PD-prefill roles
-can prepare L3 hits. Ordinary PD-decode remote landing keeps its Device-only
-prefix contract; local recovery uses the existing matcher. There is no new PD
-handshake, direct L3-to-Device DMA, shared read deduplication or layer-wise GET
-publication in this version.
+capabilities, including cyclic KV-page ownership with replica-stable keys.
+Existing model, backend and QCP/DCP role restrictions still apply; storage
+support does not establish validation of every model/parallel configuration.
+Fused and PD-prefill roles can prepare L3 hits. Ordinary PD-decode remote
+landing keeps its Device-only prefix contract; local recovery uses the existing
+matcher. This version adds no PD handshake, direct L3-to-Device DMA, shared
+read deduplication or layer-wise GET publication.
 
 Scheduler tests exercise mixed block granularities, sliding windows, sparse
 state, partial results, deadline expiry, cancellation, ID reuse and ownership.
@@ -433,11 +397,11 @@ shared-store byte round trips and quarantine. Two-process Gloo tests cover
 out-of-order owner agreement and collective error handling. GPU H2D/D2H and
 real Mooncake/RDMA validation are distinct from these CPU protocol tests.
 
-The Mooncake CI workflow runs CPU KVP owner relocation tests and the scheduler
-tail roundtrip through both memory and native storage. Its native job starts a
-local master and independent DRAM owner with `MOONCAKE_REQUIRE_MASTER=1`, then
-checks exact Host bytes after the writer closes. Native RDMA and device-byte
-checks still require the separate GPU validation environment.
+The Mooncake CI workflow defines CPU KVP owner-relocation tests and scheduler
+tail round trips through memory and native storage. Its native job starts a
+local master and independent DRAM provider with `MOONCAKE_REQUIRE_MASTER=1`,
+then checks exact Host bytes after the writer closes. These CPU tests do not
+establish native RDMA or GPU-byte correctness.
 
 `test/runtime/test_l3_flat_kv_e2e.py` checks packed history/state groups through
 D2H, asynchronous PUT/GET and H2D, including untouched GPU bytes. Its native
@@ -454,9 +418,12 @@ Validation counters must distinguish successful adapter PUT results from new
 native writes: create-only PUT can succeed because an object already exists.
 Native PUT success can also mean that the SDK skipped an existing object;
 successful submitted payload is not proof of new writes or network traffic.
-Use SDK transport counters when reporting wire bytes. Model
-reuse evidence should include fresh inference processes, successful GETs on
-every owning rank, and answers requiring information in the restored prefix.
+Use SDK transport counters when reporting wire bytes. Serving validation
+should use fresh inference processes with empty local caches, verify successful
+GETs on every owning rank and the prefix actually reused, and compare outputs
+with a recomputation run. Prompts should require information in the restored
+prefix. Byte-for-byte transfer tests establish payload preservation separately
+from model-output comparisons.
 
 The primary latency measure for L3 prefix reuse is end-to-end time to first
 token (TTFT), compared with recomputation when the tested prefix is absent
@@ -465,23 +432,18 @@ remaining prefill work and fallback frequency alongside TTFT. Separate remote
 DRAM hits, SSD hits with warm or cold file caches, and misses. Concurrent decode
 time per output token (TPOT) is an interference check; reducing idle L3 hook
 overhead does not establish a prefill benefit. A storage call overlapping GPU
-work also does not establish how much latency was hidden on the requesting
-request's critical path. PD measurements must include transfer and decode-side
+work also does not establish how much latency was hidden on the request's
+critical path. PD measurements must include transfer and decode-side
 admission through the first delivered token.
 
-Benchmark observers belong in isolated test deployments. Idle-only local
-resets distinguish Host hits from remote restores without purging the shared
-namespace. Cleanup removes only keys written by that test and waits for
-store-side offload to settle. These calls stay outside timed cohorts. Formal
-comparisons use equal Device capacity, warm execution paths, the default L3
-wait budget, and cache-off/L2-only/L3 runs; partial hits, misses and fallback
-remain in the results. Profiling and artificial I/O delays are separate runs.
-Check the engine's reported single-request limit, including both PD roles,
-against rendered input and generation tokens. Nominal pool token capacity
-does not imply that a hybrid request of that length fits every cache group;
-context-budget truncation invalidates an answer-comparison workload.
-SSE chunk intervals are not token ITL, and small-cohort empirical p99 values
-do not establish a production tail guarantee.
+Comparisons use equal Device capacity, warm execution paths and the same
+documented wait budget across cache-off, L2-only and L3 runs. Partial hits,
+misses and fallback remain in the results. Reset local caches only while idle
+without purging the remote namespace; keep reset, cleanup, profiling and
+fault injection outside timed cohorts. Check the engine's single-request
+limit in both PD roles against input and generation tokens: a hybrid request
+must fit every cache group, and context truncation invalidates output
+comparisons. Small test cohorts do not establish a production tail guarantee.
 
 See [server configuration](../configuration/server.md#host-l2-and-mooncake-store-l3)
 for limits and backend settings, [cache concepts](cache-concepts.md) for
@@ -496,9 +458,6 @@ preparation and reference-handoff scans. Ordinary Device/Host matching,
 admission and execution remain the same path. The runtime requires the
 scheduler built from matching source even when storage is disabled.
 
-This change retains the shared Host-transfer startup bindings and ordinary
-Host-copy lifetime fences. L3 preparation does not change Decode destination
-publication or receiver lifetime: restored Host data enters the existing H2D,
-forward and PD transfer path. Model metadata, sampling communication, unrelated
-MoE kernels and toolchain tuning are not dependencies of the storage protocol.
-Storage does not add model-specific forward or attention implementations.
+L3 preparation preserves Decode destination publication and receiver lifetime:
+restored Host data enters the existing H2D, forward and PD transfer path.
+Storage adds no model-specific forward or attention implementations.

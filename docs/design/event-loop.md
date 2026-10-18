@@ -104,8 +104,9 @@ Consequences:
   L3 is constructed separately at startup by `cache/l3/factory.py`, using
   the builder's Host resource and CPU-only payload facts. `DeviceBuild` does
   not create an L3 schema, namespace, backend or workers, and `DeviceSpecs`
-  carries no L3 settings. The L3 factory derives its schema and EAGLE identity
-  from the neutral Host resources and model configuration.
+  carries no L3 settings. The factory derives the schema and deployment
+  identity from neutral Host resources and model configuration; see
+  [asynchronous L3](async-l3-cache.md#ownership).
   The L3 hooks and request handler hold the resulting Host-only capability;
   its CPU workers cannot reach the device handle. The loop submits the
   storage subset of `plan.cache` independently from device work;
@@ -114,14 +115,15 @@ Consequences:
   `execute` with the write-backs, its restores with the load-backs, its ACKs
   `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
   `HostCacheExecutor` behind the handle, two Host buffers inside it. The
-  plan's cache ops cross the handle through one adapter,
+  plan's cache ops are adapted once on the control plane by
   `scheduler_utils.cache_ops_from_plan`: the L2 batches (`Cache.WriteBackOp`,
   `Cache.LoadBackOp`) pass through, and the scheduler's batched
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
   / `RestoreOp` (`cache/transfer/ops.py`) each -- the executor's unit of
   work, one slot exported or imported, one ACK. `CacheOpHooks.count_ops`
-  counts through the same adapter, so what is counted is what is submitted;
-  its return value — the plan's per-request `SnapshotOp` count, one per
+  and `DeviceHandle.execute` consume the same Device-op tuple, so what is
+  counted is what is submitted. The count hook's return value — the plan's
+  per-request `SnapshotOp` count, one per
   retraction victim — is the round's preemption count, exported as
   `tokenspeed:num_preemptions_total`.
   The `EXPERT_LOAD` profile activity adds two more named operations,
@@ -258,11 +260,11 @@ releasing a resource the closure captured. Capture plain values or a snapshot,
 and bind at capture time rather than closing over a variable the caller later
 rebinds. Results cross back **only** through `PendingExecution.result()`.
 
-The plan's cache ops follow the same capture rule: `DeviceHandle.execute`
-adapts them once on the control plane and the queued submissions read that
-list, not the live plan. The L3 prefetch lane is a CPU thread with no stream
-at all; its outcome reaches the forward thread through nothing, and the
-control plane only through the executor's progress table.
+The plan's cache ops follow the same capture rule: the control plane adapts
+them once into immutable Device and storage tuples. `DeviceHandle.execute`
+queues copies from the supplied Device tuple. L3 CPU workers receive only
+Host jobs, with no GPU stream or forward-thread access. Their results return
+to the control plane through the executor's completion poll.
 
 `execution/forward_thread.py` states this in full, including the single
 registered exception — grammar matchers, whose ownership splits by path and
@@ -272,8 +274,7 @@ whose overlap the drain registry in Principle 4 breaks instead.
 
 `EventLoop.event_loop` sequences components. It does not implement them.
 Domain logic — pause/resume semantics, EPD admission, PD transfer handling,
-L2 cache-op tracking, L3 probing and prefetch convergence, wire handshakes,
-multimodal batch
+L2 cache-op tracking, L3 replica agreement, wire handshakes and multimodal batch
 assembly — lives in its own module and enters the loop as a **single-line hook**.
 The loop body
 should read, top to bottom, as the schedule of one scheduling round, with no
@@ -450,9 +451,10 @@ fields, independently of attention head count or replica size. Idle rounds
 exchange only this header; completions and errors add a bounded payload exchange.
 
 Per-round dispatch needs no hooks class at all: the loop hands
-`DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
-plan's streams already say who runs what — the batch is the model's, the
-remote streams are the transfer peer's.
+`DeviceHandle.execute` the plan, the round's `PlannedForward` and the adapted
+Device cache-op tuple. Storage ops go to the Host-only executor. The plan's
+streams already say who runs what — the batch is the model's, the remote
+streams are the transfer peer's.
 
 Related placements that follow the same principle without a hooks class: the
 SMG startup handshake lives in `zmq_msgpack.connect_msgpack_engine_for_loop`
@@ -480,15 +482,16 @@ For orientation, one iteration of `event_loop`:
 2. Poll Host copy completions and asynchronous L3 facts; **advance the
    scheduler (head call site)** so this round's plan sees them. Hooks also
    agree forward/storage permissions and a monotonic clock for soft deadlines.
-3. Plan with those permissions, including frozen rounds. Submit storage ops,
-   count device cache ops, finish `plan.aborts`, and prepare the forward batch.
-   A frozen round drains in-flight forwards and still dispatches cleanup;
-   it does not introduce another scheduling path. Metrics, DP synchronization
-   and pending-commit dependencies retain the same boundaries.
-4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
+3. Plan with those permissions. Adapt cache ops once, submit the storage
+   subset, count Device cache ops, finish `plan.aborts`, and prepare the
+   forward batch. A frozen round drains in-flight forwards; with L3 enabled,
+   the same planner still dispatches storage cleanup with forward/storage
+   permissions disabled. Metrics, DP synchronization and pending-commit
+   dependencies retain the same boundaries.
+4. **One `DeviceHandle.execute(plan, planned, cache_ops=...)` dispatch**, in an order
    that is itself a correctness contract for same-round page reuse. The
-   handle adapts the plan's cache ops once (`cache_ops_from_plan`, on the
-   control plane) and submits, on the FIFO: the Host-bound stores first --
+   handle consumes the Device tuple already produced by `cache_ops_from_plan`
+   and submits, on the FIFO: the Host-bound stores first --
    `WriteBackOp` and `SnapshotOp`, a retraction image's two legs (the
    stream-ordered L2 write-back of the victim's hash-complete pages and the
    snapshot store of its tail pages and slot state) must read the reused
@@ -552,11 +555,11 @@ For orientation, one iteration of `event_loop`:
 * L3 QUERY/GET runs on Host workers before admission, only when
   `--kvstore-storage-backend` is set. A request waiting for preparation is
   skipped before local prefix hashing: an idle scheduling round must not
-  rehash a long prompt while native IO is outstanding. Storage success and
+  rehash a long prompt while native I/O is outstanding. Storage success and
   retirement are intersected over the complete attention-TP owner group,
   including its QCP/KVP ranks; object failures are unioned. L3 currently
-  requires PP=1. Only agreed, retired GET results can publish Host entries
-  for admission. ``WriteBackDone`` /
+  requires PP=1. After a GET retires on every owner, rows with all-owner
+  full-length success can publish Host entries for admission. ``WriteBackDone`` /
   ``LoadBackDone`` / ``SnapshotDone`` / ``RestoreDone`` completions are
   intersected before the scheduler sees them: a rank-local ACK would publish
   a Host block on one mirrored scheduler while a CP/PP peer still has the
@@ -610,9 +613,9 @@ For orientation, one iteration of `event_loop`:
   tenant are not in those groups.
   Async L3 is restricted to PP=1. Cyclic KV-page owners use the same Host
   translation as L2; replica-stable keys permit a new allocation to select
-  another owner. Replicated state fields retain per-rank keys. GET completion is separate from
-  the device copy ACKs. Only retired all-owner successes publish Host rows;
-  failures fall back before admission. Soft deadlines detach requests while
+  another owner. Replicated state fields retain per-rank keys. GET completion
+  is separate from Device copy ACKs; the ordinary matcher determines the
+  usable boundary after partial results. Soft deadlines detach requests while
   native work retains its Host buffers; uncertain retirement quarantines them.
   The D role receives its missing cache from its prefill peer.
 

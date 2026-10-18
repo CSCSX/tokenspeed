@@ -1108,133 +1108,42 @@ warning with the requested and the capped size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block.
 
-Each packed Host CacheBlock is one Mooncake object, keyed as
-`{tsl3-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
-(the trailing `c0` is the retired context-parallel shard id, kept literal so
-objects written before its removal stay addressable).
-The hashed prefix includes the loaded checkpoint (`--model`, the resolved
-immutable revision or a local fingerprint of selected weights, metadata,
-and local `*.py` including imported package subdirectories and
-directory symlinks Python follows on import — never an inherited
-config `_commit_hash` or a 40-hex folder name outside a Hugging Face hub
-`(models|datasets|spaces)--*/snapshots/<commit>` cache path with a sibling
-`refs` directory (the fingerprint includes a directory merely named
-`snapshots`) — plus `--load-format` so a directory that contains
-more than one weight encoding cannot share objects across loaders
-(`sharded_state` combines every rank's local files matching the
-configured shard pattern, default `model-rank-*-part-*`, not only rank
-0's; `npcache` fingerprints the NumPy cache when present; `extensible`
-also hashes `--ext-yaml` and the `ext_def_file` `ExtensibleLM` imports
-with the same cwd-relative `os.path.abspath` resolution as the loader,
-plus that module's transitive local helpers, including on a Hugging Face
-hub snapshot whose commit does not cover those files; the path is parsed
-without PyYAML for quoted keys, spaces around `:`, and a document-level
-flow mapping), and
-`--weight-version`), `--hf-overrides` (the effective
-HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
-fields), the packed Host layout (field payloads, not GPU-capacity
-device arena offsets), the
-cache-quantization config (including `quantization_param_path` scale-file
-bytes and `--speculative-draft-model-quantization` when a draft pool is
-present), the pipeline stage, any
-speculative draft checkpoint, `--skip-softmax-threshold` (nonzero
-changes attention output and therefore downstream cached K/V), the
-resolved EAGLE3 capture-layer list (`--eagle3-layers-to-capture` or the
-draft config's `eagle_aux_hidden_state_layer_ids`; empty when EAGLE3 is
-off), and
-`L3_RUNTIME_COMPAT` (bumped when
-built-in model code, RoPE, or a cache-producing kernel changes KV for
-the same checkpoint and layout). Live weight updates flush Device/Host
-before the GPU load, then rebuild that prefix. A requested `flush_cache`
-must succeed first: in-flight Host writebacks cause `ClearCache` to
-reject. Weight-update `flush_cache` and standalone `/flush_cache`
-first MAX-reduce flush intent across attention DP so every DP worker
-enters the same collectives, then MIN-reduce a non-mutating
-`can_clear_cache` probe across cache-owning
-ranks (attention TP, then CP, then PP) and then across attention DP
-before any rank clears. Exists, prefetch, and `WriteBackDone` stay
-TP/CP/PP because DP ranks hold different sequences. Flush includes DP
-because object keys omit DP rank. Remote L3 deletion is the next
-replica-then-DP phase: it
-returns success/failure instead of raising, the ranks MIN-reduce the
-result, and only then does `ClearCache` destroy Device/Host. A rank
-whose writebacks have drained cannot rotate L3 or drop local indexes
-while a peer still
-rejects or while Mooncake `remove_by_regex` failed on another rank. The
-frontend ANDs every DP worker's `/flush_cache` reply. A
-split flush would leave mirrored
-schedulers with different prefix indexes. The weight-update RPC then
-fails so the caller retries instead of serving new weights against the
-previous checkpoint or entering NCCL weight broadcasts alone. A
-`batch_exists` hit is not a lease: the L3 pages are fetched into Host
-before the request is admitted (below), and whatever is no longer there
-lands short. A short Mooncake read (fewer bytes than the requested
-page) is a miss, not a success. A backend exception or malformed result is a
-local miss so every replica rank still enters the MIN-reduce. Clients are
-not failed.
-L2 write-back ACKs use the same replica groups: `WriteBackDone` is
-emitted only after every cache-owning rank holds the completion, so a
-worker cannot publish Host while a replica peer's Mooncake put is still in
-flight. A truncated `batch_is_exist` reply is a failed put, not
-an implicit success.
-When L3 is on, the engine rejects supplying a new `weight_version` with
-`flush_cache=False`, so the runtime cannot treat stale Device/Host KV
-and in-flight D2H copies as the new checkpoint. Flushed L3 updates
-require an explicit `weight_version`. Minting `{current}-uN` would let
-independent checkpoints collide.
-A successful Engine update stamps that version into
-frontend `server_args`.
-GQA with TP above the KV-head count assigns
-different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
-`mapping.attn.tp_size`) is also in the namespace. The namespace also isolates
-resolved target and draft attention backends, including the full-attention
-sub-backend of a hybrid model: different implementations can produce
-different downstream KV even with identical cache layouts. This
-namespace extension intentionally starts a cold L3 cache instead of
-reusing objects written without backend identity.
-TokenSpeed splits `global_segment_size` across
-attention-TP × pipeline-parallel ranks so the mounted total matches the
-configured size. Use the resolved `mapping.attn.tp_size`, not
-`--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`)
-and an unsharded KV cache (not `--kv-parallel-size > 1`).
-Pass Mooncake client settings as JSON
-in `--kvstore-storage-backend-extra-config`, for example:
+**Requirements and deployment.** L3 requires Host L2 (omit
+`--disable-kvstore`) and currently supports PP=1. Cyclic KV-page sharding
+(`--kv-parallel-size`) is supported when the payload is replicated within
+each owner subgroup; head-partitioned payloads in a sharded group are
+rejected at startup. Existing model and parallelism restrictions still apply.
+Use a scheduler built from the matching runtime source.
 
-```json
-{
-  "master_server_address": "10.0.0.1:50051",
-  "local_hostname": "localhost",
-  "metadata_server": "P2PHANDSHAKE",
-  "global_segment_size": "16gb",
-  "protocol": "tcp"
-}
-```
+Deploy a Mooncake master and storage providers before starting inference.
+The master holds metadata; providers hold the cached bytes. Providers backed
+by CPU DRAM need no GPU memory. Set `global_segment_size` to `0` in inference
+workers to use those providers without mounting storage in the workers.
+Reuse after inference restarts requires the master and providers to retain
+the objects. `--kvstore-size` sizes each rank's Host L2, not the shared L3
+capacity. Account separately for provider segments and client staging memory.
+A positive `global_segment_size` mounts storage in the inference workers;
+TokenSpeed divides it across attention-TP × PP ranks, using the resolved
+`mapping.attn.tp_size`, so their total matches the configured size.
 
-Constructing `MooncakeKvStore` requires `extra_config`. Pass `None` to
-use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
-
-**Asynchronous preparation before admission.** Queries and GETs hold no Device
-pages. All-owner retired GET successes become ordinary Host hits; a soft
-deadline permits local computation while keeping native buffers pinned until
-retirement. D2H publication never waits for PUT. Queue pressure bypasses new
-reads/writes while existing work retires. The PD decode role does not fetch
-L3; its prefill peer supplies the missing cache.
-
-Configure limits in the `async` object of
-`--kvstore-storage-backend-extra-config`, for example:
+Pass client settings as JSON in
+`--kvstore-storage-backend-extra-config`. For example, a client using a
+separate DRAM provider over RDMA:
 
 ```json
 {
   "master_server_address": "store.example:50051",
+  "local_hostname": "10.0.0.2",
+  "metadata_server": "P2PHANDSHAKE",
   "protocol": "rdma",
   "global_segment_size": 0,
+  "tenant_id": "example-model",
   "async": {
     "max_operations": 32,
     "max_keys_per_operation": 256,
     "wait_timeout_ms": 2000,
     "ready_timeout_ms": 1000,
-    "min_prefetch_tokens": 2048,
-    "max_prefetch_tokens": 32768,
+    "max_prefetch_tokens": 8192,
     "query_workers": 2,
     "read_workers": 2,
     "write_workers": 1
@@ -1242,18 +1151,88 @@ Configure limits in the `async` object of
 }
 ```
 
-`global_segment_size=0` explicitly selects a client with no local storage
-segment; deploy separate memory-store owners. The old four
-`--kvstore-prefetch-*` arguments are removed. Queue sizes, Host credits,
-hysteresis and observability are documented in
-[asynchronous L3](../design/async-l3-cache.md). L3 currently requires PP=1
-with cyclic KV-page sharding supported through replica-stable L3 keys.
-Host L2 and snapshot pools use the same owner translation.
+Set `local_hostname` to this node's reachable address. For RDMA, validate
+connectivity between all clients and providers and set `device_name` when a
+specific HCA is required. The default protocol is `tcp`; choose `rdma`
+explicitly. Without JSON connection settings, the client reads
+`MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other Mooncake environment
+settings. `global_segment_size` defaults to 4 GiB, so explicitly set `0` for
+clients that must not mount storage. The default tenant is `default`.
 
-`--kvstore-storage-backend memory` is for tests. CPU tests cover the scheduler,
-real queue workers and gloo agreement; GPU tests round-trip packed cache bytes.
-`test/test_l3_mooncake_master.py` starts a real master and tests native Store
-I/O; `MOONCAKE_MASTER=host:port` reuses an existing master.
+**Asynchronous preparation before admission.** Queries and GETs hold no
+Device pages or request-pool slots. Once a GET has retired on every owner,
+rows with full-length success on every owner become ordinary Host entries.
+The group matcher chooses the reusable prefix, which may be shorter than
+requested. A soft deadline permits local computation while native I/O keeps
+its Host references until retirement. A result detached by timeout or
+cancellation cannot publish data. Unknown native retirement quarantines the
+buffers and disables new L3 work until process restart; valid L2 hits and
+ordinary computation can continue. D2H publication and Device-source release
+wait for replica copy agreement, independently of L3 PUT. The PD prefill role
+can prepare L3 hits; decode receives its missing cache from the prefill peer.
+
+The `async` object tunes this single execution path. Unspecified settings use
+the following defaults; unknown options are rejected:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `max_operations` | `32` | Outstanding operations, including undelivered completions, Ready holds and quarantine |
+| `max_keys_per_operation` | `256` | Key limit per query, GET or PUT |
+| `max_host_blocks` | `max(1, min(256, host_blocks // 2))` | Logical Host references across operations, Ready holds and quarantine; `host_blocks` is the usable Host LCM-parent count |
+| `metadata_entries` | `max(1, host_blocks * 4)` | Limit for negative-key metadata and for backup candidates |
+| `min_prefetch_tokens` | Model prefix granularity | Minimum extension beyond the local hit worth preparing |
+| `max_prefetch_tokens` | `8192` | Maximum extension beyond the local hit, rather than a prompt-length limit |
+| `wait_timeout_ms` | `2000` | Shared soft wait budget for query and GET |
+| `ready_timeout_ms` | `1000` | Hold time for completed Host results awaiting ordinary admission |
+| `query_workers` / `read_workers` / `write_workers` | `2` / `2` / `1` | Independent executor worker counts |
+| `failure_threshold` / `recovery_interval_ms` | `1` / `30000` | Backend-health failure threshold and recovery-probe interval |
+| `queue_high_operations` / `queue_low_operations` | `min(8, max_operations)` / high divided by two, rounded down | Queue-count admission watermarks |
+| `queue_high_bytes` / `queue_low_bytes` | `268435456` / `134217728` | Queued payload-byte watermarks (256 / 128 MiB) |
+| `operation_high_age_ms` / `operation_low_age_ms` | `500` / `250` | Oldest queued/running operation age watermarks |
+
+Prefetch length is also constrained by keys, Host references and group
+geometry: Full history, SWA windows and State checkpoints must fit together.
+Raising `max_prefetch_tokens` alone does not guarantee a longer restore.
+`max_host_blocks` is a logical-reference budget, not bytes or a per-worker
+quota, and cannot exceed the usable Host-parent count. PUTs may use at most
+half of the operation and Host credits, rounded down, to leave room for reads.
+
+Any high watermark closes new L3 read/write admission; all observations must
+reach their low watermarks before it reopens. The gate bypasses new requests'
+L3 preparation and drops nonowning backup candidates. Already submitted I/O
+keeps its lifetime and deadlines; completions, ordinary forward work and L2
+publication continue. Pressure admission and backend health are independent.
+See [asynchronous L3](../design/async-l3-cache.md) for queue and ownership
+invariants. The four legacy `--kvstore-prefetch-*` arguments are removed.
+
+**Object compatibility and maintenance.** Each packed Host CacheBlock is
+one object, keyed as
+`{tsl3-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{object_rank}|c0`.
+For replicated groups, `object_rank` is the attention-TP rank; for cyclic
+page groups it is `tp_rank // shard_count`, independent of which cyclic owner
+allocated the block. The literal `c0` is a reserved format field.
+The namespace isolates loaded target/draft checkpoints, explicit weight
+versions, packed Host layout, parallel geometry and cache-producing runtime
+choices. Different compatibility epochs start cold caches. See
+[cache concepts](../design/cache-concepts.md) for the identity contract.
+
+Host eviction leaves shared objects intact. Full cache clear and weight
+updates require replica-agreed idle state, including storage operations,
+Ready holds and quarantine. Remote namespace purge is still a synchronous
+administrative RPC; preparation soft deadlines do not bound it. Failed
+preflight or purge prevents local clearing. With L3 enabled, weight updates
+require an explicit `weight_version` and a successful flush; the
+metadata-only `/update_weight_version` endpoint is rejected. Independent
+inference jobs sharing a namespace are outside this flush agreement.
+
+Omitting `--kvstore-storage-backend` creates no L3 executor, workers or SDK
+client. `--kvstore-storage-backend memory` selects an in-process test store;
+it is separate from Mooncake's distributed DRAM mode. CPU tests cover the
+scheduler, executor and replica agreement; GPU tests cover packed-byte
+D2H/PUT/GET/H2D round trips. See the
+[validation scope](../design/async-l3-cache.md#initial-scope-and-validation)
+for native Mooncake test requirements.
+
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).
 On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
