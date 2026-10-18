@@ -13,8 +13,9 @@ runs on the shared model path: vendor-neutral Triton kernels
 with capability-gated NVIDIA fast paths that keep the same numerics. The
 checkpoint must expose the model type `muse_spark` and the architecture
 `MuseSparkForConditionalGeneration`; the runtime reads the sliding-attention
-and no-RoPE schedule from that configuration. Expert parallelism spans the
-attention TP ranks with MoE TP1. The gateway loads the checkpoint's
+and no-RoPE schedule from that configuration. The experts use either expert
+parallelism spanning the attention TP ranks, or tensor parallelism over the
+same group with EP1. The gateway loads the checkpoint's
 `chat_template.jinja`; pass `--chat-template` only to override it. The
 residual stream, the layer boundaries and the final norm run in FP32; the
 attention and MoE branch outputs and the final-norm output are BF16.
@@ -70,6 +71,45 @@ ts serve \
 ```
 
 Prefill stays eager and overlap scheduling is off.
+
+### MI350X MXFP4 with TP8/EP1
+
+The MXFP4 checkpoint supports both TP8/EP8 and TP8/EP1. With EP1 each GPU owns
+all 256 experts, with matching 512-wide intermediate slices of their gate,
+up, and down projections. Every rank computes the same token routes, and the
+down-projection partials are summed across TP ranks before each route's
+post-expert normalization and weighted top-k sum. Excluded BF16 experts use
+the same partition and normalization order.
+
+```bash
+ts serve \
+    --model amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
+    --served-model-name muse-spark \
+    --tp 8 \
+    --moe-tp-size 8 \
+    --ep-size 1 \
+    --dtype bfloat16 \
+    --quantization mxfp4 \
+    --moe-backend gluon \
+    --max-model-len 65536 \
+    --max-num-seqs 16 \
+    --max-total-tokens 1048576 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --cudagraph-capture-sizes 1 2 4 8 16 \
+    --max-cudagraph-capture-size 16 \
+    --disable-prefill-graph \
+    --gpu-memory-utilization 0.92 \
+    --sampling-backend triton \
+    --disable-kvstore \
+    --kvstore-ratio 0.0 \
+    --host 127.0.0.1 \
+    --port 8000
+```
+
+For TP8/EP8, set `--moe-tp-size 1 --ep-size 8`. That topology distributes
+32 complete experts to each GPU and sums the normalized, weighted local
+expert contributions.
 
 ### Blackwell NVFP4
 

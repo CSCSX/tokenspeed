@@ -27,6 +27,15 @@ Route-tiled GEMMs group each expert's routes into small tiles described by
 token/slot order for intermediates and outputs. Matrix dimensions, top-k and
 expert counts are explicit kernel parameters.
 
+Muse's deferred A4W4 path supports TP4/EP4 and TP8/EP8 with a 4096-wide
+local intermediate, and TP8/EP1 with all 256 experts and a 512-wide local
+intermediate. TP8/EP1 returns one partial output per token/route before the
+model reduces the TP partitions and normalizes each expert output. It uses
+direct decode through 16 tokens and the package prefill above that. Package
+row blocks follow the route density across all 256 experts. Startup warmup
+uses the processed local weight geometry and bounded row families for all
+three placements.
+
 For the staged package's second GEMM, TP uses direct BF16 atomic accumulation
 through 2048 tokens with E2M1 activations (64 with E4M3), and scratch-plus-FP32
 reduction at larger sizes. E2M1 atomics use adjacent column pairs per lane and

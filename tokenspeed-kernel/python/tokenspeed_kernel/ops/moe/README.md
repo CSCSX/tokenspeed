@@ -9,6 +9,23 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+Tensor parallel experts shard the intermediate channels. Their down projections
+produce partial values for each route, so ranks must sum those values before
+per-route normalization. `gather_moe_routes` restores original token/route order
+from a deferred output map, removes hidden-width padding, and zeros absent routes.
+This gives collectives aligned route identities even when ranks use different
+permutations. Its optional output supports prepared collective producer buffers
+and must not overlap either the route values or their map.
+Expert parallel ranks instead normalize their complete local expert outputs
+before combining weighted token sums.
+
+The selected kernel may declare `deferred_output_is_token_order`: output row
+`token * topk + slot` already holds that token's selected route. `moe_plan`
+and `MoELayer` expose this contract. The route map still marks absent rows;
+only a caller that owns every route may omit it. Muse TP8/EP1 consumes
+unpadded canonical rows directly and borrows its collective result until the
+per-route norm finishes, avoiding a gather and a reduction copy-back.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.

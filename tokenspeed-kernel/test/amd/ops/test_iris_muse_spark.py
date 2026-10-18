@@ -453,9 +453,12 @@ def _muse_collective_policy_worker(rank, world_size, device):
     def sequence():
         outputs = []
         for index, values in enumerate(inputs):
-            branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
-            branch.copy_(values)
-            outputs.append(state.reduce_outputs((branch,))[0].clone())
+            if index % 2 and state.can_reduce_borrowed(values):
+                outputs.append(state.reduce_borrowed(values).clone())
+            else:
+                branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
+                branch.copy_(values)
+                outputs.append(state.reduce_outputs((branch,))[0].clone())
             if index == 5:
                 boundary_branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
                 boundary_branch.copy_(boundary_values)
@@ -521,6 +524,16 @@ def _muse_collective_policy_worker(rank, world_size, device):
         iris_pull_twoshot_allreduce,
     ):
         for rows in (3, 17, 127, 130):
+            ordinary = torch.full(
+                (rows, 8192), rank + 1, device=device, dtype=torch.bfloat16
+            )
+            output = state.reduce_borrowed(ordinary)
+            torch.testing.assert_close(
+                output,
+                torch.full_like(output, world_size * (world_size + 1) // 2),
+                rtol=0,
+                atol=0,
+            )
             branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
             branch.fill_(rank + 1)
             output = state.reduce_outputs((branch,))[0]
@@ -532,6 +545,17 @@ def _muse_collective_policy_worker(rank, world_size, device):
             )
     for numel in (512, 44 * 4096, 129 * 8192):
         ordinary = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
+        borrowed = state.reduce_borrowed(ordinary)
+        assert borrowed.data_ptr() != ordinary.data_ptr()
+        torch.testing.assert_close(
+            borrowed,
+            torch.full_like(borrowed, world_size * (world_size + 1) // 2),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            ordinary, torch.full_like(ordinary, rank + 1), rtol=0, atol=0
+        )
         result = state.reduce(ordinary)
         assert result.data_ptr() == ordinary.data_ptr()
         torch.testing.assert_close(
@@ -1071,6 +1095,92 @@ def _muse_routed_lamport_worker(rank, world_size, device):
         dist.barrier()
 
 
+def _muse_tp_routes_worker(rank, world_size, device):
+    """Expert TP sums aligned partial routes before nonlinear normalization."""
+    from tokenspeed.runtime.models.muse_spark import MuseSparkMoE, MuseSparkRMSNorm
+
+    torch.set_grad_enabled(False)
+    width, topk = 4096, 8
+    group = tuple(range(world_size))
+    moe = MuseSparkMoE.__new__(MuseSparkMoE)
+    torch.nn.Module.__init__(moe)
+    moe.iris_state = None
+    moe.pre_expert_proj = None
+    moe.post_expert_proj = None
+    moe.tp_group, moe.tp_size, moe.topk = group, world_size, topk
+    moe.ep_group, moe.ep_size = (rank,), 1
+    moe.post_expert_norm = MuseSparkRMSNorm(width, 1e-8, True, 1.0)
+    norm_weight = torch.linspace(-0.25, 0.25, width, device=device).bfloat16()
+    moe.post_expert_norm.weight = torch.nn.Parameter(norm_weight)
+    _prepare_muse_backend(world_size, None, moe)
+    dims = torch.arange(width, device=device)[None, :]
+
+    # The large mapped case exceeds Muse's prepared producer capacity and exercises
+    # the ordinary collective fallback with the same route semantics.
+    cases = ((1, False), (3, False), (16, False), (2049, False))
+    cases += ((3, True), (6, True), (33, True))
+    for tokens, canonical in cases:
+        indices = torch.arange(tokens * topk, device=device)
+        mapping = None if canonical else ((indices + rank) % indices.numel()).int()
+        weights = (
+            torch.linspace(0.01, 1, topk, device=device).expand(tokens, -1).contiguous()
+        )
+        routes = torch.empty(
+            (indices.numel(), width if canonical else width + 16),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        def update(step):
+            partial = (
+                (indices[:, None] * 3 + dims * 5 + rank * 7 + step) % 9 - 4
+            ).bfloat16() / 32
+            routes[:, :width].copy_(
+                partial if canonical else partial.roll(rank, dims=0)
+            )
+            routes[:, width:].fill_(torch.nan)
+
+        def reference(step):
+            full = sum(
+                ((indices[:, None] * 3 + dims * 5 + peer * 7 + step) % 9 - 4).float()
+                / 32
+                for peer in range(world_size)
+            ).reshape(tokens, topk, width)
+            scaled = full * (norm_weight + 1.0).float()
+            normalized = scaled * torch.rsqrt(
+                scaled.square().mean(-1, keepdim=True) + 1e-8
+            )
+            return (normalized * weights[:, :, None]).sum(1).bfloat16()
+
+        def run():
+            return moe._reduce_expert_routes(
+                routes.view(tokens, topk, width) if canonical else routes,
+                mapping,
+                tokens,
+                weights,
+                owned_rows=False,
+            )
+
+        update(0)
+        actual = run()
+        torch.testing.assert_close(actual, reference(0), rtol=0, atol=2**-8)
+        if tokens <= 33:
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            for step in (1, 2):
+                update(step)
+                if rank == step % world_size:
+                    torch.cuda._sleep(20000)
+                graph.replay()
+                torch.testing.assert_close(
+                    captured, reference(step), rtol=0, atol=2**-8
+                )
+        dist.barrier()
+
+
 def _muse_owned_routed_wt_worker(rank, world_size, device):
     torch.set_grad_enabled(False)
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -1097,6 +1207,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
     moe.ep_group, moe.ep_size, moe.topk = group, world_size, 8
+    moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
     moe.post_expert_norm.weight = torch.nn.Parameter(norm)
     group, state = _prepare_muse_backend(world_size, None, moe)
@@ -1268,6 +1379,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
+        pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
     ],
 )
 @pytest.mark.parametrize("world_size", [4, 8])

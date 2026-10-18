@@ -79,6 +79,19 @@ The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
 GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
 unquantized.
 
+Muse Spark MXFP4 has manual AIME26 tasks for TP4/EP4, TP8/EP8, and
+TP8/EP1 on MI35x GPUs. TP8/EP1 shards each expert's feed-forward projection
+across all eight GPUs. All placements use the Gluon MoE backend, high reasoning,
+an output budget of 32768 tokens, and evaluation batch size eight. The 0.91
+accuracy gate requires at least 28 correct answers out of 30. Run the TP8/EP1
+task on an exclusive eight-GPU runner with:
+
+```bash
+python3 test/ci_system/pipeline.py execute \
+  --config test/ci/eval/muse-spark-mxfp4-tp8ep1-evalscope-aime26-amd.yaml \
+  --runner amd-mi35x-8gpu-test
+```
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.

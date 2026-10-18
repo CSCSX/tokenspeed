@@ -36,10 +36,15 @@ also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
 model-specific head layouts, route packets, or normalization semantics stay in
 the model package, along with dispatch and capacities.
 
-Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
-topologies keep the same global token cutoffs for Lamport, push, pull, and
+Muse Spark prepares its collectives for TP4/EP4, TP8/EP8, or TP8/EP1 on gfx950.
+Both EP topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded
 rows masked; QKVG exchange derives each rank's head widths from the group size.
+TP8/EP1 reduces raw route partials before normalization. Its model-private
+`reduce_borrowed` reads ordinary canonical rows and returns a borrowed gather
+or push output; the per-route norm consumes it on the same stream before any
+projection or collective reuses the storage. Generic all-reduce outputs keep
+their independent-storage contract.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
