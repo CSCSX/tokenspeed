@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerical copy and reuse coverage for GLM's composite KDA checkpoints."""
+"""Numerical GLM checkpoint coverage, including test-only retained layouts."""
 
 import os
 import sys
@@ -36,6 +36,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
@@ -51,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
     kda_replay_history_capacity,
+    kda_state_fields,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -63,8 +65,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("draft_layers", [0, 1])
 @pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.parametrize("history_capacity", [0, 8])
 def test_glm53_retained_endpoint_survives_copy_and_reuse(
-    tp_size: int, cache_dtype: torch.dtype, draft_layers: int, captured: bool
+    tp_size: int,
+    cache_dtype: torch.dtype,
+    draft_layers: int,
+    captured: bool,
+    history_capacity: int,
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -109,7 +116,7 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
         speculative_num_draft_tokens=4 if draft_layers else 1,
         components=(dsa, linear),
     )
-    if not kda_replay_history_capacity(config):
+    if history_capacity and not kda_replay_history_capacity(config):
         pytest.skip("selected device kernels do not retain KDA history")
     draft_config = (
         replace(
@@ -126,6 +133,30 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
         draft_attn_config=draft_config,
         draft_layers=draft_layers,
     )
+    if history_capacity:
+        # Exercise composite packing without enabling retained history in GLM.
+        groups = tuple(
+            (
+                spec,
+                (
+                    tuple(
+                        state_field
+                        for field in fields
+                        if field.field_id.endswith(".conv_state")
+                        for state_field in kda_state_fields(
+                            int(field.field_id.split(".")[1]),
+                            field.plane_id,
+                            conv_shape=linear.conv_state_shape,
+                            recurrent_shape=linear.temporal_state_shape,
+                            history_capacity=history_capacity,
+                        )
+                    )
+                    if spec.attn_kind == "state"
+                    else fields
+                ),
+            )
+            for spec, fields in groups
+        )
     packing = glm53_flash_packing_counts(
         tp_size=tp_size, mla_element_size=cache_dtype.itemsize, groups=groups
     )
@@ -158,14 +189,18 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
             dsa_layer_ids=dsa_layers,
         ),
     )
-    names = (
-        "conv_state",
-        "recurrent_state",
-        "replay_correction",
-        "replay_key",
-        "replay_decay",
-        "replay_length",
+    backend = KdaAttnBackend(
+        config, dsa, enable_prefill_graph=False, kda_backend="cutedsl_kda"
     )
+    backend.set_kv_pool(pool)
+    names = ("conv_state", "recurrent_state")
+    if history_capacity:
+        names += (
+            "replay_correction",
+            "replay_key",
+            "replay_decay",
+            "replay_length",
+        )
     fields = {name: pool.get_component(0, name) for name in names}
     torch.manual_seed(5317)
     for name, tensor in fields.items():
@@ -179,7 +214,8 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
             tensor[1:4].copy_(
                 torch.randn(tensor[1:4].shape, dtype=tensor.dtype, device="cuda") * 0.01
             )
-    fields["replay_decay"][1:4].add_(0.95)
+    if history_capacity:
+        fields["replay_decay"][1:4].add_(0.95)
 
     # State blocks 1..3 own the first three parents. The fourth belongs to
     # full attention; its latent and index pages must survive state operations.
@@ -199,7 +235,8 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
 
     def endpoint(block: int) -> torch.Tensor:
         state = before["recurrent_state"][block].clone()
-        for token in range(int(before["replay_length"][block, 0])):
+        length = int(before["replay_length"][block, 0]) if history_capacity else 0
+        for token in range(length):
             state *= before["replay_decay"][block, :, token, None, :]
             state += (
                 before["replay_correction"][block, :, token, :, None]
@@ -207,23 +244,16 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
             )
         return state
 
-    from tokenspeed_kernel.ops.attention.kda import kda_materialize_history
-
     indices = torch.tensor([1, 2, 0, -1], dtype=torch.int32, device="cuda")
+    destinations = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device="cuda")
     output = torch.empty(
         (4, *linear.temporal_state_shape), dtype=torch.float32, device="cuda"
     )
 
     def materialize() -> None:
-        kda_materialize_history(
-            fields["recurrent_state"],
-            fields["replay_correction"],
-            fields["replay_key"],
-            fields["replay_decay"],
-            fields["replay_length"].squeeze(-1),
-            indices,
-            out=output,
-            use_tensor_cores=False,
+        nonlocal output
+        output, _ = backend._prepare_prefill_state_inputs(
+            0, fields["conv_state"], fields["recurrent_state"], indices, destinations
         )
 
     materialize()
@@ -245,6 +275,7 @@ def test_glm53_retained_endpoint_survives_copy_and_reuse(
         torch.testing.assert_close(tensor[2], before[name][1], atol=0, rtol=0)
         torch.testing.assert_close(tensor[3], before[name][2], atol=0, rtol=0)
     indices[:2].copy_(torch.tensor([3, 2], dtype=torch.int32, device="cuda"))
+    destinations.copy_(torch.tensor([3, 2, 1, 4], dtype=torch.int32, device="cuda"))
     if graph is not None:
         graph.replay()
     else:

@@ -41,7 +41,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
-    kda_replay_history_capacity,
     kda_replay_supported,
     kda_state_fields,
     kda_verify_workspace_bytes,
@@ -220,7 +219,6 @@ def declare_glm53_flash_groups(
         for group_id in group_ids
     )
     target_layers = len(target_layer_types)
-    history_capacity = kda_replay_history_capacity(attn_config)
 
     def fields_for_layer(
         layer_id: int, group_id: str, occurrence: int
@@ -252,7 +250,7 @@ def declare_glm53_flash_groups(
             plane_id,
             conv_shape=target_linear.conv_state_shape,
             recurrent_shape=target_linear.temporal_state_shape,
-            history_capacity=history_capacity,
+            history_capacity=0,
         )
 
     base = group(
@@ -364,10 +362,6 @@ class Glm53FlashRecipe(CacheRecipe):
         return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @cached_property
-    def replay_history_capacity(self) -> int:
-        return kda_replay_history_capacity(self.attn_config)
-
-    @cached_property
     def replay_kda(self) -> bool:
         """Cache the replay capability for this recipe's fixed configuration."""
         return kda_replay_supported(self.attn_config)
@@ -381,9 +375,7 @@ class Glm53FlashRecipe(CacheRecipe):
             if self.server_args.speculative_algorithm is not None
             else 1
         )
-        if self.server_args.disaggregation_mode == "prefill" or (
-            width <= 1 and not self.replay_history_capacity
-        ):
+        if self.server_args.disaggregation_mode == "prefill" or width <= 1:
             return tail_bytes
         return tail_bytes + kda_verify_workspace_bytes(
             self.attn_config,

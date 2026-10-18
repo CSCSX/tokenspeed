@@ -241,9 +241,11 @@ state block, so prefix reuse, zeroing, copying, retraction and PD transfer
 carry all of them together. The physical history capacity is independent of
 the engine role and speculative width. Head-valued fields follow attention
 TP partitioning; the accepted length is replicated.
-Kimi and GLM size shared state planes from all of these fields. If a checkpoint
-outgrows the current plane, the recipe increases the number of full-attention
-pages per parent while preserving each MLA page's exact payload-sized stride.
+Retained history is enabled only by the supported Kimi recipe. Other model
+recipes, including GLM, keep a dense endpoint with no retained history. The
+shared packing code sizes state planes from the declared fields. If a checkpoint
+outgrows the current plane, it increases the number of full-attention pages per
+parent while preserving each MLA page's exact payload-sized stride.
 
 Verify reconstructs the input endpoint and publishes a new base only into the
 private live block, before evaluating candidates, when ownership changes or
