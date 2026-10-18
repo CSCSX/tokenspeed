@@ -342,7 +342,7 @@ arithmetic in the kernels, without eager casts, gathers, `index_select` or
 group's block vector and copies the shared context once and local convolution
 states in one batched launch.
 
-GDN (prefill, decode and verify), QSA and gated residual kernels follow
+GDN (prefill, decode and verify), KDA RecoverSSM verify, QSA and gated residual kernels follow
 `pdl_enabled()`, passed explicitly to QSA indexing kernels. Waits precede
 producer-owned reads and outgoing triggers. A trigger permits successor
 setup, never publishes results; each kernel may delay it for performance.
@@ -353,6 +353,12 @@ merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 `situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
 themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model
 layers do not pass the platform PDL setting through their calls.
+
+KDA RecoverSSM launchers also select the platform PDL setting. The single-token
+fused producer and multi-token recurrence wait before reading metadata, writing
+outputs or returning for padding. They then release successors so gated output
+quantization can prepare its independent inputs during recurrence and history
+recovery. Both launch attributes use that same setting.
 
 AttnRes partial kernels may trigger their successors before writing partial
 scratch. `attnres_combine` may preload only weights known to be independent of

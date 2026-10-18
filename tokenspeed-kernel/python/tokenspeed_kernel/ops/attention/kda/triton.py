@@ -452,6 +452,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
             records=replay_records,
             replay_mixed_qkv=replay_mixed_qkv,
             lower_bound=lower_bound,
+            enable_pdl=pdl_enabled(),
         )
     if replay_mixed_qkv is not None:
         raise ValueError("a QKV payload requires replay records")

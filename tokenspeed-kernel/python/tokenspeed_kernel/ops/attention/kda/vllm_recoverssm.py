@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
@@ -143,6 +143,7 @@ def vllm_triton_kda_recoverssm_verify(
         history_write_indices=None if history is None else history.write_indices,
         history_append_offsets=None if history is None else history.append_offsets,
         history_use_tensor_cores=False if history is None else history.use_tensor_cores,
+        enable_pdl=pdl_enabled(),
     )
 
 

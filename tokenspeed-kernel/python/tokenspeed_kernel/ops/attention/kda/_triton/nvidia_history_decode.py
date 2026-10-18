@@ -96,7 +96,13 @@ def _fused_history_decode_kernel(
     IS_VARLEN: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # Fence predecessor writes even for padded rows that return below.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     i_v = pid % NV
@@ -298,6 +304,7 @@ def fused_history_decode(
     records: KdaReplayRecords,
     replay_mixed_qkv: torch.Tensor,
     lower_bound: float | None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Verify one token and save FP32 factors for the shared accepted commit.
 
@@ -305,7 +312,8 @@ def fused_history_decode(
     records supplies normalized-key/decay destinations, stamps, query boundaries
     and the cache-owned accepted history. replay_mixed_qkv receives request-major
     raw projections for the subsequent convolution commit. Return packed BF16
-    attention output shaped [1, tokens, heads, value_dim].
+    attention output shaped [1, tokens, heads, value_dim]. enable_pdl allows
+    successor setup to overlap while preserving producer dependencies.
     """
     history = records.history
     if history is None or records.key_gate_format != "normalized_key_decay":
@@ -381,6 +389,8 @@ def fused_history_decode(
         BV=tile,
         stride_state_page=state_pool.stride(0),
         stride_conv_page=conv_states.stride(0),
+        ENABLE_PDL=enable_pdl,
+        launch_pdl=enable_pdl,
         num_warps=4,
         num_stages=2,
     )

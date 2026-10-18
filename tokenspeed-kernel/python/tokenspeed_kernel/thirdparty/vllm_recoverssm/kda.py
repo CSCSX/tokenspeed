@@ -227,7 +227,13 @@ def _kda_recoverssm_verify_kernel(
     SPEC_QUERY_LEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     BATCH: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # Null rows also wait before zeroing output or releasing successors.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_h = tl.program_id(2)
@@ -957,8 +963,9 @@ def kda_recoverssm_verify(
     history_write_indices: torch.Tensor | None,
     history_append_offsets: torch.Tensor | None,
     history_use_tensor_cores: bool,
+    enable_pdl: bool,
 ) -> torch.Tensor:
-    """Verify a KDA speculative window without modifying its checkpoint."""
+    """Verify candidates; enable_pdl permits dependent-kernel setup overlap."""
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
     _, total_tokens, num_heads, key_dim = q.shape
@@ -1124,6 +1131,8 @@ def kda_recoverssm_verify(
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
         BATCH=triton.next_power_of_2(batch),
+        ENABLE_PDL=enable_pdl,
+        launch_pdl=enable_pdl,
         num_warps=(2 if batch <= 8 else 4) if history_use_tensor_cores else 1,
         # Keep explicit replay metadata assertions without instrumenting every
         # integer operation. The four-token, 16-row tile no longer keeps the
