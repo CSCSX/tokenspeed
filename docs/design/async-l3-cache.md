@@ -149,8 +149,9 @@ The literal `tsl3-` prefix identifies the cache without a second version number;
 the namespace hash includes `runtime_compat` as its single compatibility epoch.
 Scheduling, queue and query-budget changes do not advance that epoch.
 
-The request has one soft deadline shared by query and GET. A soft timeout
-ends its wait and permits local admission; it does not retract the request,
+The request's soft deadline starts when the query is issued and includes
+queue wait for both query and GET. A soft timeout ends its wait and permits
+local admission; it does not retract the request,
 raise admission headroom, mark the backend unhealthy or release native I/O
 buffers. Detached completions cannot publish data. Another request's local
 publication may also satisfy the wait before the remote operation completes.

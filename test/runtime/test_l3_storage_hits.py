@@ -343,6 +343,78 @@ def test_cancelled_queued_scheduler_get_retires_without_writing_host(runtime):
     assert host.host_buffer[:240] == bytes(240)
 
 
+def test_expired_queued_get_retires_while_active_get_keeps_host_references(runtime):
+    config, host, backend, executor, _ = runtime
+    scheduler, active, _ = _get_descriptor(config, backend, executor)
+    backend.release_reads.clear()
+    executor.submit_operations([active])
+    assert backend.read_started.wait(2)
+
+    query = _query(scheduler, "queued")
+    keys = _keys(executor, query)
+    _send(
+        scheduler,
+        ts.Cache.StorageDone(
+            query.op_id, backend.batch_exists(keys), True, [False] * len(keys)
+        ),
+    )
+    queued = storage_ops(scheduler.next_execution_plan())[0]
+    assert queued.kind == ts.StorageKind.Get
+    executor.submit_operations([queued])
+
+    # Both deadlines include queue wait. Expiration permits ordinary admission
+    # while the active native call still owns its destinations.
+    _send(
+        scheduler,
+        ts.Cache.StorageTick(
+            config.scheduler.wait_timeout_us + 2,
+            True,
+            True,
+            ts.StoragePressure(0, 0, 0),
+        ),
+    )
+    plan = scheduler.next_execution_plan()
+    assert {rid for batch in plan.forward for rid in batch.request_ids} == {
+        "snapshot",
+        "queued",
+    }
+    assert all(
+        prefix == 0 for batch in plan.forward for prefix in batch.extend_prefix_lens
+    )
+    assert scheduler.storage_stats().wait_timeouts == 2
+    cancellations = storage_ops(plan)
+    assert {op.op_id for op in cancellations} == {active.op_id, queued.op_id}
+    assert all(op.kind == ts.StorageKind.Cancel for op in cancellations)
+    executor.submit_operations(cancellations)
+
+    result = _completions(executor, 1)[0]
+    assert result.op_id == queued.op_id and result.retired
+    assert not any(result.success) and not any(result.object_failures)
+    _finish(scheduler, result)
+    assert not executor.poll().completions  # Repeated polling cannot replay the ACK.
+    assert scheduler.storage_held_blocks() == len(active.host_blocks)
+    assert scheduler.storage_pending()
+    assert executor.delete_namespace() is False
+    with pytest.raises(RuntimeError, match="must retire"):
+        executor.set_weight_version("v2")
+    assert host.host_buffer == bytes(len(host.host_buffer))
+
+    backend.release_reads.set()
+    result = _completions(executor, 1)[0]
+    assert result.op_id == active.op_id and result.retired and all(result.success)
+    _finish(scheduler, result)
+    assert not scheduler.storage_pending()
+    assert scheduler.storage_held_blocks() == 0
+    assert scheduler.host_pool_cached_blocks() == 0  # Detached reads cannot publish.
+    for block in active.host_blocks:
+        offset, size = host.host_block_range(0, block)
+        assert host.host_buffer[offset : offset + size] == b"snapshot"
+    for block in queued.host_blocks:
+        offset, size = host.host_block_range(0, block)
+        assert host.host_buffer[offset : offset + size] == bytes(size)
+    executor.set_weight_version("v2")
+
+
 def test_namespace_mutation_rejects_inflight_io_without_waiting(runtime):
     _, host, backend, executor, _ = runtime
     old_key = executor._object_key("hash", 0, 0)
