@@ -136,10 +136,9 @@ def test_scan_preparation_across_scalar_boundaries(dtype):
             atol=0,
         )
 
-    # Warm each sequence tile once. Within a tile, changing the live counts,
-    # scalar alignment classes or chunk-loop trip count must reuse its binary.
-    for shape in ((1, 1), (33, 2), (65, 3), (129, 5), (257, 9), (513, 17)):
-        run(*shape)
+    # A single startup shape covers small batches with different live counts.
+    # Every call still checks the scrubbed inputs and complete device plan.
+    run(1, 1)
     with assert_no_triton_compile(_prepare_capacity_scan_kernel):
         for shape in (
             (1, 1),
@@ -168,3 +167,14 @@ def test_scan_preparation_across_scalar_boundaries(dtype):
             (4112, 1),
         ):
             run(*shape)
+
+    # Larger sequence counts keep bounded tiles. Exercise their padded rows
+    # and chunk plans without introducing variants inside an existing tile.
+    for warm, shapes in (
+        ((3168, 33), ((6048, 63), (6144, 64))),
+        ((8192, 65), ((8192, 96), (8192, 127), (8192, 128))),
+    ):
+        run(*warm)
+        with assert_no_triton_compile(_prepare_capacity_scan_kernel):
+            for shape in shapes:
+                run(*shape)

@@ -1473,8 +1473,10 @@ passes this explicit plan to the existing native launch without replacing
 global functions or changing scan arithmetic. Routing and workspace partition
 rules remain owned by the native host. Unsupported layouts retain the public
 wrapper's capacity preparation. Token, sequence and chunk counts do not
-specialize on equality or divisibility; the power-of-two sequence tile remains
-a compile-time bucket. A different live partition must not add scalar variants.
+specialize on equality or divisibility. Small sequence batches share the
+startup tile; larger batches use bounded power-of-two tiles. A different live
+partition within a tile must not add scalar variants. Chunk-plan temporaries
+remain small so they do not increase the register cost of every input copy.
 History clearing likewise accepts contiguous page vectors and strided block-table
 columns without specializing on their live row counts or index strides.
 

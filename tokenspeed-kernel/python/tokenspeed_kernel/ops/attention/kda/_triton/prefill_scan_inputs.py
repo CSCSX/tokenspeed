@@ -78,8 +78,9 @@ def _prepare_capacity_scan_kernel(
         ends = tl.cumsum(counts)
         tl.store(CHUNKS + slot + 1, ends, slot < N)
         tl.store(CHUNKS, 0)
-        for base in range(tl.cdiv(MAX_CHUNKS, 128)):
-            index = base * 128 + tl.arange(0, 128)
+        # Keep the plan tile small so its registers do not limit input copies.
+        for base in range(tl.cdiv(MAX_CHUNKS, 16)):
+            index = base * 16 + tl.arange(0, 16)
             sequence = tl.sum(
                 (index[:, None] >= ends[None, :]) & (slot[None, :] < N), 1
             )
@@ -137,7 +138,8 @@ def prepare_capacity_scan(q, k, v, gate, beta, boundaries):
         GS=gate.stride(1),
         BS=beta.stride(1),
         MAX_CHUNKS=count,
-        N_BLOCK=triton.next_power_of_2(sequences),
+        # Small batches share one tile, avoiding first-use shape compilations.
+        N_BLOCK=max(32, triton.next_power_of_2(sequences)),
         BLOCK=1024,
     )
     return oq, ok, ov, og, ob, chunks, chunk_rows
