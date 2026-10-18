@@ -84,3 +84,87 @@ def test_conv_capacity_refresh_masks_history_loads():
             cursor += count
         torch.testing.assert_close(maps.batch_indices.cpu(), expected)
         torch.testing.assert_close(maps.chunk_offsets.cpu(), offsets)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_scan_preparation_across_scalar_boundaries(dtype):
+    from tokenspeed_kernel.ops.attention.kda._triton.prefill_scan_inputs import (
+        _prepare_capacity_scan_kernel,
+        prepare_capacity_scan,
+    )
+    from utils import assert_no_triton_compile
+
+    def run(tokens, sequences):
+        live = tokens if tokens <= sequences + 7 else tokens - 7
+        lengths = [1 + row % 17 for row in range(sequences)]
+        if sum(lengths) > live:
+            lengths = [1] * sequences
+        lengths[-1] += live - sum(lengths)
+        boundaries = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        shape = (1, tokens, 2, 128)
+        q, k, v = [torch.randn(shape, dtype=dtype, device="cuda") for _ in range(3)]
+        gate = torch.randn(shape, dtype=torch.float32, device="cuda")
+        beta = torch.randn((1, tokens, 2), dtype=dtype, device="cuda")
+        inputs = (q, k, v, gate, beta)
+        for tensor in inputs:
+            tensor[:, live::2] = float("nan")
+            tensor[:, live + 1 :: 2] = float("inf")
+        *outputs, chunks, chunk_rows = prepare_capacity_scan(
+            q, k, v, gate, beta, boundaries
+        )
+        for source, output in zip(inputs, outputs, strict=True):
+            expected = source.clone()
+            expected[:, live:] = 0
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        counts = [(length + 15) // 16 for length in lengths]
+        expected_chunks = torch.tensor(
+            [0, *torch.tensor(counts).cumsum(0).tolist()], dtype=torch.int32
+        )
+        expected_rows = [row for row, count in enumerate(counts) for _ in range(count)]
+        capacity = (tokens + 15) // 16 + sequences - 1
+        expected_rows += [sequences - 1] * (capacity - len(expected_rows))
+        torch.testing.assert_close(chunks.cpu(), expected_chunks, rtol=0, atol=0)
+        torch.testing.assert_close(
+            chunk_rows.cpu(),
+            torch.tensor(expected_rows, dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+
+    # Warm each sequence tile once. Within a tile, changing the live counts,
+    # scalar alignment classes or chunk-loop trip count must reuse its binary.
+    for shape in ((1, 1), (33, 2), (65, 3), (129, 5), (257, 9), (513, 17)):
+        run(*shape)
+    with assert_no_triton_compile(_prepare_capacity_scan_kernel):
+        for shape in (
+            (1, 1),
+            (15, 1),
+            (16, 1),
+            (17, 1),
+            (32, 1),
+            (96, 1),
+            (33, 2),
+            (97, 3),
+            (96, 4),
+            (480, 5),
+            (576, 6),
+            (672, 7),
+            (768, 8),
+            (832, 9),
+            (1440, 15),
+            (1536, 16),
+            (1632, 17),
+            (3072, 32),
+            # MAX_CHUNKS crosses 127/128/129 and 256/257 loop boundaries.
+            (2032, 1),
+            (2048, 1),
+            (2064, 1),
+            (4096, 1),
+            (4112, 1),
+        ):
+            run(*shape)

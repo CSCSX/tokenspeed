@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "N", "MAX_CHUNKS"])
 def _prepare_capacity_scan_kernel(
     Q,
     K,
@@ -39,8 +39,8 @@ def _prepare_capacity_scan_kernel(
     CU,
     CHUNKS,
     CHUNK_ROWS,
-    # Token, sequence and chunk counts follow the batch; runtime so every batch
-    # shape shares one binary. N_BLOCK buckets N for the per-sequence tile.
+    # Batch counts must not specialize on equality or divisibility either.
+    # N_BLOCK alone buckets N for the per-sequence tile.
     T,
     H: tl.constexpr,
     D: tl.constexpr,
