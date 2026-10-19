@@ -1838,19 +1838,21 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
         auto probe = probeTier<CacheTier::kHost>(candidate, local.group_keys, match_order_, floor, true, &remote);
         if (probe.num_common_tokens <= local.device.num_common_tokens) return {};
         StorageReservation result;
+        std::vector<CacheBlockRef> warm_blocks;
         std::vector<std::uint32_t> groups;
         std::vector<std::int32_t> buckets;
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = AcquireHostCachedBlock(key);
             if (ref) {
-                result.warm_blocks.push_back(std::move(ref));
+                warm_blocks.push_back(std::move(ref));
             } else {
                 result.keys.push_back(key);
                 groups.push_back(key.group_id);
                 buckets.push_back(logical_block % groups_[key.group_id].Spec().shard_count);
             }
         };
-        // Pin every warm dependency before any allocation can evict another hit.
+        // Protect warm dependencies only while allocating destinations. They
+        // stay evictable during I/O; ordinary admission matches the cache again.
         forEachStorageDependency(probe, local.group_keys, floor, pin);
         if (probe.tail) {
             result.tail_prior = probe.full_page_tokens == 0
@@ -1859,7 +1861,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
             result.tail = TailPublication{.tail_tokens = probe.tail->tail_tokens, .hash = probe.tail->hash};
         }
         if (result.keys.empty()) return {};
-        if (result.keys.size() + result.warm_blocks.size() <= max_blocks) {
+        if (result.keys.size() + warm_blocks.size() <= max_blocks) {
             auto allocation = AcquireHostBlocks(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.blocks = std::move(allocation.blocks);

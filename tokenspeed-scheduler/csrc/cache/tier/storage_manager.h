@@ -71,7 +71,6 @@ private:
         StorageKind kind;
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> blocks;
-        std::vector<CacheBlockRef> warm_blocks;
         std::vector<std::uint8_t> success;
         ContentHash tail_prior;
         std::optional<TailPublication> tail;

@@ -405,7 +405,6 @@ public:
     struct StorageReservation {
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> blocks;
-        std::vector<CacheBlockRef> warm_blocks;
         ContentHash tail_prior;
         std::optional<TailPublication> tail;
     };

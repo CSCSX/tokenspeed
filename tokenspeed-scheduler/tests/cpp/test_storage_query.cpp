@@ -26,6 +26,7 @@
 #include <numeric>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -275,11 +276,11 @@ TEST(StorageQueryTest, APartialHostBoundaryUsesAlignedQueryFloorAndDeviceReserva
     EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 1}));
     const auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, query.keys, 64);
     EXPECT_EQ(reservation.keys.size(), 5u);
-    EXPECT_EQ(reservation.warm_blocks.size(), 2u);
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
     EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 7);
 }
 
-TEST(StorageQuerySwaFloorTest, QuerySkipsBelowHostFloorButReservationPinsTheLiveWindow) {
+TEST(StorageQuerySwaFloorTest, QuerySkipsBelowHostFloorAndWarmPinsEndWithReservation) {
     const std::vector<CacheGroupSpec> specs{
         {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         {.attn_kind = AttnKind::kState, .block_granularity = 0},
@@ -336,21 +337,87 @@ TEST(StorageQuerySwaFloorTest, QuerySkipsBelowHostFloorButReservationPinsTheLive
     EXPECT_EQ(pool_facts(cache.device), device_before);
     ASSERT_EQ(reservation.keys.size(), 7u);
     ASSERT_EQ(reservation.blocks.size(), 7u);
-    ASSERT_EQ(reservation.warm_blocks.size(), 3u);
-    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), pinned_before + 3);
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), pinned_before);
     const std::vector<CacheKey> expected_warm{{.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 0},
                                               {.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 1},
                                               // T=9, W=8 needs [2, 9): this block is below Query's F=4.
                                               {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1}};
     for (const auto& key : expected_warm) {
-        const auto reference = cache.coordinator.AcquireHostCachedBlock(key);
-        ASSERT_TRUE(reference);
-        EXPECT_NE(std::ranges::find(reservation.warm_blocks, reference), reservation.warm_blocks.end());
+        EXPECT_TRUE(cache.coordinator.ContainsHostCachedBlock(key));
     }
     for (const auto& key : expected_query) EXPECT_TRUE(Has(reservation.keys, key));
     // Reserving unfilled destinations is not Host publication.
     EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 7);
 }
+
+enum class WarmReadStage { kRunning, kReady, kDetached, kQuarantined, kDetachBeforeQuarantine };
+
+class StorageWarmLifetimeTest : public ::testing::TestWithParam<std::tuple<std::uint32_t, WarmReadStage>> {};
+
+TEST_P(StorageWarmLifetimeTest, ExistingDependenciesRemainEvictableAcrossTheGetLifetime) {
+    const std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .block_granularity = 0},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 2,
+         .block_granularity = 2}};
+    QueryCache cache(4, specs, 32);
+    QueryPrompt prompt(8, 4);
+    const auto prefix = prompt.Prefix(8, false);
+    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = prompt.hashes[0]},
+                                     {.group_id = 1, .content_hash = prompt.hashes[1]},
+                                     {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1}};
+    cache.Warm(warm);
+    const auto query = cache.coordinator.MissingStorageKeys(prefix, 64);
+    const auto id = cache.storage.StartRead(prefix, query.keys);
+    ASSERT_NE(id, 0u);
+    const auto commands = cache.storage.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    const auto op = std::get<StorageGetOperation>(commands[0]);
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), op.keys.size());
+    const auto [group, stage] = GetParam();
+    const auto complete = [&](bool retired) {
+        cache.storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(op.keys.size(), 1), retired,
+                                                  std::vector<std::uint8_t>(op.keys.size(), 0)});
+    };
+    if (stage == WarmReadStage::kReady) {
+        complete(true);
+        ASSERT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 8);
+    } else if (stage == WarmReadStage::kDetached || stage == WarmReadStage::kDetachBeforeQuarantine) {
+        cache.storage.Detach(id);
+        if (stage == WarmReadStage::kDetachBeforeQuarantine) complete(false);
+    } else if (stage == WarmReadStage::kQuarantined) {
+        complete(false);
+        cache.storage.Detach(id);
+    }
+
+    // The old dependency is not an I/O destination, even when its group is
+    // needed to resume at T=8. Its eviction must shorten the next real probe.
+    auto block = cache.coordinator.AcquireHostCachedBlock(warm[group]);
+    ASSERT_TRUE(block);
+    const auto location = block->Location();
+    block.reset();
+    ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(group).Evict(cache.host, location));
+    if (stage == WarmReadStage::kRunning || stage == WarmReadStage::kDetached) complete(true);
+    EXPECT_LT(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 8);
+    if (stage == WarmReadStage::kDetached) {
+        EXPECT_FALSE(cache.storage.HasPending());
+        EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    } else {
+        EXPECT_EQ(cache.storage.NumHeldBlocks(), op.keys.size());
+    }
+    if (stage == WarmReadStage::kQuarantined || stage == WarmReadStage::kDetachBeforeQuarantine) {
+        EXPECT_EQ(cache.storage.NumQuarantined(), 1u);
+        EXPECT_FALSE(cache.storage.CanStart());
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(FullStateAndWindow, StorageWarmLifetimeTest,
+                         ::testing::Combine(::testing::Values(0u, 1u, 2u),
+                                            ::testing::Values(WarmReadStage::kRunning, WarmReadStage::kReady,
+                                                              WarmReadStage::kDetached, WarmReadStage::kQuarantined,
+                                                              WarmReadStage::kDetachBeforeQuarantine)));
 
 }  // namespace
 }  // namespace tokenspeed::test

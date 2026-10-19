@@ -972,7 +972,7 @@ TEST_F(AsyncStorageTailTest, KnownTailBelowTheRequestBoundCanBeRestored) {
     ASSERT_NE(id, 0u);
     const auto op = std::get<StorageGetOperation>(storage.TakeCommands()[0]);
     ASSERT_EQ(op.keys.size(), 6u);
-    EXPECT_EQ(storage.NumHeldBlocks(), 7u) << "the exact state is a pinned warm dependency";
+    EXPECT_EQ(storage.NumHeldBlocks(), 6u) << "only new GET destinations hold I/O credits";
     storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(6, 1), true, std::vector<std::uint8_t>(6, 0)});
     EXPECT_EQ(coordinator.ProbePromptPrefix(prompt(11, false)).host.num_common_tokens, 7);
 }
@@ -1323,9 +1323,36 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
     auto reservation = coordinator.ReserveStoragePrefix(StoragePrompt(hashes, 2),
                                                         std::array{CacheKey{.group_id = 0, .content_hash = "h0"}}, 2);
     ASSERT_EQ(reservation.blocks.size(), 1u);
-    ASSERT_EQ(reservation.warm_blocks.size(), 1u);
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(later));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(unrelated));
+    auto reused = coordinator.AcquireHostBlock(0, 0);
+    ASSERT_TRUE(reused);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(later));
+}
+
+TEST_F(AsyncStorageTransactionTest, AnIndependentPutStillProtectsAWarmGetDependency) {
+    auto warm = coordinator.AcquireHostBlock(0, 0);
+    coordinator.CacheHostBlock(warm, key("h0"));
+    const auto location = warm->Location();
+    warm.reset();
+    storage.QueueBackups(std::array{key("h0")});
+    storage.StartBackups();
+    const auto writes = storage.TakeCommands();
+    ASSERT_EQ(writes.size(), 1u);
+    const auto put = std::get<StoragePutOperation>(writes[0]);
+    const auto read = storage.StartRead(StoragePrompt(hashes, 2), coordinator.ExpandPrefixKeys(hashes));
+    ASSERT_NE(read, 0u);
+    const auto reads = storage.TakeCommands();
+    ASSERT_EQ(reads.size(), 1u);
+    const auto get = std::get<StorageGetOperation>(reads[0]);
+    EXPECT_EQ(storage.NumHeldBlocks(), put.keys.size() + get.keys.size());
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Evict(host, location));
+    storage.Complete(cache::StorageDone{put.op_id, {1}, true, {0}});
+    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(host, location));
+    EXPECT_EQ(storage.NumHeldBlocks(), get.keys.size());
+    storage.Complete(cache::StorageDone{read, {1, 1}, true, {0, 0}});
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 0);
 }
 
 TEST_F(AsyncStorageTransactionTest, RejectedReadDoesNotPoisonObjectsAndCanRetry) {

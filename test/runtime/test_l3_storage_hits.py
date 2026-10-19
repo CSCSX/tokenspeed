@@ -415,6 +415,133 @@ def test_expired_queued_get_retires_while_active_get_keeps_host_references(runti
     executor.set_weight_version("v2")
 
 
+@pytest.mark.parametrize("phase", ["running", "ready", "detached"])
+def test_reused_warm_host_address_preserves_get_results(phase):
+    config = StorageRuntimeConfig.from_extra_config(
+        '{"async":{"read_workers":1,"max_operations":2,"max_host_blocks":2}}',
+        host_blocks=2,
+        prefix_granularity=2,
+    )
+    host = _Host()
+    backend = _ControlledMemoryStore()
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 2
+    cfg.num_snapshot_pages = 1
+    cfg.num_device_pages = 32
+    cfg.num_host_pages = 3  # Two usable Host slots: one warm and one GET destination.
+    cfg.max_batch_size = 4
+    cfg.max_scheduled_tokens = 8
+    cfg.enable_l3_storage = True
+    cfg.storage_config = config.scheduler
+    cfg.cache_groups = [ts.CacheGroupConfig("kv", 2, 32, ts.AttnKind.Full)]
+    scheduler = ts.Scheduler(cfg)
+    _send(scheduler, ts.Cache.StorageTick(1, False, True, ts.StoragePressure(0, 0, 0)))
+    executor = L3Executor(
+        backend,
+        host,
+        key_prefix="warm-lifetime",
+        rank=0,
+        ownership=None,
+        config=config,
+        prefix_for_weight_version=None,
+    )
+
+    def prepare_read(request_id, tokens, bound, payload):
+        spec = ts.RequestSpec()
+        spec.request_id = request_id
+        spec.tokens = tokens
+        spec.max_cached_prefix_tokens = bound
+        scheduler.submit_requests([spec])
+        operations = storage_ops(scheduler.next_execution_plan())
+        assert len(operations) == 1 and operations[0].kind == ts.StorageKind.Query
+        query = operations[0]
+        _seed(backend, _keys(executor, query), payload)
+        executor.submit_operations([query])
+        _finish(scheduler, _completions(executor, 1)[0])
+        operations = storage_ops(scheduler.next_execution_plan())
+        assert len(operations) == 1 and operations[0].kind == ts.StorageKind.Get
+        return operations[0]
+
+    try:
+        seed = prepare_read("seed", [0, 1, 2], 2, b"warmdata")
+        executor.submit_operations([seed])
+        _finish(scheduler, _completions(executor, 1)[0])
+        assert not any(
+            batch.request_ids for batch in scheduler.next_execution_plan().forward
+        )
+        abort = ts.ForwardEvent.Abort()
+        abort.request_id = "seed"
+        _send(scheduler, abort)
+        scheduler.next_execution_plan()
+        assert scheduler.storage_held_blocks() == 0
+        assert scheduler.host_pool_cached_blocks() == 1
+
+        active = prepare_read("active", [0, 1, 2, 3, 4], 4, b"readback")
+        backend.read_started.clear()
+        backend.release_reads.clear()
+        executor.submit_operations([active])
+        assert backend.read_started.wait(2)
+        assert scheduler.storage_held_blocks() == len(active.host_blocks)
+        if phase == "ready":
+            backend.release_reads.set()
+            _finish(scheduler, _completions(executor, 1)[0])
+            scheduler.next_execution_plan()
+            assert scheduler.storage_stats().ready_requests == 1
+
+        # A second real reservation must evict the old warm entry and reuse
+        # its address while the first GET or Ready hold owns its destination.
+        replacement = prepare_read("replacement", [10, 11, 12], 2, b"newowner")
+        assert list(replacement.host_blocks) == list(seed.host_blocks)
+        warm_offset, size = host.host_block_range(0, replacement.host_blocks[0])
+        host.host_buffer[warm_offset : warm_offset + size] = b"newowner"
+        if phase == "detached":
+            abort = ts.ForwardEvent.Abort()
+            abort.request_id = "active"
+            _send(scheduler, abort)
+            executor.submit_operations(storage_ops(scheduler.next_execution_plan()))
+
+        if phase != "ready":
+            backend.release_reads.set()
+            result = _completions(executor, 1)[0]
+            assert (
+                result.op_id == active.op_id and result.retired and all(result.success)
+            )
+            _finish(scheduler, result)
+        assert host.host_buffer[warm_offset : warm_offset + size] == b"newowner"
+        offset, size = host.host_block_range(0, active.host_blocks[0])
+        assert host.host_buffer[offset : offset + size] == b"readback"
+        _send(
+            scheduler, ts.Cache.StorageTick(2, True, True, ts.StoragePressure(0, 0, 0))
+        )
+        plan = scheduler.next_execution_plan()
+        if phase == "detached":
+            assert not any(batch.request_ids for batch in plan.forward)
+        else:
+            assert list(plan.forward[0].request_ids) == ["active"]
+            assert list(plan.forward[0].extend_prefix_lens) == [0]
+
+        executor.submit_operations([replacement])
+        _finish(scheduler, _completions(executor, 1)[0])
+        plan = scheduler.next_execution_plan()
+        batch = next(
+            batch for batch in plan.forward if "replacement" in batch.request_ids
+        )
+        index = list(batch.request_ids).index("replacement")
+        assert batch.extend_prefix_lens[index] == 2
+        assert scheduler.storage_held_blocks() == 0
+        assert (
+            scheduler.host_pool_pinned_blocks() > 0
+        )  # Ordinary H2D owns the new prefix.
+        for operation in plan.cache:
+            if isinstance(operation, ts.Cache.LoadBackOp):
+                for op_id in operation.op_ids:
+                    _send(scheduler, ts.Cache.LoadBackDoneEvent(op_id))
+        assert scheduler.storage_quarantined() == 0
+    finally:
+        backend.release_reads.set()
+        executor.close(timeout_s=2)
+
+
 def test_namespace_mutation_rejects_inflight_io_without_waiting(runtime):
     _, host, backend, executor, _ = runtime
     old_key = executor._object_key("hash", 0, 0)

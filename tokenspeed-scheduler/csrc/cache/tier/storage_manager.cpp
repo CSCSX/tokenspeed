@@ -87,7 +87,7 @@ void StorageTransferManager::UpdatePressure(const StoragePressure& pressure) {
 std::size_t StorageTransferManager::NumHeldBlocks() const {
     std::size_t count = 0;
     for (const auto& [id, ticket] : operations_) {
-        count += ticket.blocks.size() + ticket.warm_blocks.size();
+        count += ticket.blocks.size();
     }
     return count;
 }
@@ -109,7 +109,7 @@ std::uint64_t StorageTransferManager::StartQuery(std::vector<CacheKey> keys) {
     }
     StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
-    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, {}, {}, {}});
+    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, {}, {}});
     commands_.push_back(std::move(op));
     return id;
 }
@@ -147,7 +147,6 @@ std::uint64_t StorageTransferManager::StartRead(const CacheCoordinator::PromptPr
     operations_.emplace(id, Ticket{decltype(op)::kKind,
                                    op.keys,
                                    std::move(reservation.blocks),
-                                   std::move(reservation.warm_blocks),
                                    {},
                                    std::move(reservation.tail_prior),
                                    std::move(reservation.tail)});
@@ -281,7 +280,7 @@ void StorageTransferManager::StartBackups() {
     }
     if (refs.empty()) return;
     op.op_id = nextId();
-    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, std::move(refs), {}, {}});
+    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, std::move(refs), {}});
     commands_.push_back(std::move(op));
 }
 

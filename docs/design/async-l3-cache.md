@@ -19,8 +19,8 @@ asynchronous implementation; there is no second synchronous scheduling mode.
 
 The C++ cache subsystem selects reusable prefixes, allocates blocks and owns
 their references. Python workers receive immutable keys and Host byte ranges;
-they call neither the scheduler nor GPU APIs or collectives. References remain
-held until every cache-owning rank proves that native I/O has retired. L2 and
+they call neither the scheduler nor GPU APIs or collectives. Native I/O references
+remain held until every cache-owning rank proves retirement. L2 and
 L3 independently retain the shared Host allocation, so either can shut down
 without invalidating memory still used by the other.
 
@@ -99,8 +99,9 @@ completion protocol; storage completion never substitutes for an H2D fence.
    increasing operation ID and immutable keys. Querying reserves no Device
    pages or batch slots.
 3. After all owners report existence, C++ runs the existing group matcher
-   with these temporary hints. It pins all warm dependencies before allocating
-   Host destinations. Under shortage it shortens the boundary and re-runs the
+   with these temporary hints. It pins warm dependencies only while allocating
+   Host destinations, releasing those temporary references before returning
+   the reservation. Under shortage it shortens the boundary and re-runs the
    matcher, including sliding-window and snapshot-state requirements.
 4. A GET job receives fixed backend keys, Host offsets and lengths. No worker
    reads a mutable namespace or a later scheduler plan.
@@ -109,9 +110,12 @@ completion protocol; storage completion never substitutes for an H2D fence.
    every owner, only rows with full-length success on every owner publish
    Host entries. Successful rows may form a shorter legal prefix; ordinary
    matching determines what is actually reusable.
-6. A short Ready hold protects the result until ordinary admission transfers
-   ownership to the existing H2D ticket. Ready expiry releases the hold. H2D
-   and the forward use the same execution path as every Host hit.
+6. A short Ready hold protects the newly read blocks until ordinary admission
+   transfers ownership to the existing H2D ticket. Existing Device and Host
+   dependencies remain evictable while GET is queued/running and while Ready
+   waits. Admission matches the real cache again; lost dependencies can shorten
+   reuse or require recomputation. Ready expiry releases the hold. H2D and the
+   forward use the same execution path as every Host hit.
 
 Tail candidates carry their exact token count and hash through reservation.
 A retired, attached GET records a local tail hint only after publishing Host
@@ -139,6 +143,9 @@ byte budget nor a quota per worker. Page sharding changes the transferred bytes,
 not this logical count. A read with no legal prefix within the remaining budget
 uses ordinary local admission; deployments must budget for the prefix lengths
 and concurrency they intend to restore together.
+The reservation still checks new destinations plus temporary warm references
+against available credits. Once it returns, GET tickets and Ready holds charge
+only their destination references; warm dependencies hold no I/O credits.
 
 Retraction restores exact images through `HostCacheExecutor`; it never starts
 a fresh L3 preparation. State groups use the current fixed two-slot checkpoint
@@ -198,8 +205,9 @@ outstanding-operation limit includes queued jobs, native work and undelivered
 results. Completed scheduler tickets remain charged while they hold Ready
 results or quarantined references. C++ also limits key count, Host references, lookahead tokens,
 negative metadata and backup candidates. Each held CacheBlock is charged
-conservatively as one potentially pinned LCM parent, including warm
-requirements and quarantine. This can underuse packed Host capacity but cannot
+conservatively as one potentially pinned LCM parent. Warm references participate
+only in the reservation check; quarantine retains the actual I/O references.
+This can underuse packed Host capacity but cannot
 oversubscribe it.
 
 Backups may occupy at most half of the operation credits and half of the Host
