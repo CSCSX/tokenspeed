@@ -329,17 +329,15 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-        ):
-            # Verify staging exists for the target's verify step; the prefill
-            # role only ever writes committed prompt state.
+        if self.server_args.disaggregation_mode == "prefill":
+            return 0
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if width == 1 and not self.replay_kda:
             return 0
         return kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
-            draft_token_num=int(self.server_args.speculative_num_draft_tokens),
+            draft_token_num=width,
             replay_kda=self.replay_kda,
         )
 

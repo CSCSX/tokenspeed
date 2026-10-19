@@ -562,6 +562,7 @@ def kda_verify_conv_update(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    bias: torch.Tensor | None = None,
     recurrent_layout: str,
 ) -> torch.Tensor:
     """Materialize the convolution producer used by split KDA verification.
@@ -571,6 +572,7 @@ def kda_verify_conv_update(
         conv_weights: Fused four-tap QKV convolution weights.
         conv_states: Committed convolution-state pool.
         read_indices: Committed page index for each request.
+        bias: Optional per-channel bias before SiLU; None adds zero.
         num_heads: Per-rank KDA head count.
         head_dim: KDA head width.
         draft_token_num: Verify positions per request.
@@ -602,6 +604,7 @@ def kda_verify_conv_update(
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
+        bias=bias,
     )
 
 

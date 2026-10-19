@@ -971,6 +971,7 @@ def _kda_verify_launch_config(
 def fused_kda_verify_conv_update_kernel(
     qkv_raw,
     conv_w,
+    conv_bias,
     conv_pool,
     read_indices,
     out,
@@ -980,6 +981,7 @@ def fused_kda_verify_conv_update_kernel(
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     i_row = tl.program_id(0)
     i_c = tl.program_id(1)
@@ -1006,6 +1008,8 @@ def fused_kda_verify_conv_update_kernel(
         ).to(tl.float32)
         b_w = tl.load(conv_w + o_c * 4 + i_w, mask=mask_c, other=0.0).to(tl.float32)
         acc += tl.where(from_raw, b_raw, b_state) * b_w
+    if HAS_BIAS:
+        acc += tl.load(conv_bias + o_c, mask=mask_c, other=0.0).to(tl.float32)
     acc = acc * tl.sigmoid(acc)
     tl.store(
         out + i_row * stride_out_tok + o_c,
@@ -1023,6 +1027,7 @@ def fused_kda_verify_conv_update(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_c: int = 256,
     num_warps: int = 4,
@@ -1086,6 +1091,7 @@ def fused_kda_verify_conv_update(
     fused_kda_verify_conv_update_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,
+        conv_bias=bias,
         conv_pool=conv_pool,
         read_indices=read_indices,
         out=out,
@@ -1095,6 +1101,7 @@ def fused_kda_verify_conv_update(
         T=T,
         C=C,
         BLOCK_C=block_c,
+        HAS_BIAS=bias is not None,
         num_warps=num_warps,
     )
     return out

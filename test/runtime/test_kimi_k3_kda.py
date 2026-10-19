@@ -362,14 +362,26 @@ def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     backend = _backend("cpu", contract_pool=pool)
 
     resolve_calls = 0
-    real = mamba.compute_state_block_indices
+    real = (
+        mamba.verify_state_blocks
+        if backend.deferred_state_commit
+        else mamba.compute_state_block_indices
+    )
 
     def counting(*args, **kwargs):
         nonlocal resolve_calls
         resolve_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(mamba, "compute_state_block_indices", counting)
+    monkeypatch.setattr(
+        mamba,
+        (
+            "verify_state_blocks"
+            if backend.deferred_state_commit
+            else "compute_state_block_indices"
+        ),
+        counting,
+    )
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
@@ -596,6 +608,13 @@ class _KDAHarness:
             **self.common_kwargs(layer_id),
         ).flatten(0, 1)
 
+    def commit_decode(self, bs):
+        self.backend.commit_state_after_acceptance(
+            torch.ones(bs, dtype=torch.int32, device=self.device),
+            num_extends=0,
+            accepted_path=None,
+        )
+
     def decode(self, layer_id, mixed, g_raw, beta_raw, bs):
         # mixed cloned for the same reason as in extend().
         return self.backend.forward_decode(
@@ -610,7 +629,7 @@ class _KDAHarness:
             g_raw=g_raw,
             beta_raw=beta_raw,
             **self.common_kwargs(layer_id),
-        ).flatten(0, 1)
+        ).reshape(-1, self.D)
 
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
@@ -790,6 +809,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
                     bs=1,
                 )
             )
+        h.commit_decode(1)
 
     for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
         s = streams[layer_id]
@@ -887,6 +907,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
             bs=1,
         )
     )
+    h.commit_decode(1)
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
@@ -916,6 +937,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     g_raw = torch.cat([a_new["g_raw"][1:2], b_new["g_raw"][3:4]], dim=0)
     beta_raw = torch.cat([a_new["beta_raw"][1:2], b_new["beta_raw"][3:4]], dim=0)
     both = h.decode(layer_id, mixed, g_raw, beta_raw, bs=2)
+    h.commit_decode(2)
     a_outs.append(both[: h.H])
     b_outs.append(both[h.H :])
 
@@ -1015,6 +1037,7 @@ def test_kda_cache_pool_component_views_end_to_end(
                     bs=1,
                 )
             )
+        h.commit_decode(1)
 
     assert indexed_decode_calls == len(layer_ids) * (total - 8)
 

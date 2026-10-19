@@ -53,6 +53,7 @@ def _state_input_page(table, row, table_stride, live):
 def _verify_state_blocks_kernel(
     table,
     pages_out,
+    live_pages_out,
     bs,
     table_stride,
     BLOCK: tl.constexpr,
@@ -64,11 +65,14 @@ def _verify_state_blocks_kernel(
     live = row < bs
     page = _state_input_page(table, row, table_stride, live)
     tl.store(pages_out + row, page.to(tl.int32), mask=live)
+    if live_pages_out is not None:
+        working = tl.load(table + row * table_stride + 1, mask=live, other=0)
+        tl.store(live_pages_out + row, working.to(tl.int32), mask=live)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def _torch_verify_state_blocks(table, batch_size, pages_out):
+def _torch_verify_state_blocks(table, batch_size, pages_out, live_pages_out):
     """Portable spelling, kept for non-CUDA callers (the backends' CPU tests)."""
     rows = table[:batch_size]
     checkpoint = rows[:, STATE_INPUT_SLOT]
@@ -76,6 +80,8 @@ def _torch_verify_state_blocks(table, batch_size, pages_out):
     pages_out[:batch_size].copy_(
         torch.where(checkpoint > 0, checkpoint, working).to(torch.int32)
     )
+    if live_pages_out is not None:
+        live_pages_out[:batch_size].copy_(working)
 
 
 def _check_state_table(table: torch.Tensor, batch_size: int) -> None:
@@ -95,13 +101,16 @@ def verify_state_blocks(
     *,
     batch_size: int,
     pages_out: torch.Tensor,
+    live_pages_out: torch.Tensor | None = None,
 ) -> None:
     """Resolve the committed-state page each request's verify reads.
 
     Args:
         table: Group block table ``[>=batch_size, 2]``, dense inner.
         batch_size: Live requests.
-        pages_out: INT32 destination ``[>=batch_size]``.
+        pages_out: INT32 source-page destination ``[>=batch_size]``.
+        live_pages_out: Optional INT32 live-page destination of the same shape.
+            Omission resolves only the input pages.
     """
     enable_pdl = pdl_enabled()
     _check_state_table(table, batch_size)
@@ -114,12 +123,13 @@ def verify_state_blocks(
     if batch_size == 0:
         return
     if not table.is_cuda:
-        return _torch_verify_state_blocks(table, batch_size, pages_out)
+        return _torch_verify_state_blocks(table, batch_size, pages_out, live_pages_out)
 
     block = 256
     _verify_state_blocks_kernel[(triton.cdiv(batch_size, block),)](
         table,
         pages_out,
+        live_pages_out,
         batch_size,
         table.stride(0),
         BLOCK=block,

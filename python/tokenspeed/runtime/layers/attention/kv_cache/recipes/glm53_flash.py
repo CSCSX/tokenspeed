@@ -363,11 +363,9 @@ class Glm53FlashRecipe(CacheRecipe):
     def workspace_bytes(self) -> int:
         """Shared KPool tails plus the target's KDA verification staging."""
         tail_bytes = self.pool_options().workspace_bytes
-        width = self.attn_config.speculative_num_draft_tokens
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-            or width <= 1
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if self.server_args.disaggregation_mode == "prefill" or (
+            width == 1 and not self.replay_kda
         ):
             return tail_bytes
         return tail_bytes + kda_verify_workspace_bytes(
