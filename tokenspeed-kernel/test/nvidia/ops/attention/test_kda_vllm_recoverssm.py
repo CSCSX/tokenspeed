@@ -50,15 +50,19 @@ def _reference(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     state: torch.Tensor,
-    lower_bound: float,
+    lower_bound: float | None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     q32 = q.float()
     k32 = k.float()
     q32 *= torch.rsqrt(q32.square().sum(dim=-1, keepdim=True) + 1e-06)
     q32 *= q.shape[-1] ** (-0.5)
     k32 *= torch.rsqrt(k32.square().sum(dim=-1, keepdim=True) + 1e-06)
-    gate = lower_bound * torch.sigmoid(
-        A_log.exp()[None, None, :, None] * (raw_g.float() + dt_bias[None, None, :, :])
+    gate_input = raw_g.float() + dt_bias[None, None, :, :]
+    scale = A_log.exp()[None, None, :, None]
+    gate = (
+        lower_bound * torch.sigmoid(scale * gate_input)
+        if lower_bound is not None
+        else -scale * torch.nn.functional.softplus(gate_input)
     )
     beta = raw_beta.float().sigmoid()
     current = state.float().clone()
@@ -249,21 +253,24 @@ def test_record_chain_uses_verify_inputs() -> None:
 
 @pytest.mark.parametrize("batch", [4, 6, 8, 9, 16, 17, 32])
 @pytest.mark.parametrize("captured", [False, True])
-def test_recoverssm_ragged_prefix_and_null_rows(batch: int, captured: bool) -> None:
-    """Verify valid prefixes and preserve unwritten records in every value tile."""
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("record_start", [0, 2**32 - 2])
+def test_recoverssm_ragged_prefix_and_null_rows(
+    batch: int, captured: bool, dtype: torch.dtype, record_start: int
+) -> None:
+    """Verify record values, metadata-selected destinations, and masked rows."""
     torch.manual_seed(1209)
     lengths = ([4, 2, 0, 1, 3, 4] * ((batch + 5) // 6))[:batch]
     lengths[-1] = 4
+    full_lengths = lengths.copy()
     heads, dim, width = (12, 128, 4)
     starts_cpu = [0]
     for length in lengths:
         starts_cpu.append(starts_cpu[-1] + length)
     rows = starts_cpu[-1]
     shape = (1, rows, heads, dim)
-    q, k, v, g = (
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(4)
-    )
-    beta = torch.randn(1, rows, heads, device="cuda", dtype=torch.bfloat16)
+    q, k, v, g = (torch.randn(shape, device="cuda", dtype=dtype) for _ in range(4))
+    beta = torch.randn(1, rows, heads, device="cuda", dtype=dtype)
     A = torch.randn(heads, device="cuda") * 0.1
     bias = torch.randn(heads, dim, device="cuda") * 0.1
     state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
@@ -271,18 +278,23 @@ def test_recoverssm_ragged_prefix_and_null_rows(batch: int, captured: bool) -> N
     indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
     indices[-1] = 0
     starts = torch.tensor(starts_cpu, device="cuda", dtype=torch.int32)
-    u = torch.full((batch, heads, width, dim), float("nan"), device="cuda")
+    slots = batch + 2
+    u = torch.full((slots, heads, width, dim), float("nan"), device="cuda")
     kd = torch.full(
-        (batch, heads, width, 2 * dim),
+        (slots, heads, width, 2 * dim),
         float("nan"),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     out = torch.full_like(v, float("nan"))
-    metadata = torch.zeros(batch, 3, dtype=torch.int64, device="cuda")
-    metadata[:, 0] = torch.arange(batch, device="cuda")
-    metadata[:, 1] = 1
-    stamps = torch.full((batch, width, 2), -1, dtype=torch.int64, device="cuda")
+    records = [(request, 1, 0) for request in range(batch)]
+    if record_start:
+        records = [
+            (batch - 1 - request, 7 + request, record_start + request)
+            for request in range(batch)
+        ]
+    metadata = torch.tensor(records, dtype=torch.int64, device="cuda")
+    stamps = torch.full((slots, width, 2), -1, dtype=torch.int64, device="cuda")
     record_k = k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-06)
     record_v = v.float()
     record_d = torch.exp(
@@ -310,73 +322,109 @@ def test_recoverssm_ragged_prefix_and_null_rows(batch: int, captured: bool) -> N
             record_stamps=stamps,
         )
 
-    verify()
+    buffers = (u, kd, metadata, stamps, out, starts, indices)
+    addresses = [(tensor.data_ptr(), tensor.nbytes) for tensor in buffers]
+    initial_records = records
+    graph = None
     if captured:
+        verify()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             verify()
-        # Only replay writes may satisfy the checks below.
+    for round_index, live in enumerate((batch, max(1, batch // 2), batch)):
+        # Padded graphs retain their capacity while the live batch shrinks and grows.
+        lengths = [
+            length if request < live else 0
+            for request, length in enumerate(full_lengths)
+        ]
+        starts_cpu = [0]
+        for length in lengths:
+            starts_cpu.append(starts_cpu[-1] + length)
+        starts.copy_(torch.tensor(starts_cpu, dtype=torch.int32, device="cuda"))
+        records = [
+            (slot, generation + round_index, position + round_index * width)
+            for slot, generation, position in initial_records
+        ]
+        metadata.copy_(torch.tensor(records, dtype=torch.int64, device="cuda"))
         out.fill_(float("nan"))
         u.fill_(float("nan"))
         kd.fill_(float("nan"))
         stamps.fill_(-1)
-        graph.replay()
-    torch.testing.assert_close(state, initial, atol=0, rtol=0)
-    for request, length in enumerate(lengths):
-        begin, end = starts_cpu[request : request + 2]
-        if request == batch - 1:
-            torch.testing.assert_close(
-                out[:, begin:end], torch.zeros_like(out[:, begin:end]), atol=0, rtol=0
-            )
-            valid = 0
+        if graph is None:
+            verify()
         else:
-            valid = length
-            if length:
-                expected_out, _ = _reference(
-                    q[:, begin:end],
-                    k[:, begin:end],
-                    v[:, begin:end],
-                    g[:, begin:end],
-                    beta[:, begin:end],
-                    A,
-                    bias,
-                    initial[request + 1 : request + 2],
-                    -5.0,
-                )
+            graph.replay()
+        torch.testing.assert_close(state, initial, atol=0, rtol=0)
+        for request, length in enumerate(lengths):
+            begin, end = starts_cpu[request : request + 2]
+            slot, generation, position = records[request]
+            if request == batch - 1:
                 torch.testing.assert_close(
-                    out[:, begin:end].float(), expected_out, atol=2e-3, rtol=8e-3
+                    out[:, begin:end],
+                    torch.zeros_like(out[:, begin:end]),
+                    atol=0,
+                    rtol=0,
                 )
-                current = initial[request + 1].clone()
-                for offset in range(length):
-                    token = begin + offset
-                    key = record_k[0, token]
-                    decay = record_d[0, token]
-                    current = current * decay[:, None, :]
-                    correction = (
-                        record_v[0, token] - (current * key[:, None, :]).sum(-1)
-                    ) * beta[0, token].float().sigmoid()[:, None]
-                    torch.testing.assert_close(
-                        u[request, :, offset], correction, atol=1e-05, rtol=0.001
+                valid = 0
+            else:
+                valid = length
+                if length:
+                    expected_out, _ = _reference(
+                        q[:, begin:end],
+                        k[:, begin:end],
+                        v[:, begin:end],
+                        g[:, begin:end],
+                        beta[:, begin:end],
+                        A,
+                        bias,
+                        initial[request + 1 : request + 2],
+                        -5.0,
+                    )
+                    atol, rtol = (
+                        (2e-6, 1e-3) if dtype == torch.float16 else (2e-3, 8e-3)
                     )
                     torch.testing.assert_close(
-                        kd[request, :, offset, :dim], k[0, token], atol=0, rtol=0
+                        out[:, begin:end].float(), expected_out, atol=atol, rtol=rtol
                     )
-                    torch.testing.assert_close(
-                        kd[request, :, offset, dim:], g[0, token], atol=0, rtol=0
-                    )
-                    current = current + correction[:, :, None] * key[:, None, :]
-        assert torch.isnan(u[request, :, valid:]).all()
-        assert torch.isnan(kd[request, :, valid:]).all()
-        assert (stamps[request, valid:] == -1).all()
-        if valid:
-            torch.testing.assert_close(
-                stamps[request, :valid, 0],
-                torch.arange(valid, device="cuda", dtype=torch.int64),
-                atol=0,
-                rtol=0,
-            )
-            assert (stamps[request, :valid, 1] == 1).all()
+                    current = initial[request + 1].clone()
+                    for offset in range(length):
+                        token = begin + offset
+                        ring = (position + offset) % width
+                        key = record_k[0, token]
+                        decay = record_d[0, token]
+                        current = current * decay[:, None, :]
+                        correction = (
+                            record_v[0, token] - (current * key[:, None, :]).sum(-1)
+                        ) * beta[0, token].float().sigmoid()[:, None]
+                        torch.testing.assert_close(
+                            u[slot, :, ring], correction, atol=2e-6, rtol=2e-5
+                        )
+                        torch.testing.assert_close(
+                            kd[slot, :, ring, :dim], k[0, token], atol=0, rtol=0
+                        )
+                        torch.testing.assert_close(
+                            kd[slot, :, ring, dim:], g[0, token], atol=0, rtol=0
+                        )
+                        current = current + correction[:, :, None] * key[:, None, :]
+            unwritten = (position + torch.arange(valid, width, device="cuda")) % width
+            assert torch.isnan(u[slot, :, unwritten]).all()
+            assert torch.isnan(kd[slot, :, unwritten]).all()
+            assert (stamps[slot, unwritten] == -1).all()
+            if valid:
+                positions = position + torch.arange(
+                    valid, device="cuda", dtype=torch.int64
+                )
+                written = positions % width
+                torch.testing.assert_close(
+                    stamps[slot, written, 0], positions, atol=0, rtol=0
+                )
+                assert (stamps[slot, written, 1] == generation).all()
+        assert torch.isnan(out[:, starts_cpu[-1] :]).all()
+        assert torch.isnan(u[batch:]).all()
+        assert torch.isnan(kd[batch:]).all()
+        assert (stamps[batch:] == -1).all()
+        assert [(tensor.data_ptr(), tensor.nbytes) for tensor in buffers] == addresses
 
 
 @pytest.mark.parametrize("captured", [False, True])
@@ -604,13 +652,22 @@ def test_recoverssm_gate_recovery_across_layers(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("project_gate", [False, True])
+@pytest.mark.parametrize("with_conv_bias", [False, True])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
 @pytest.mark.parametrize("entry", ["split", "standalone"])
 def test_verify_derived_records_with_serving_producers(
-    batch: int, dtype: torch.dtype, width: int, project_gate: bool, entry: str
+    batch: int,
+    dtype: torch.dtype,
+    width: int,
+    project_gate: bool,
+    with_conv_bias: bool,
+    lower_bound: float | None,
+    entry: str,
 ) -> None:
     """Check producer records and each supported commit against an FP32 recurrence."""
     from tokenspeed_kernel.ops.attention.kda import (
         KdaReplayRecords,
+        kda_replay_payload_specs,
         kda_verify_conv_update,
         try_kda_fused_paged_verify,
     )
@@ -634,16 +691,31 @@ def test_verify_derived_records_with_serving_producers(
     a = torch.randn(heads, device="cuda") * 0.1
     bias = torch.randn(heads, dim, device="cuda") * 0.1
     indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
-    # Keep the existing projection/no-conv-bias case and cover raw gate with bias.
-    conv_bias = None if project_gate else torch.randn(3 * channels, **kwargs) * 0.05
+    conv_bias = torch.randn(3 * channels, **kwargs) * 0.05 if with_conv_bias else None
     gate = (
         torch.nn.functional.linear(fa, fb)
         if project_gate
         else torch.randn(rows, channels, **kwargs)
     )
-    captured = raw.clone()
+    if not project_gate:
+        # Exercise both sides of the softplus threshold and saturated gates.
+        gate.view(rows, heads, dim)[..., :8] = torch.tensor(
+            [-100.0, -20.0, -1.0, 0.0, 19.875, 20.125, 80.0, 100.0], **kwargs
+        )
+    payloads = tuple(
+        torch.empty((rows, channels), device="cuda", dtype=payload_dtype)
+        for channels, payload_dtype in kda_replay_payload_specs(
+            dtype,
+            conv_channels=3 * channels,
+            num_heads=heads,
+            head_dim=dim,
+            records=True,
+            raw_gate=False,
+        )
+    )
+    payloads[0].copy_(raw)
     qkv = kda_verify_conv_update(
-        raw,
+        payloads[0],
         conv_weights,
         conv_state,
         indices,
@@ -653,7 +725,8 @@ def test_verify_derived_records_with_serving_producers(
         recurrent_layout="v_major",
         bias=conv_bias,
     )
-    torch.testing.assert_close(captured, raw, atol=0, rtol=0)
+    torch.testing.assert_close(payloads[0], raw, atol=0, rtol=0)
+    torch.testing.assert_close(conv_state, initial_conv, atol=0, rtol=0)
     history = initial_conv[indices.long()].float().transpose(1, 2)
     sequence = torch.cat((history, raw.float().view(batch, width, -1)), dim=1)
     expected_conv = []
@@ -669,8 +742,8 @@ def test_verify_derived_records_with_serving_producers(
 
     state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
     initial_state = state.clone()
-    correction = torch.empty(batch, width, heads, dim, device="cuda").transpose(1, 2)
-    key_gate = torch.empty(batch, width, heads, 2 * dim, **kwargs).transpose(1, 2)
+    correction = payloads[1].view(batch, width, heads, dim).transpose(1, 2)
+    key_gate = payloads[2].view(batch, width, heads, 2 * dim).transpose(1, 2)
     slots = torch.arange(batch, device="cuda", dtype=torch.int64)
     starts = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * width
     positions = slots + width - 1
@@ -679,7 +752,7 @@ def test_verify_derived_records_with_serving_producers(
     q, k, v = (part.reshape(1, rows, heads, dim) for part in qkv.chunk(3, dim=-1))
     if entry == "split":
         out = try_kda_fused_paged_verify(
-            raw,
+            payloads[0],
             conv_weights,
             conv_state,
             torch.empty_like(conv_state),
@@ -695,7 +768,7 @@ def test_verify_derived_records_with_serving_producers(
             num_heads=heads,
             head_dim=dim,
             draft_token_num=width,
-            lower_bound=-5.0,
+            lower_bound=lower_bound,
             recurrent_layout="v_major",
             store_states=False,
             replay_records=KdaReplayRecords(
@@ -731,7 +804,7 @@ def test_verify_derived_records_with_serving_producers(
             query_start_loc=starts,
             state_indices=indices,
             spec_query_len=width,
-            lower_bound=-5.0,
+            lower_bound=lower_bound,
             out=torch.empty_like(v),
             record_metadata=metadata,
             record_stamps=stamps,
@@ -747,7 +820,7 @@ def test_verify_derived_records_with_serving_producers(
         a,
         bias,
         initial_state[1:],
-        -5.0,
+        lower_bound,
     )
     torch.testing.assert_close(
         out.reshape(shape), expected_out.to(dtype), atol=2e-6, rtol=rtol
@@ -756,12 +829,14 @@ def test_verify_derived_records_with_serving_producers(
     normalized_k = normalized_k * torch.rsqrt(
         normalized_k.square().sum(-1, keepdim=True) + 1e-6
     )
-    decay = torch.exp(
-        -5.0
-        * torch.sigmoid(
-            a.exp()[None, None, :, None] * (gate.float().view(shape) + bias)
-        )
+    gate_input = gate.float().view(shape) + bias
+    scale = a.exp()[None, None, :, None]
+    log_gate = (
+        lower_bound * torch.sigmoid(scale * gate_input)
+        if lower_bound is not None
+        else -scale * torch.nn.functional.softplus(gate_input)
     )
+    decay = log_gate.exp()
     recovered = initial_state[1:].clone()
     for token in range(width):
         ring = (positions + token) % width
@@ -813,11 +888,12 @@ def test_verify_derived_records_with_serving_producers(
                 spec_query_len=width,
                 record_metadata=metadata,
                 record_stamps=stamps,
-                gate_parameters=(a, bias, -5.0),
+                gate_parameters=(a, bias, lower_bound),
             )
             torch.testing.assert_close(
                 state[1:], expected_states[accepted_count - 1], atol=2e-6, rtol=2e-5
             )
+            torch.testing.assert_close(state[0], initial_state[0], atol=0, rtol=0)
 
 
 def _check_raw_ring_rounds(

@@ -2,6 +2,7 @@
 
 import os
 import sys
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -678,24 +679,30 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         _assert_committed_pages_equal(captured, eager, pages)
 
 
-@pytest.mark.parametrize("draft_tokens", [None, 1])
-def test_standard_decode_replay_workspace_matches_recipe(draft_tokens):
-    """Ordinary decode reserves the bytes used by its real replay buffers."""
+@pytest.mark.parametrize("draft_tokens", [None, 1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_standard_decode_replay_workspace_matches_recipe(draft_tokens, dtype):
+    """Decode and MTP reserve the bytes used by their real replay buffers."""
     harness = _Harness(draft_tokens=draft_tokens, eager_replay=True)
+    config = replace(harness.config, dtype=dtype)
+    backend = KdaAttnBackend(
+        config, config.components[0], enable_prefill_graph=False, kda_backend="auto"
+    )
+    backend.set_kv_pool(harness.pool)
+    backend.init_cuda_graph_state(config.max_bs)
     recipe = _kimi_recipe(
-        max_bs=harness.backend.max_bs,
-        speculative_algorithm=None,
+        max_bs=config.max_bs,
+        speculative_algorithm=None if harness.width == 1 else "EAGLE3",
         speculative_num_draft_tokens=draft_tokens,
     )
+    recipe.attn_config = replace(recipe.attn_config, dtype=dtype)
     planned_bytes = recipe.setup().fixed_workspace_bytes
-    allocated_bytes = harness.backend.preallocate_verify_workspace(
-        harness.backend.max_bs, 1
-    )
+    allocated_bytes = backend.preallocate_verify_workspace(config.max_bs, harness.width)
     assert planned_bytes == allocated_bytes
     _prepare_fixed_workspaces(
         server_args=recipe.server_args,
-        config=harness.config,
-        backend=harness.backend,
+        config=config,
+        backend=backend,
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
@@ -896,6 +903,7 @@ def test_rebinding_the_pool_commits_like_a_fresh_bind():
     replacement = _make_kimi_pool(DEV, usable_pages=24)
     rebound.backend.set_kv_pool(replacement)
     rebound.backend.init_cuda_graph_state(rebound.config.max_bs)
+    rebound.backend.preallocate_verify_workspace(rebound.config.max_bs, rebound.width)
     rebound.pool = replacement
     rebound.contract = replacement.arena.runtime_contract
     for round_index, accepted in enumerate(([0, T], [T, 2])):
@@ -1280,7 +1288,7 @@ def test_commit_plan_queued_table_updates_keep_each_round_pages(batch):
 @pytest.mark.parametrize("draft_tokens", [None, 1, 4])
 @pytest.mark.parametrize("captured", [False, True])
 def test_decode_records_commit_after_acceptance(draft_tokens, captured):
-    """T=1 and MTP keep live pages unchanged until the common commit hook."""
+    """Verify preserves live state; acceptance commits only the selected prefixes."""
     actual = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=431)
     eager = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=431)
     width = actual.width
@@ -1289,6 +1297,7 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
         speculative_num_draft_tokens=draft_tokens,
         speculative_algorithm=None if width == 1 else "EAGLE3",
     )
+    planned_bytes = recipe.workspace_bytes()
     _prepare_fixed_workspaces(
         server_args=recipe.server_args,
         config=actual.config,
@@ -1296,44 +1305,99 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
-        expected_bytes=recipe.workspace_bytes(),
+        expected_bytes=planned_bytes,
     )
-    batch, live = 4, 2
-    pages = {
-        group: [2 + index * live + row for row in range(live)]
+
+    def workspace_tensors():
+        backend = actual.backend
+        return tuple(
+            tensor
+            for tensor in (
+                *backend._replay_payloads,
+                backend._replay_descriptors,
+                backend._replay_group_indices,
+                backend._replay_commit_tables,
+                backend._replay_commit_reads,
+                backend._replay_commit_pages,
+                backend._replay_commit_steps,
+                backend._replay_record_metadata,
+                backend._replay_record_stamps,
+                *(pair[0] for pair in backend._verify_scratch.values()),
+                *backend.query_start_loc_list,
+            )
+            if tensor is not None
+        )
+
+    # Retain the allocations so a replacement cannot reuse their addresses.
+    initial_workspace = workspace_tensors()
+    workspace_storage = [
+        (tensor.data_ptr(), tensor.nbytes) for tensor in initial_workspace
+    ]
+    batch_sizes = (4, 8, 3, 4)
+    live_counts = (2, 1, 3, 2)
+    max_live = max(live_counts)
+    all_pages = {
+        group: [2 + index * max_live + row for row in range(max_live)]
         for index, group in enumerate(_STATE_GROUPS)
     }
-    lengths = [8 + width] * live
-    stable_inputs = actual.inputs(batch, 432)
+    all_lengths = [8 + width] * max_live
+    stable_inputs = actual.inputs(actual.config.max_bs, 432)
 
+    def assert_live_state_unchanged(snapshots):
+        for (layer, component), snapshot in snapshots.items():
+            torch.testing.assert_close(
+                actual.pool.get_component(layer, component), snapshot, atol=0, rtol=0
+            )
+
+    before = {
+        (layer, component): actual.pool.get_component(layer, component).clone()
+        for layer in actual.layer_ids
+        for component in ("conv_state", "recurrent_state")
+    }
     # Bind layer descriptors before capture, as serving warmup does.
-    actual.prepare_metadata([0, 1], pages, lengths)
-    actual.forward(actual.inputs(live, 433), live)
-    actual.backend.init_forward_metadata_capture_cuda_graph(
-        batch,
-        torch.arange(batch, dtype=torch.int32, device=DEV),
-        torch.full((batch,), 8 + width, dtype=torch.int32, device=DEV),
-        ForwardMode.DECODE,
-    )
-    graph = None
+    actual.prepare_metadata(list(range(max_live)), all_pages, all_lengths)
+    actual.forward(actual.inputs(max_live, 433), max_live)
+    assert_live_state_unchanged(before)
+    graphs = {}
     if captured:
         stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            actual.forward(stable_inputs, batch)
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            outputs = actual.forward(stable_inputs, batch)
+        for batch in dict.fromkeys(batch_sizes):
+            actual.backend.init_forward_metadata_capture_cuda_graph(
+                batch,
+                torch.arange(batch, dtype=torch.int32, device=DEV),
+                torch.full((batch,), 8 + width, dtype=torch.int32, device=DEV),
+                ForwardMode.DECODE,
+            )
+            capture_inputs = {
+                name: value[: batch * width] for name, value in stable_inputs.items()
+            }
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                actual.forward(capture_inputs, batch)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            assert_live_state_unchanged(before)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs = actual.forward(capture_inputs, batch)
+            graphs[batch] = graph, outputs
+            assert_live_state_unchanged(before)
+    assert [
+        (tensor.data_ptr(), tensor.nbytes) for tensor in workspace_tensors()
+    ] == workspace_storage
 
-    for round_index in range(3):
+    for round_index, (batch, live) in enumerate(
+        zip(batch_sizes, live_counts, strict=True)
+    ):
         if round_index:
-            pages = {group: ids[::-1] for group, ids in pages.items()}
-            lengths.reverse()
+            all_pages = {group: ids[::-1] for group, ids in all_pages.items()}
+            all_lengths.reverse()
+        pages = {group: ids[:live] for group, ids in all_pages.items()}
+        lengths = all_lengths[:live]
+        rpis = list(reversed(range(live)))
         inputs = actual.inputs(batch, 440 + round_index)
         live_inputs = {name: value[: live * width] for name, value in inputs.items()}
-        counts = [1, width - round_index % width]
+        counts = [1 + (round_index + row) % width for row in range(live)]
         expected = _reference_committed_states(eager, pages, live_inputs, counts)
         tables = {
             group: np.asarray([[0, page] for page in ids], dtype=np.int32)
@@ -1342,7 +1406,7 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
         actual.backend.refresh_decode_metadata(
             batch,
             live,
-            torch.tensor([1, 0], dtype=torch.int32, device=DEV),
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
             torch.tensor(lengths, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
             for_graph_replay=captured,
@@ -1354,17 +1418,31 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
             for component in ("conv_state", "recurrent_state")
         }
         for name, value in inputs.items():
-            stable_inputs[name].copy_(value)
-        if graph is not None:
-            graph.replay()
-        else:
-            outputs = actual.forward(stable_inputs, batch)
-        for (layer, component), snapshot in before.items():
-            torch.testing.assert_close(
-                actual.pool.get_component(layer, component), snapshot, atol=0, rtol=0
-            )
+            stable_inputs[name][: batch * width].copy_(value)
+        first_outputs = None
+        for _ in range(2):
+            if captured:
+                graph, outputs = graphs[batch]
+                graph.replay()
+            else:
+                outputs = actual.forward(
+                    {
+                        name: value[: batch * width]
+                        for name, value in stable_inputs.items()
+                    },
+                    batch,
+                )
+            assert_live_state_unchanged(before)
+            live_outputs = [
+                output.reshape(-1, KEY_DIM)[: live * width] for output in outputs
+            ]
+            if first_outputs is None:
+                first_outputs = [output.clone() for output in live_outputs]
+            else:
+                for output, previous in zip(live_outputs, first_outputs, strict=True):
+                    torch.testing.assert_close(output, previous, atol=0, rtol=0)
 
-        eager.prepare_metadata([1, 0], pages, lengths)
+        eager.prepare_metadata(rpis, pages, lengths)
         eager_outputs = eager.forward(live_inputs, live)
         for output, reference in zip(outputs, eager_outputs, strict=True):
             torch.testing.assert_close(
@@ -1383,6 +1461,11 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
             root.commit_state_after_acceptance(
                 accepted, num_extends=0, accepted_path=None
             )
+        # State groups share physical planes, so a view includes the other
+        # groups' pages. Exclude all accepted destinations from the guard.
+        destination_pages = [
+            page for group_pages in pages.values() for page in group_pages
+        ]
         for layer, (state, conv) in expected.items():
             ids = pages[actual.pool.state_group_by_layer[layer]]
             torch.testing.assert_close(
@@ -1398,13 +1481,29 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
                 rtol=0,
             )
             for component in ("conv_state", "recurrent_state"):
+                committed = actual.pool.get_component(layer, component)
+                untouched = torch.ones(committed.shape[0], device=DEV, dtype=torch.bool)
+                untouched[destination_pages] = False
                 torch.testing.assert_close(
-                    actual.pool.get_component(layer, component),
+                    committed[untouched],
+                    before[layer, component][untouched],
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    committed,
                     eager.pool.get_component(layer, component),
                     atol=0,
                     rtol=0,
                 )
-        lengths = [length + count for length, count in zip(lengths, counts)]
+        assert [
+            (tensor.data_ptr(), tensor.nbytes) for tensor in workspace_tensors()
+        ] == workspace_storage
+        assert (
+            actual.backend.preallocate_verify_workspace(actual.config.max_bs, width)
+            == planned_bytes
+        )
+        all_lengths[:live] = [length + count for length, count in zip(lengths, counts)]
 
 
 @pytest.mark.parametrize("width", [1, 4])

@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.kda import (
 )
 from tokenspeed_kernel.ops.attention.kda import (
     kda_replay_commit_supported,
+    kda_replay_payload_specs,
     kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
@@ -302,7 +303,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         )
 
     def _allocate_replay_workspace(self) -> None:
-        """Allocate target decode records when the planned workspace is bound."""
+        """Allocate max_bs * T payload rows before eager or graph execution.
+
+        Batch refreshes reuse these buffers; binding a pool resets them.
+        """
         if self._replay_payloads is not None:
             return
         rows = self.max_bs * self.speculative_num_draft_tokens
@@ -337,40 +341,20 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 }
             hv, head_dim = first_ssm.shape[1:3]
             payload_shape = (len(layer_ids), rows)
-            self._replay_payloads = (
+            self._replay_payloads = tuple(
                 torch.empty(
-                    (*payload_shape, first_conv.shape[1]),
-                    dtype=self.dtype,
+                    (*payload_shape, channels),
+                    dtype=payload_dtype,
                     device=self.device,
-                ),
-                torch.empty(
-                    (
-                        *payload_shape,
-                        hv * head_dim if self._verify_split_producers else head_dim,
-                    ),
-                    dtype=(
-                        torch.float32 if self._verify_split_producers else self.dtype
-                    ),
-                    device=self.device,
-                ),
-                torch.empty(
-                    (
-                        *payload_shape,
-                        2 * hv * head_dim if self._verify_split_producers else hv,
-                    ),
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                torch.empty(
-                    (
-                        *payload_shape,
-                        0 if self._verify_split_producers else hv * head_dim,
-                    ),
-                    dtype=(
-                        torch.bfloat16 if self._replay_uses_raw_gate else torch.float32
-                    ),
-                    device=self.device,
-                ),
+                )
+                for channels, payload_dtype in kda_replay_payload_specs(
+                    self.dtype,
+                    conv_channels=first_conv.shape[1],
+                    num_heads=hv,
+                    head_dim=head_dim,
+                    records=self._verify_split_producers,
+                    raw_gate=self._replay_uses_raw_gate,
+                )
             )
             self._replay_descriptors = addresses
             self._replay_group_indices = group_indices
@@ -870,6 +854,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         head_v_dim: int,
         lower_bound: float | None,
     ) -> torch.Tensor | None:
+        """Keep live state read-only; acceptance commits the selected prefix."""
         if self._replay_active:
             if not self._verify_split_producers and (
                 f_a_out is None or bias is not None
@@ -915,7 +900,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     consumer_stream = torch.cuda.current_stream()
                     g_raw.record_stream(consumer_stream)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
-                # NVIDIA saves FP32 corrections and BF16 unnormalized K/raw gates.
+                # Records hold FP32 corrections and activation-dtype K/raw gates.
                 # Request rows, not pool block IDs, size the per-round cache.
                 assert self._replay_record_metadata is not None
                 assert self._replay_record_stamps is not None

@@ -128,6 +128,45 @@ class KdaReplayRecords:
     query_start_loc: torch.Tensor
 
 
+def kda_replay_payload_specs(
+    dtype: torch.dtype,
+    *,
+    conv_channels: int,
+    num_heads: int,
+    head_dim: int,
+    records: bool,
+    raw_gate: bool,
+) -> tuple[tuple[int, torch.dtype], ...]:
+    """Describe per-token replay buffers for allocation and workspace budgeting.
+
+    Args:
+        dtype: Activation dtype, also used for saved K and raw gate records.
+        conv_channels: Width of the original QKV input to convolution.
+        num_heads: Number of recurrent state heads on this rank.
+        head_dim: Recurrent head dimension and low-rank gate input width.
+        records: Whether verify saves correction U and K/raw gate records.
+        raw_gate: Whether raw-input replay retains the projected gate in BF16.
+
+    Returns:
+        Four (channels, dtype) entries in payload order. The first retains
+        original QKV. Records use FP32 U, activation-dtype K/raw gate, and an
+        empty fourth buffer. Raw-input replay uses low-rank gate input, beta,
+        and gate scratch instead. Callers prepend layer and token capacities.
+    """
+    return (
+        (conv_channels, dtype),
+        (
+            num_heads * head_dim if records else head_dim,
+            torch.float32 if records else dtype,
+        ),
+        (2 * num_heads * head_dim if records else num_heads, dtype),
+        (
+            0 if records else num_heads * head_dim,
+            torch.bfloat16 if raw_gate else torch.float32,
+        ),
+    )
+
+
 def kda_recurrent_layout() -> str:
     """Return the recurrent state layout this platform's KDA kernels consume.
 
@@ -844,6 +883,7 @@ import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 __all__ = [
     "KdaPrefillResult",
+    "kda_replay_payload_specs",
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",

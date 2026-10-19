@@ -20,8 +20,6 @@
 
 """KDA verify workspace shared by the Kimi-K3 and GLM cache recipes."""
 
-import torch
-
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -87,6 +85,7 @@ def kda_verify_workspace_bytes(
         kda_batched_replay_uses_raw_gate,
         kda_fused_paged_verify_uses_split_producers,
         kda_recurrent_layout,
+        kda_replay_payload_specs,
     )
 
     linear = config.component(LinearAttnConfig)
@@ -109,19 +108,17 @@ def kda_verify_workspace_bytes(
         if raw_gate
         else config.max_bs * sum(field.payload_bytes for field in conv_fields)
     )
-    row_bytes = (linear.conv_state_shape[0] + head_dim + heads) * config.dtype.itemsize
-    row_bytes += (
-        heads
-        * head_dim
-        * (torch.bfloat16.itemsize if raw_gate else torch.float32.itemsize)
-    )
-    if records:
-        # Raw QKV retains the accepted convolution window. Records store
-        # FP32 U and activation-dtype unnormalized K/raw gate.
-        row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
-        row_bytes += (
-            heads * head_dim * (torch.float32.itemsize + 2 * config.dtype.itemsize)
+    row_bytes = sum(
+        channels * payload_dtype.itemsize
+        for channels, payload_dtype in kda_replay_payload_specs(
+            config.dtype,
+            conv_channels=linear.conv_state_shape[0],
+            num_heads=heads,
+            head_dim=head_dim,
+            records=records,
+            raw_gate=raw_gate,
         )
+    )
     group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
     metadata_bytes = len(conv_fields) * (10 * 8 + 4)
     metadata_bytes += group_count * 4 * 8

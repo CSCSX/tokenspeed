@@ -1043,6 +1043,7 @@ def fused_kda_verify_conv_update(
         read_indices: ``[N]`` committed page per request (-1 = fresh).
         num_heads/head_dim: Per-rank head geometry (P = num_heads*head_dim).
         draft_token_num: Draft positions per request (T).
+        bias: Optional ``[3*P]`` convolution bias added before SiLU.
         out: Optional ``[N*T, 3*P]`` output tensor in the input dtype.
         block_c: Number of feature channels handled by each program.
         num_warps: Number of warps used by each program.
