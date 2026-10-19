@@ -35,6 +35,9 @@ from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
 )
 
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
+_DENSE_HALF_SIGNATURES = format_signatures(
+    ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+)
 
 
 def _use_tensor_cores_for_commit(
@@ -56,7 +59,7 @@ def _use_tensor_cores_for_commit(
     name="vllm_triton_kda_recoverssm_verify",
     solution="vllm_triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
+    signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.REFERENCE,
     traits={
         "paged_state": frozenset({True}),

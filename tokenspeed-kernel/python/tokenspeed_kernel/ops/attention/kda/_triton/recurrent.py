@@ -1035,13 +1035,15 @@ def fused_kda_verify_conv_update(
     """Compute verify conv1d(+silu) rows from committed convolution state.
 
     Args:
-        qkv_raw: ``[N*T, 3*P]`` bf16 pre-conv packed q|k|v, request-major.
-        conv_w: ``[3*P, 4]`` contiguous bf16 convolution tap bank.
-        conv_pool: ``[pages, 3*P, 3]`` bf16 committed state (read-only).
+        qkv_raw: ``[N*T, 3*P]`` FP16/BF16 pre-conv packed q|k|v, request-major.
+        conv_w: ``[3*P, 4]`` contiguous convolution taps in the input dtype.
+        conv_pool: ``[pages, 3*P, 3]`` committed state (read-only), in the
+            input dtype or BF16 for FP16 inputs. History and current inputs
+            are converted independently to FP32 for convolution.
         read_indices: ``[N]`` committed page per request (-1 = fresh).
         num_heads/head_dim: Per-rank head geometry (P = num_heads*head_dim).
         draft_token_num: Draft positions per request (T).
-        out: Optional ``[N*T, 3*P]`` bf16 output tensor.
+        out: Optional ``[N*T, 3*P]`` output tensor in the input dtype.
         block_c: Number of feature channels handled by each program.
         num_warps: Number of warps used by each program.
 
@@ -1057,8 +1059,8 @@ def fused_kda_verify_conv_update(
     N = total // T
     if qkv_raw.shape != (total, C) or qkv_raw.stride(-1) != 1:
         raise ValueError(f"qkv_raw must have shape [{total}, {C}] and last stride 1")
-    if qkv_raw.dtype != torch.bfloat16:
-        raise ValueError(f"qkv_raw must have dtype torch.bfloat16, got {qkv_raw.dtype}")
+    if qkv_raw.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"qkv_raw must have dtype FP16 or BF16, got {qkv_raw.dtype}")
     if conv_w.shape != (C, 4) or not conv_w.is_contiguous():
         raise ValueError(f"conv_w must be contiguous with shape [{C}, 4]")
     if conv_w.dtype != qkv_raw.dtype:
@@ -1071,9 +1073,10 @@ def fused_kda_verify_conv_update(
         )
     if conv_pool.stride(-1) != 1 or conv_pool.stride(-2) != 3:
         raise ValueError("conv_pool feature and tap dimensions must be contiguous")
-    if conv_pool.dtype != qkv_raw.dtype:
+    if conv_pool.dtype not in (qkv_raw.dtype, torch.bfloat16):
         raise ValueError(
-            f"conv_pool must have dtype {qkv_raw.dtype}, got {conv_pool.dtype}"
+            f"conv_pool must have dtype {qkv_raw.dtype} or torch.bfloat16, "
+            f"got {conv_pool.dtype}"
         )
     if read_indices.ndim != 1 or read_indices.numel() != N:
         raise ValueError(f"read_indices must have shape [{N}]")

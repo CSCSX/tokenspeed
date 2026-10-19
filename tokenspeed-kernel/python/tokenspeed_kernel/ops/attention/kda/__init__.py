@@ -518,7 +518,7 @@ def kda_fused_paged_verify_uses_split_producers(
     num_heads: int,
     head_dim: int,
 ) -> bool:
-    """Whether the selected verify implementation accepts split producers.
+    """Whether serving can pair split-producer verify with batched recovery.
 
     Args:
         dtype: Activation dtype used to resolve the registered kernel.
@@ -529,7 +529,8 @@ def kda_fused_paged_verify_uses_split_producers(
 
     Returns:
         True when the selected implementation accepts precomputed convolution
-        and gate tensors.
+        and gate tensors and its dtype has a batched recovery kernel. Direct
+        kernel callers can exercise verify before serving recovery is available.
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
@@ -547,9 +548,15 @@ def kda_fused_paged_verify_uses_split_producers(
     except NoKernelFoundError:
         return False
     registered = KernelRegistry.get().get_by_name(kernel.name)
-    return bool(
-        registered is not None
-        and registered.traits.get("split_producers") == frozenset({True})
+    if registered is None or registered.traits.get("split_producers") != frozenset(
+        {True}
+    ):
+        return False
+    # The backend and workspace recipe must make the same records decision.
+    # Otherwise verify can produce records that commit cannot consume.
+    return (
+        resolve_kda_batched_replay_commit(dtype, num_heads=num_heads, head_dim=head_dim)
+        is not None
     )
 
 

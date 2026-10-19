@@ -22,7 +22,7 @@ from tokenspeed_kernel.signature import format_signatures
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
-# Descriptor addresses are dereferenced as bf16, so registrations exclude fp16.
+# Batched recovery still dereferences descriptor addresses as BF16.
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
 
@@ -198,7 +198,7 @@ def _nvidia_fused_verify(
     name="triton_nvidia_kda_verify_conv_update",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
+    signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
@@ -358,9 +358,8 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     name="triton_nvidia_kda_fused_paged_verify_split",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
-    # Outranks the inline-producer twin so bf16 gets it without asking; fp16
-    # is filtered out by signature and falls back to that twin.
+    signatures=_DENSE_HALF_SIGNATURES,
+    # Serving enables this producer arrangement only with compatible recovery.
     priority=Priority.SPECIALIZED + 1,
     traits={
         "paged_state": frozenset({True}),
