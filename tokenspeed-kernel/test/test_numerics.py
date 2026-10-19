@@ -319,6 +319,32 @@ def test_bmm_input_generator_supports_scaled_fp8_channel_scales() -> None:
     assert inputs["block_size"] is None
 
 
+def test_gemm_generator_stores_b_column_major_when_the_kernel_requires_it() -> None:
+    signature = format_signature(
+        a=dense_tensor_format(torch.bfloat16), b=dense_tensor_format(torch.bfloat16)
+    )
+
+    def generate(traits: dict) -> dict:
+        generator = get_input_generator(
+            "gemm",
+            "mm",
+            dtype=torch.bfloat16,
+            traits=traits,
+            format_signature=signature,
+            device="cpu",
+        )
+        return generator.generate(M=4, N=64, K=32)
+
+    row_major = generate({"b_layout": frozenset({"KN"})})["B"]
+    column_major = generate(
+        {"b_layout": frozenset({"KN"}), "b_inner_stride_one": frozenset({False})}
+    )["B"]
+    assert row_major.shape == column_major.shape == (32, 64)
+    assert row_major.stride(-1) == 1
+    assert column_major.stride() == (1, 32)
+    assert torch.equal(row_major, column_major)
+
+
 def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
     tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
     channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
@@ -357,7 +383,7 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
     registry.register(test_spec, lambda **_kwargs: None)
 
     signature, reference = _verification_signature_and_reference(
-        registry, test_spec, _fp8_dtype, "a"
+        test_spec, _fp8_dtype, "a"
     )
 
     assert signature == tensor_signature
@@ -381,7 +407,7 @@ class TestNumericsVerification:
                 if spec.solution == "deep_gemm":
                     continue
                 _, reference = _verification_signature_and_reference(
-                    registry, spec, dtype, dtype_role
+                    spec, dtype, dtype_role
                 )
                 if reference is None:
                     continue
