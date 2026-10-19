@@ -1605,6 +1605,18 @@ class TestSelectReference:
         spec = KernelRegistry.get().get_by_name("triton_ref_mm")
         assert select_reference(spec, GEMM_BF16, traits=None) is None
 
+    def test_a_top_ranked_kernel_takes_the_next_triton_kernel(self):
+        _register("triton_fast_mm", "triton", Priority.PERFORMANT)
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        spec = KernelRegistry.get().get_by_name("triton_fast_mm")
+        assert select_reference(spec, GEMM_BF16, traits=None)() == "triton_ref_mm"
+
+    def test_the_only_torch_kernel_takes_a_triton_reference(self):
+        _register("torch_ref_mm", "torch", Priority.REFERENCE)
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        spec = KernelRegistry.get().get_by_name("torch_ref_mm")
+        assert select_reference(spec, GEMM_BF16, traits=None)() == "triton_ref_mm"
+
     def test_overrides_do_not_redirect_the_reference(self):
         _register("torch_ref_mm", "torch", Priority.REFERENCE)
         _register("gluon_mm", "gluon", Priority.SPECIALIZED)

@@ -422,11 +422,13 @@ def _match_candidates(
     traits: dict[str, Any] | None,
     solution: str | None,
     ignore_layout: bool,
+    exclude: str | None,
 ) -> tuple[list[KernelSpec], list[KernelSpec], str | None]:
     """Kernels matching a request, before and after trait filtering.
 
     The ``"reference"`` meta solution takes the first of
-    ``REFERENCE_SOLUTIONS`` with a kernel passing every filter.
+    ``REFERENCE_SOLUTIONS`` with a kernel passing every filter. The kernel
+    named ``exclude`` never matches.
 
     Returns:
         ``(matched, eligible, resolved)``: the kernels matching platform,
@@ -445,6 +447,7 @@ def _match_candidates(
             solution=resolved,
             ignore_layout=ignore_layout,
         )
+        matched = [spec for spec in matched if spec.name != exclude]
         eligible = _filter_by_traits(matched, traits) if traits else matched
         if eligible:
             return matched, eligible, resolved
@@ -652,6 +655,7 @@ def select_kernel(
         traits=traits,
         solution=solution,
         ignore_layout=ignore_layout,
+        exclude=None,
     )
     registry.cache_put(cache_key, result)
     return result
@@ -668,8 +672,10 @@ def _select_ranked(
     traits: dict[str, Any] | None,
     solution: str | None,
     ignore_layout: bool,
+    exclude: str | None,
 ) -> SelectedKernel:
-    """The best-ranked kernel matching a request; overrides do not apply."""
+    """The best-ranked kernel matching a request, other than the one named
+    ``exclude``; overrides do not apply."""
     matched, candidates, _ = _match_candidates(
         registry,
         family,
@@ -680,6 +686,7 @@ def _select_ranked(
         traits=traits,
         solution=solution,
         ignore_layout=ignore_layout,
+        exclude=exclude,
     )
 
     solution_clause = f" with solution {solution!r}" if solution else ""
@@ -729,8 +736,9 @@ def select_reference(
     solution for ``spec``'s operator and ``format_signature``, requiring every
     trait ``spec`` declares, so the reference accepts any input ``spec``
     does, plus the call's ``traits`` (such as problem-shape traits).
-    Overrides do not apply: an override naming the kernel under test would
-    make it its own reference.
+    The kernel under test is never a candidate, so when it would rank first
+    the next-best reference is taken. Overrides do not apply: an override
+    naming the kernel under test would make it its own reference.
 
     Args:
         spec: The kernel under test.
@@ -739,8 +747,8 @@ def select_reference(
         platform: Hardware to match (auto-detected if None).
 
     Returns:
-        The selected reference, or None when no reference matches or the
-        selection is ``spec`` itself.
+        The selected reference, or None when no kernel other than ``spec``
+        matches.
     """
     registry = KernelRegistry.get()
     try:
@@ -754,10 +762,11 @@ def select_reference(
             traits={**spec.traits, **(traits or {})},
             solution=REFERENCE_SOLUTION,
             ignore_layout=False,
+            exclude=spec.name,
         )
     except NoKernelFoundError:
         return None
-    return None if selected.name == spec.name else selected
+    return selected
 
 
 def _autotune_select(
@@ -871,6 +880,7 @@ def explain_selection(
         traits=traits,
         solution=solution,
         ignore_layout=False,
+        exclude=None,
     )
 
     scored = _rank(candidates, platform, traits)
