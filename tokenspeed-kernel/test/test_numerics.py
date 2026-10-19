@@ -25,6 +25,7 @@ import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
 from tokenspeed_kernel.numerics.gemm import tolerance as gemm_tolerance
 from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.torch.gemm import (
     torch_bmm_fp8_blockscale,
@@ -38,7 +39,14 @@ from tokenspeed_kernel.numerics.verify import (
     verify_kernel,
 )
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    Priority,
+    load_builtin_kernels,
+    register_kernel,
+)
+from tokenspeed_kernel.selection import NoKernelFoundError
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
@@ -343,6 +351,38 @@ def test_gemm_generator_stores_b_column_major_when_the_kernel_requires_it() -> N
     assert row_major.stride(-1) == 1
     assert column_major.stride() == (1, 32)
     assert torch.equal(row_major, column_major)
+
+
+def _register_mm(name: str, solution: str, priority: int) -> None:
+    register_kernel(
+        "gemm",
+        "mm",
+        name=name,
+        solution=solution,
+        signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        priority=priority,
+    )(lambda: name)
+
+
+def test_reference_kernel_checks_the_dispatched_kernel(fresh_registry) -> None:
+    _register_mm("gluon_mm", "gluon", Priority.SPECIALIZED)
+    _register_mm("triton_mm", "triton", Priority.PORTABLE)
+    _register_mm("torch_mm", "torch", Priority.REFERENCE)
+    signature = next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
+
+    def reference(kernel: str | None) -> str:
+        return reference_kernel("gemm", "mm", signature, traits=None, kernel=kernel)()
+
+    assert reference(None) == "torch_mm"
+    # The torch kernel under test is checked against the Triton one.
+    assert reference("torch_mm") == "triton_mm"
+
+
+def test_reference_kernel_refuses_a_kernel_without_reference(fresh_registry) -> None:
+    _register_mm("gluon_mm", "gluon", Priority.SPECIALIZED)
+    signature = next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
+    with pytest.raises(NoKernelFoundError, match="No reference for 'gluon_mm'"):
+        reference_kernel("gemm", "mm", signature, traits=None, kernel=None)
 
 
 def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
