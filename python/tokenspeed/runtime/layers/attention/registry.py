@@ -77,6 +77,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
 )
 from tokenspeed.runtime.layers.attention.utils import (
+    check_probe_cache_fits,
     profile_available_cache_memory_bytes,
     reserve_cache_budget,
 )
@@ -288,6 +289,8 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3NextN",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -1310,6 +1313,8 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
+    if probe_batch_rows is not None:
+        check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
     spec = cache_setup.spec
     if config.kvp_size > 1 and target.is_hybrid_linear:
         _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
