@@ -36,11 +36,22 @@ also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
 model-specific head layouts, route packets, or normalization semantics stay in
 the model package, along with dispatch and capacities.
 
-Muse Spark prepares its collectives for TP4/EP4, TP8/EP8, or TP8/EP1 on gfx950.
-Both EP topologies keep the same global token cutoffs for Lamport, push, pull, and
-owned-row paths. Owned rows use ceil(global rows / world size), with padded
-rows masked; QKVG exchange derives each rank's head widths from the group size.
-TP8/EP1 reduces raw route partials before normalization. Its model-private
+Muse Spark prepares its collectives for TP4/EP4, TP8/EP8, or expert TP on gfx950.
+Pure expert TP and EP share the owned-row and QKVG token thresholds; full-row
+reductions retain their payload-based protocol policies. Owned rows use
+ceil(global rows / world size), with
+padded rows masked; QKVG exchange derives each rank's head widths from the group
+size. Expert TP reduce-scatters complete groups of eight raw routes to token
+owners before normalization and weighted combination. Its separate prepared
+route state owns symmetric input staging, local output scratch, and completion
+flags; it does not enlarge the attention producer or gather buffers. All peer
+reads finish before input reuse, and the local norm consumes borrowed output
+before the next route reduction. Pool/unpool, the residual boundary, and the
+next attention input remain on owned rows; QKVG exchange restores head sharding.
+
+Full-row expert TP reduces raw route partials before normalization. Oversized
+ordinary payloads use consecutive capacity-bounded Iris reductions, preserving
+the prepared addresses and the existing fallback for excluded policies. Its model-private
 `reduce_borrowed` reads ordinary canonical rows and returns a borrowed gather
 or push output; the per-route norm consumes it on the same stream before any
 projection or collective reuses the storage. Generic all-reduce outputs keep

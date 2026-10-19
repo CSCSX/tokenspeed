@@ -157,7 +157,7 @@ def _muse_all_reduce(
             tensor.dtype == torch.bfloat16
             and tensor.device == iris.all_reduce.device
             and tensor.is_contiguous()
-            and 0 < tensor.numel() <= iris.all_reduce.producer_direct_max_numel
+            and tensor.numel() > 0
             and tensor.numel() % (iris.world_size * 8) == 0
         ):
             results.append(iris.reduce(tensor))
@@ -710,10 +710,10 @@ class MuseSparkAttention(nn.Module):
                 layer_id > 0
                 and current_platform().is_cdna4
                 and mapping.pp_size == 1
-                and mapping.attn.tp_size == mapping.moe.ep_size
+                and mapping.attn.tp_size == mapping.moe.tp_ep_size
                 and mapping.attn.tp_size in (4, 8)
-                and mapping.moe.tp_size == 1
-                and mapping.attn.tp_group == mapping.moe.ep_group
+                and (mapping.moe.tp_size == 1 or mapping.moe.ep_size == 1)
+                and mapping.attn.tp_group == mapping.moe.tp_ep_group
                 and config.hidden_size == 8192
                 and config.num_attention_heads == 128
                 and config.num_key_value_heads == 16
@@ -1140,9 +1140,19 @@ class MuseSparkMoE(nn.Module):
         norm = self.post_expert_norm
         iris = self.iris_state
         if self.tp_size > 1:
-            assert not owned_rows and norm.weight is not None
+            assert norm.weight is not None
             width = norm.weight.shape[0]
-            if route_map is not None:
+            if owned_rows:
+                assert iris is not None and iris.tp_routes is not None
+                routes = iris.tp_routes.run(routes, route_map, num_tokens)
+                num_tokens = routes.shape[0]
+                first = iris.all_reduce.rank_in_group * num_tokens
+                route_weights = route_weights[first : first + num_tokens]
+                if route_weights.shape[0] < num_tokens:
+                    route_weights = torch.nn.functional.pad(
+                        route_weights, (0, 0, 0, num_tokens - route_weights.shape[0])
+                    )
+            elif route_map is not None:
                 output = _acquire_all_reduce_output(
                     (num_tokens * self.topk, width), routes, self.tp_group
                 )
@@ -1160,11 +1170,12 @@ class MuseSparkMoE(nn.Module):
                 )
             # Each TP rank contributes only its intermediate-column slice.
             # RMSNorm must see the complete route before top-k weighting.
-            routes = routes.reshape(num_tokens * self.topk, width)
-            if iris is not None and iris.can_reduce_borrowed(routes):
-                routes = iris.reduce_borrowed(routes)
-            else:
-                (routes,) = _muse_all_reduce(iris, (routes,), self.tp_group)
+            if not owned_rows:
+                routes = routes.reshape(num_tokens * self.topk, width)
+                if iris is not None and iris.can_reduce_borrowed(routes):
+                    routes = iris.reduce_borrowed(routes)
+                else:
+                    (routes,) = _muse_all_reduce(iris, (routes,), self.tp_group)
             # Consume borrowed collective storage before the next projection.
             return routed_input_scale_rmsnorm_sum(
                 routes.reshape(num_tokens, self.topk, width),
@@ -1388,7 +1399,10 @@ class MuseSparkMoE(nn.Module):
                 compressed = self.pre_expert_proj.forward_owned_rows(
                     hidden_states, output
                 )
-                if self.expert_quant_kind == "mxfp4":
+                if (
+                    self.expert_quant_kind == "mxfp4"
+                    and self.experts.supports_prequantized_input
+                ):
                     compressed_quantized = rmsnorm_mxfp4_quant(
                         compressed,
                         norm_weight,
@@ -1448,7 +1462,13 @@ class MuseSparkMoE(nn.Module):
                 topk_ids,
                 topk_weights,
                 owned_global_rows,
-                min(local_rows, max(0, owned_global_rows - self.ep_rank * local_rows)),
+                min(
+                    local_rows,
+                    max(
+                        0,
+                        owned_global_rows - iris.all_reduce.rank_in_group * local_rows,
+                    ),
+                ),
             )
             compressed_quantized = None
             router_logits = None
@@ -1850,10 +1870,10 @@ class MuseSparkModel(BaseTransformerModel):
             and not ctx.forward_mode.is_idle()
             and not ctx.forward_mode.is_mixed()
             and mapping.pp_size == 1
-            and mapping.attn.tp_size == mapping.moe.ep_size
+            and mapping.attn.tp_size == mapping.moe.tp_ep_size
             and mapping.attn.tp_size in (4, 8)
-            and mapping.moe.tp_size == 1
-            and mapping.attn.tp_group == mapping.moe.ep_group
+            and (mapping.moe.tp_size == 1 or mapping.moe.ep_size == 1)
+            and mapping.attn.tp_group == mapping.moe.tp_ep_group
             and self.config.hidden_size == 8192
             and self.config.moe_hidden_size == 4096
             and self.config.num_local_experts == 256
@@ -1881,7 +1901,14 @@ class MuseSparkModel(BaseTransformerModel):
             ):
                 return False
         iris = self.iris_state
-        return iris is not None and iris.can_use_owned_rows(rows)
+        return (
+            iris is not None
+            and iris.can_use_owned_rows(rows)
+            and (
+                mapping.moe.tp_size == 1
+                or (iris.tp_routes is not None and rows <= iris.tp_routes.max_rows)
+            )
+        )
 
     def forward(
         self,
@@ -2206,6 +2233,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         )
 
         capacity = min(max_num_tokens, 8192) * self.config.hidden_size
+        tp_route_max_rows = (
+            min(max_num_tokens, 8192)
+            if mapping.moe.tp_size > 1
+            and mapping.moe.ep_size == 1
+            and self.config.moe_hidden_size == 4096
+            and self.config.num_experts_per_tok == 8
+            else 0
+        )
         state = self.model.iris_state
         if state is None:
             state = prepare_muse_communication(
@@ -2214,13 +2249,19 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 staged_max_numel=min(capacity, (512 << 10) // torch.bfloat16.itemsize),
                 producer_direct_max_numel=capacity,
                 enable_lamport=True,
+                tp_route_max_rows=tp_route_max_rows,
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
             backend.iris.install(group, state.all_reduce)
             backend.iris.install_all_gather(group, state.gather)
             backend.iris.install_broadcast(group, state.broadcast)
-        elif state.all_reduce.producer_direct_max_numel < capacity:
+        elif state.all_reduce.producer_direct_max_numel < capacity or (
+            tp_route_max_rows
+            and (
+                state.tp_routes is None or state.tp_routes.max_rows < tp_route_max_rows
+            )
+        ):
             raise RuntimeError(
                 "Muse communication was prepared below the requested capacity"
             )

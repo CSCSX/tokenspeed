@@ -56,6 +56,9 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
     iris_routed_rmsnorm_weighted_sum_write_through,
 )
+from tokenspeed_kernel.ops.communication._iris.muse_spark.tp_routes import (
+    MuseTPRouteReduceScatter,
+)
 from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
     iris_pull_reduce_scatter,
 )
@@ -77,12 +80,18 @@ class MuseIrisState:
     All layers reuse these buffers in stream order. Reductions and gathers can
     return borrowed activations; a consumer must finish before the next write.
     The generic all-reduce retains its independent-output contract.
-    TP4/EP4 and TP8/EP8 use the same global padded-token cutoffs; each owner
+    Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
     """
 
     @staticmethod
-    def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
+    def heap_bytes(
+        max_numel: int,
+        *,
+        world_size: int,
+        enable_lamport: bool,
+        tp_route_max_rows: int,
+    ) -> int:
         rows = min(max_numel // _MUSE_BOUNDARY_WIDTH, _MUSE_BOUNDARY_MAX_ROWS)
         size = ProducerAllReduce.heap_bytes(
             max_numel, world_size=world_size, enable_lamport=enable_lamport
@@ -101,9 +110,17 @@ class MuseIrisState:
             size += allocation_bytes(
                 (2, _MUSE_ROW_GATHER_PROGRAMS, world_size), torch.uint32
             )
+        if tp_route_max_rows:
+            size += MuseTPRouteReduceScatter.heap_bytes(tp_route_max_rows, world_size)
         return size
 
-    def __init__(self, all_reduce: IrisAllReduce, *, enable_lamport: bool):
+    def __init__(
+        self,
+        all_reduce: IrisAllReduce,
+        *,
+        enable_lamport: bool,
+        tp_route_max_rows: int,
+    ):
         self.all_reduce = all_reduce
         self.world_size = all_reduce.world_size
         self.enable_lamport = enable_lamport
@@ -157,14 +174,26 @@ class MuseIrisState:
             if self.row_boundary_supported
             else None
         )
+        self.tp_routes = (
+            MuseTPRouteReduceScatter(peers, tp_route_max_rows)
+            if tp_route_max_rows
+            else None
+        )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy."""
         numel = tensor.numel()
         assert tensor.dtype == self.all_reduce.dtype and tensor.is_contiguous()
-        reduced = self.reduction.run(tensor, tensor, numel)
-        if reduced.data_ptr() != tensor.data_ptr():
-            tensor.view(-1).copy_(reduced[:numel])
+        capacity = self.all_reduce.producer_direct_max_numel
+        capacity -= capacity % (self.world_size * 8)
+        assert capacity > 0 and numel % (self.world_size * 8) == 0
+        # Oversized full-row fallbacks retain Iris without growing prepared state.
+        flat = tensor.view(-1)
+        for begin in range(0, numel, capacity):
+            chunk = flat[begin : begin + capacity]
+            reduced = self.reduction.run(chunk, chunk, chunk.numel())
+            if reduced.data_ptr() != chunk.data_ptr():
+                chunk.copy_(reduced[: chunk.numel()])
         return tensor
 
     def can_reduce_borrowed(self, tensor: torch.Tensor) -> bool:
@@ -960,6 +989,7 @@ def prepare_muse_communication(
     staged_max_numel: int,
     producer_direct_max_numel: int,
     enable_lamport: bool,
+    tp_route_max_rows: int,
     all_reduce: IrisAllReduce | None,
     device: torch.device,
 ) -> MuseIrisState:
@@ -985,7 +1015,10 @@ def prepare_muse_communication(
     else:
         capacity = producer_direct_max_numel
     size = MuseIrisState.heap_bytes(
-        capacity, world_size=group.size(), enable_lamport=enable_lamport
+        capacity,
+        world_size=group.size(),
+        enable_lamport=enable_lamport,
+        tp_route_max_rows=tp_route_max_rows,
     )
     if all_reduce is None:
         size += IrisAllReduce.heap_bytes(
@@ -996,6 +1029,10 @@ def prepare_muse_communication(
         )
         peers = IrisGroup(ctx, group, rank_in_group, device)
         all_reduce = IrisAllReduce(peers, staged_max_numel, capacity, torch.bfloat16)
-    state = MuseIrisState(all_reduce, enable_lamport=enable_lamport)
+    state = MuseIrisState(
+        all_reduce,
+        enable_lamport=enable_lamport,
+        tp_route_max_rows=tp_route_max_rows,
+    )
     all_reduce.peers.finish_prepare()
     return state

@@ -1472,6 +1472,7 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
         device = torch.device("cuda", rank)
         state = prepare_muse_communication(
             enable_lamport=False,
+            tp_route_max_rows=0,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,

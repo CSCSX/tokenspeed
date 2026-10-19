@@ -286,6 +286,7 @@ def _muse_state(rank, device, max_rows, enable_lamport):
         staged_max_numel=0,
         producer_direct_max_numel=max_rows * 8192,
         enable_lamport=enable_lamport,
+        tp_route_max_rows=0,
         all_reduce=None,
         device=device,
     )
@@ -703,7 +704,7 @@ def _muse_owned_packet_worker(rank, world_size, device):
     torch.cuda.synchronize()
 
 
-def _prepare_muse_backend(world_size, projection, moe):
+def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
         initialize_comm_backend,
@@ -727,9 +728,15 @@ def _prepare_muse_backend(world_size, projection, moe):
     owner = SimpleNamespace(
         mapping=SimpleNamespace(
             attn=SimpleNamespace(tp_size=world_size, tp_group=group),
-            moe=SimpleNamespace(tp_ep_group=group),
+            moe=SimpleNamespace(
+                tp_ep_group=group,
+                tp_size=expert_tp_size,
+                ep_size=world_size // expert_tp_size,
+            ),
         ),
-        config=SimpleNamespace(hidden_size=8192),
+        config=SimpleNamespace(
+            hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
+        ),
         model=SimpleNamespace(iris_state=None, layers=[layer]),
     )
     assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
@@ -776,7 +783,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             tp_group=group,
             replicate_for_owned_rows=True,
         )
-    group, state = _prepare_muse_backend(world_size, projection, None)
+    group, state = _prepare_muse_backend(world_size, projection, None, expert_tp_size=1)
     full_weights = {}
     expected_columns = []
     for index, (name, width) in enumerate(
@@ -1097,6 +1104,11 @@ def _muse_routed_lamport_worker(rank, world_size, device):
 
 def _muse_tp_routes_worker(rank, world_size, device):
     """Expert TP sums aligned partial routes before nonlinear normalization."""
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+    from utils import assert_no_triton_compile
+
     from tokenspeed.runtime.models.muse_spark import MuseSparkMoE, MuseSparkRMSNorm
 
     torch.set_grad_enabled(False)
@@ -1112,14 +1124,24 @@ def _muse_tp_routes_worker(rank, world_size, device):
     moe.post_expert_norm = MuseSparkRMSNorm(width, 1e-8, True, 1.0)
     norm_weight = torch.linspace(-0.25, 0.25, width, device=device).bfloat16()
     moe.post_expert_norm.weight = torch.nn.Parameter(norm_weight)
-    _prepare_muse_backend(world_size, None, moe)
+    _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
     dims = torch.arange(width, device=device)[None, :]
 
-    # The large mapped case exceeds Muse's prepared producer capacity and exercises
-    # the ordinary collective fallback with the same route semantics.
-    cases = ((1, False), (3, False), (16, False), (2049, False))
-    cases += ((3, True), (6, True), (33, True))
-    for tokens, canonical in cases:
+    # Full-row inputs exceed generic staging; owned inputs keep complete token
+    # route groups together, including an uneven last owner and mapped outputs.
+    cases = [
+        (n, c, False) for n, c in ((1, False), (3, False), (16, False), (2049, False))
+    ]
+    cases += [(n, True, False) for n in (3, 6, 33)]
+    cases += [
+        (192, True, True),
+        (193, False, True),
+        (2049, True, True),
+        (8191, False, True),
+        (8192, True, True),
+        (2051, True, True),
+    ]
+    for tokens, canonical, owned in cases:
         indices = torch.arange(tokens * topk, device=device)
         mapping = None if canonical else ((indices + rank) % indices.numel()).int()
         weights = (
@@ -1141,16 +1163,29 @@ def _muse_tp_routes_worker(rank, world_size, device):
             routes[:, width:].fill_(torch.nan)
 
         def reference(step):
+            local_rows = (tokens + world_size - 1) // world_size
+            first = rank * local_rows if owned else 0
+            count = min(local_rows, tokens - first) if owned else tokens
+            route_indices = indices[first * topk : (first + count) * topk]
             full = sum(
-                ((indices[:, None] * 3 + dims * 5 + peer * 7 + step) % 9 - 4).float()
+                (
+                    (route_indices[:, None] * 3 + dims * 5 + peer * 7 + step) % 9 - 4
+                ).float()
                 / 32
                 for peer in range(world_size)
-            ).reshape(tokens, topk, width)
+            ).reshape(count, topk, width)
             scaled = full * (norm_weight + 1.0).float()
             normalized = scaled * torch.rsqrt(
                 scaled.square().mean(-1, keepdim=True) + 1e-8
             )
-            return (normalized * weights[:, :, None]).sum(1).bfloat16()
+            expected = (
+                (normalized * weights[first : first + count, :, None]).sum(1).bfloat16()
+            )
+            if owned and count < local_rows:
+                expected = torch.nn.functional.pad(
+                    expected, (0, 0, 0, local_rows - count)
+                )
+            return expected
 
         def run():
             return moe._reduce_expert_routes(
@@ -1158,13 +1193,20 @@ def _muse_tp_routes_worker(rank, world_size, device):
                 mapping,
                 tokens,
                 weights,
-                owned_rows=False,
+                owned_rows=owned,
             )
 
         update(0)
-        actual = run()
+        if tokens == 2051:
+            with assert_no_triton_compile(iris_pull_reduce_scatter):
+                actual = run()
+        else:
+            actual = run()
         torch.testing.assert_close(actual, reference(0), rtol=0, atol=2**-8)
-        if tokens <= 33:
+        if tokens <= 33 or owned:
+            if owned:
+                state.tp_routes.flags.view(torch.int32).fill_(-2)
+                state.all_reduce.peers.ctx.device_barrier()
             torch.cuda.synchronize()
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
@@ -1175,9 +1217,113 @@ def _muse_tp_routes_worker(rank, world_size, device):
                 if rank == step % world_size:
                     torch.cuda._sleep(20000)
                 graph.replay()
+                if owned:
+                    # A second reduction overwrites borrowed raw-route storage;
+                    # the normalization result must retain its own contents.
+                    state.tp_routes.run(routes, mapping, tokens)
                 torch.testing.assert_close(
                     captured, reference(step), rtol=0, atol=2**-8
                 )
+        dist.barrier()
+
+
+def _muse_tp_owned_forward_worker(rank, world_size, device):
+    """Exercise the real router/pool/gather/expert/unpool caller on uneven rows."""
+    from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
+    from tokenspeed.runtime.distributed import process_group_manager as pgm
+    from tokenspeed.runtime.distributed.comm_backend.registry import (
+        initialize_comm_backend,
+    )
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.muse_spark import MuseSparkMoE
+
+    torch.set_grad_enabled(False)
+    torch.set_default_dtype(torch.bfloat16)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world_size,
+        attn_tp_size=world_size,
+        dense_tp_size=world_size,
+        moe_tp_size=world_size,
+        moe_ep_size=1,
+        vision_tp_size=world_size,
+        linear_attn_tp_size=world_size,
+        nprocs_per_node=world_size,
+        nnodes=1,
+    )
+    group = mapping.attn.tp_group
+    pgm.process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+    initialize_comm_backend()
+    config = MuseSparkConfig(
+        text_config=dict(
+            vocab_size=256,
+            hidden_size=8192,
+            head_dim=64,
+            num_attention_heads=128,
+            num_key_value_heads=16,
+            num_hidden_layers=1,
+            max_position_embeddings=8192,
+            rms_norm_eps=1e-5,
+            post_norm_eps=1e-8,
+            final_logit_softcapping=20.0,
+            qk_scale_factor=5.47,
+            output_multiplier=0.125,
+            residual_gate_temperature=0.3,
+            moe_hidden_size=4096,
+            moe_intermediate_size=256,
+            num_local_experts=8,
+            num_experts_per_tok=8,
+            num_shared_experts=0,
+            routed_scaling_factor=1.0,
+            layer_types=["full_attention"],
+            layer_rope_theta=[0.0],
+            mlp_layer_types=["sparse"],
+            sliding_window=128,
+            rope_parameters=dict(rope_theta=500000.0, rope_type="default"),
+        ),
+        vision_config={},
+        audio_config={},
+        image_token_id=200,
+        video_token_id=201,
+        audio_token_id=202,
+        out_hidden_size=32,
+        projector_hidden_size=32,
+        projector_hidden_act="gelu",
+    )
+    with torch.device(device):
+        moe = MuseSparkMoE(config, mapping, None, 0, "model.layers.0.mlp", None)
+    torch.manual_seed(117)
+    for parameter in moe.parameters():
+        parameter.normal_(0, 0.02)
+    # Sparse pool/unpool weights make the reference insensitive to GEMM tiling.
+    for projection in (moe.pre_expert_proj, moe.post_expert_proj):
+        projection.weight.zero_()
+        index = torch.arange(projection.output_size, device=device)
+        projection.weight[index, (index * 3) % projection.input_size] = 1
+    torch.manual_seed(117 + rank)
+    moe.experts.w13_weight.normal_(0, 0.02)
+    moe.experts.w2_weight.normal_(0, 0.02)
+    moe.gate.process_weights_after_loading(moe.gate)
+    _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
+    for rows in (192, 193):
+        local_rows = (rows + world_size - 1) // world_size
+        first = rank * local_rows
+        valid = min(local_rows, rows - first)
+        for step in (0, 1):
+            torch.manual_seed(rows + step)
+            full = torch.randn(rows, 8192, device=device)
+            local = torch.zeros(local_rows, 8192, device=device)
+            local[:valid].copy_(full[first : first + valid])
+            expected, _ = moe(full, full.float(), rows, rows, None)
+            expected = expected[first : first + valid].clone()
+            actual, _ = moe(local, local.float(), rows, rows, rows)
+            actual = actual.clone()
+            # Post projection borrows the generic producer; retain it before reuse.
+            state.all_reduce.producer.data.fill_(torch.nan)
+            torch.testing.assert_close(actual[:valid], expected, atol=2**-7, rtol=2**-7)
+            torch.testing.assert_close(
+                actual[valid:], torch.zeros_like(actual[valid:]), atol=0, rtol=0
+            )
         dist.barrier()
 
 
@@ -1210,7 +1356,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
     moe.post_expert_norm.weight = torch.nn.Parameter(norm)
-    group, state = _prepare_muse_backend(world_size, None, moe)
+    group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
 
     def inputs(rows):
         torch.manual_seed(rows + rank * 17)
@@ -1380,6 +1526,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
+        pytest.param(_muse_tp_owned_forward_worker, "nccl", id="tp_owned_forward"),
     ],
 )
 @pytest.mark.parametrize("world_size", [4, 8])
