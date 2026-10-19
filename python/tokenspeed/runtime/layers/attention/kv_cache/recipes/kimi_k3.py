@@ -317,9 +317,7 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def replay_kda(self) -> bool:
-        """Whether verify commits by replaying from one conv checkpoint row."""
-        if self.server_args.speculative_algorithm is None:
-            return False
+        """Whether target decode uses replay, including the one-token window."""
         return kda_replay_supported(self.attn_config)
 
     @override

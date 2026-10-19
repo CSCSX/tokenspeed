@@ -1057,8 +1057,10 @@ after decode/mixed execution or graph replay, with live acceptance and
 `num_extends`. KDA uses the same replay lifecycle for standard target decode:
 its verify width and accepted count are one when there are no draft tokens.
 Its cache recipe reserves the record workspace for this case before sizing
-the arena. Since forward mode is derived from the extend count,
-zero means decode at this entry. Hybrid delegates to the recurrent child.
+the arena. Replay capability determines this reservation even without a drafter;
+prefill-only engines do not reserve decode records. Since forward mode is
+derived from the extend count, zero means decode at this entry. Hybrid
+delegates to the recurrent child.
 A mixed batch gives prefill and decode rows their existing metadata and
 forwards; only the decode suffix enters the acceptance commit. The
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for

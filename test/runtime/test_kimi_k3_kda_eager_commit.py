@@ -678,6 +678,31 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         _assert_committed_pages_equal(captured, eager, pages)
 
 
+@pytest.mark.parametrize("draft_tokens", [None, 1])
+def test_standard_decode_replay_workspace_matches_recipe(draft_tokens):
+    """Ordinary decode reserves the bytes used by its real replay buffers."""
+    harness = _Harness(draft_tokens=draft_tokens, eager_replay=True)
+    recipe = _kimi_recipe(
+        max_bs=harness.backend.max_bs,
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=draft_tokens,
+    )
+    planned_bytes = recipe.setup().fixed_workspace_bytes
+    allocated_bytes = harness.backend.preallocate_verify_workspace(
+        harness.backend.max_bs, 1
+    )
+    assert planned_bytes == allocated_bytes
+    _prepare_fixed_workspaces(
+        server_args=recipe.server_args,
+        config=harness.config,
+        backend=harness.backend,
+        draft_backend=None,
+        uses_paged_state_verify=True,
+        is_inkling=False,
+        expected_bytes=planned_bytes,
+    )
+
+
 def test_replay_planning_matches_allocation_and_rejects_drift():
     """The cache recipe and startup allocator share one byte contract."""
     harness = _Harness(draft_tokens=T, eager_replay=True)
