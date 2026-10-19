@@ -26,9 +26,6 @@ import pytest
 import torch
 from fused_boundary_helpers import boundary_case
 from tokenspeed_kernel.numerics.reference import reference_kernel
-from tokenspeed_kernel.numerics.torch.residual import (
-    torch_post_norm_residual_pre_norm,
-)
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
     weightless_qk_rmsnorm,
@@ -54,7 +51,11 @@ from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
     triton_post_norm_residual_pre_norm as triton_boundary,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.signature import dense_format_signature
+from tokenspeed_kernel.signature import (
+    dense_format_signature,
+    dense_tensor_format,
+    format_signature,
+)
 
 pytestmark = pytest.mark.skipif(
     not (current_platform().is_amd or current_platform().is_nvidia),
@@ -311,6 +312,22 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
         assert torch.equal(actual, reference)
 
 
+def _post_norm_reference(kernel: str, args):
+    """``residual.post_norm_residual_pre_norm``'s reference for ``kernel``."""
+    stream, branch = args[:2]
+    signature = format_signature(
+        stream=dense_tensor_format(stream.dtype),
+        branch=dense_tensor_format(branch.dtype),
+    )
+    return reference_kernel(
+        "residual",
+        "post_norm_residual_pre_norm",
+        signature,
+        traits=None,
+        kernel=kernel,
+    )
+
+
 @pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("boundary", ["attention", "ffn", "ffn_linked"])
@@ -327,7 +344,8 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
     ):
         assert (got is None and plain is None) or torch.equal(got, plain)
     new_stream, pre_fp32, pre_bf16 = outputs
-    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(*args, False, None, 1)
+    reference = _post_norm_reference("triton_post_norm_residual_pre_norm", args)
+    stream_ref, pre_ref, _ = reference(*args, False, None, 1)
     ulps = 2.0**-20
     torch.testing.assert_close(new_stream.double(), stream_ref, atol=1e-6, rtol=ulps)
     if pre_ref is None:
