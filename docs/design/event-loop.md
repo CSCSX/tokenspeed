@@ -163,7 +163,11 @@ Consequences:
   backpressured stage off the control plane. The remote submissions' only
   failure surface is a settle at the next round's `execute` (their semantic
   completion arrives through the transfer events; a submission that RAISED
-  produces none, so the settle must not swallow it). The handle's remaining
+  produces none, so the settle must not swallow it). A raise is therefore
+  for broken invariants only: a transfer worker, the bootstrap thread or
+  another Prefill rank can fail a request's transfer while its submission
+  waits on the FIFO, and that submission then does nothing for the request,
+  whose failure arrives as its transfer event. The handle's remaining
   `run_*` methods do block, deliberately — the DP idle forward, the landing of a
   completed remote prefill, the KV repair after a wake, the RL weight sync —
   but each is a low-rate path whose caller cannot proceed without the result
@@ -304,7 +308,7 @@ There are exactly two call sites, each with a documented reason:
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `SnapshotDone`, `RestoreDone`, each replica-intersected), together with
   the L3 hooks' agreed storage facts.
-  These must advance *before* `next_execution_plan`, otherwise cache-gated
+  These must advance *before* `next_execution_plan`; otherwise, cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are
   delayed by a full round.

@@ -324,8 +324,8 @@ const BlockPool& CacheCoordinator::tierPool() const {
 // per_group blocks are relative to the floor, num_common_tokens is the
 // absolute converged page boundary in TOKENS. num_prefix_pages bounds the walk
 // in prefix pages; each group key vector is expanded to that group's
-// block_granularity. State groups take no part here: their boundaries are
-// candidates of probeTier's candidate phase.
+// block_granularity. State groups take no part in this phase; probeTier
+// checks State and sliding-window requirements at each candidate boundary.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,

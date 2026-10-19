@@ -491,8 +491,8 @@ private:
     BlockPool& tierPool();
     template <CacheTier Tier>
     const BlockPool& tierPool() const;
-    // with_storage_keys treats the L3 shadow's keys as hits beside the tier's
-    // entries (the Host tier only): the storage probe of ProbePrefix.
+    // Aligned matching over token-spanned groups; no State checkpoint hits.
+    // extra_hits counts additional assumed hits beside the tier's entries.
     template <CacheTier Tier>
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,

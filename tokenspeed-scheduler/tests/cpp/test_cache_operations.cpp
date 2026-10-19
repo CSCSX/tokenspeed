@@ -686,9 +686,6 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
     EXPECT_NO_THROW(Scheduler{std::move(config)});
 }
 
-// L3 keys beyond the Host hit are a storage-tier probe, never a Host hit:
-// PlanPrefetch turns them into a Host fill before admission.
-
 TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
