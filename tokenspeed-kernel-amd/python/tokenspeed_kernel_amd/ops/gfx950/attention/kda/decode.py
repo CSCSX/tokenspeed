@@ -34,6 +34,8 @@ from tokenspeed_kernel_amd.ops._kda_records import (
 cdna4 = gl.amd.cdna4
 
 _CDNA4_NUM_CUS = 256
+# MI355 gate projection crosses over between 64 and 128 rows at T1 and T4.
+_INLINE_GATE_MAX_ROWS = 64
 
 
 def _kda_value_splits(batch: int) -> int:
@@ -1400,7 +1402,8 @@ def gluon_kda_fused_verify_gfx950(
     mixed_qkv contains activation-dtype pre-convolution Q/K/V rows; raw_g and
     beta_logits are projected gate inputs. A supplied raw_g requires both
     projection inputs to be None. Otherwise f_a_out and f_b_weight produce the
-    gate in this kernel. state_pool is FP32 [page, head, V, K].
+    gate inline for small row counts and with GEMM for larger inputs.
+    state_pool is FP32 [page, head, V, K].
     read_indices selects checkpoint pages; nonpositive pages are padding.
     correction is FP32 [slot, head, capacity, V]. key_gate has the same layout
     with activation-dtype unnormalized K followed by raw gate in its last axis.
@@ -1449,6 +1452,10 @@ def gluon_kda_fused_verify_gfx950(
         raise ValueError(
             "fused KDA verify requires four-tap convolution and V-major state"
         )
+    if raw_g is None and mixed_qkv.shape[0] > _INLINE_GATE_MAX_ROWS:
+        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        f_a_out = None
+        f_b_weight = None
     value_splits = _kda_value_splits(batch)
     gluon_kda_fused_paged_verify_nostore_vmajor_gfx950[
         (num_heads * value_splits, batch)

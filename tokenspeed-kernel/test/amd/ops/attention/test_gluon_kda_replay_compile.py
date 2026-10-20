@@ -63,8 +63,8 @@ def _offline_launch(monkeypatch, kernel, arch):
     monkeypatch.setattr(kernel, "run", compile_launch)
 
 
-def _inputs(window, device):
-    batch, heads, dim, pages = 3, 12, 128, 8
+def _inputs(window, device, *, batch):
+    heads, dim, pages = 12, 128, 2 * batch + 2
     arena = torch.empty(pages, 884736, dtype=torch.uint8, device=device)
     state_bytes = heads * dim * dim * 4
     conv_bytes = 3 * heads * dim * 3 * 2
@@ -91,9 +91,13 @@ def _inputs(window, device):
     }
 
 
-@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
-@pytest.mark.parametrize("window", [1, 4, 8])
-def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window):
+@pytest.mark.parametrize(
+    ("arch", "window", "batch"),
+    [(arch, window, 3) for arch in ("gfx950", "gfx1250") for window in (1, 4, 8)]
+    # Exercise the launcher GEMM fallback above 64 total input rows.
+    + [("gfx950", 4, 17)],
+)
+def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window, batch):
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.kda.decode"
     )
@@ -102,8 +106,8 @@ def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window):
         f"gluon_kda_fused_replay_{arch}",
     ):
         _offline_launch(monkeypatch, getattr(module, name), arch)
-    x = _inputs(window, "cpu")
-    batch, heads, dim, layers = 3, 12, 128, 2
+    x = _inputs(window, "cpu", batch=batch)
+    heads, dim, layers = 12, 128, 2
     # A capacity wider than the live window also exercises masked ring loads.
     capacity = window + 1
     correction = torch.empty(batch, capacity, heads, dim)
@@ -187,7 +191,7 @@ def test_gate_launcher_requires_one_producer(both):
         gluon_kda_fused_verify_gfx950,
     )
 
-    x = _inputs(1, "cpu")
+    x = _inputs(1, "cpu", batch=3)
     batch, heads, dim = 3, 12, 128
     message = "excludes projection inputs" if both else "requires either a raw gate"
     with pytest.raises(ValueError, match=message):
@@ -228,7 +232,7 @@ def test_original_kda_comparison_launches_compile(monkeypatch, arch, window):
     # Substitute the missing GPU device check and launch. Tensor storage,
     # shape/stride validation, adapter calls and compilation remain real.
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda tensor: True))
-    x = _inputs(window, "cpu")
+    x = _inputs(window, "cpu", batch=3)
     original = OriginalKda(
         source,
         arch,
@@ -253,7 +257,7 @@ def test_original_kda_comparison_launches_compile(monkeypatch, arch, window):
 
 def test_original_gfx950_gate_projection_launch_compiles(monkeypatch):
     _offline_launch(monkeypatch, _original_gate_projection_gfx950, "gfx950")
-    x = _inputs(1, "cpu")
+    x = _inputs(1, "cpu", batch=3)
     projected = original_gate_projection(x["f_a"], x["w_fb"])
     assert projected.shape == (3, 12 * 128)
     assert projected.dtype == torch.bfloat16

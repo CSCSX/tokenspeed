@@ -728,6 +728,7 @@ def main():
         "state_page_bytes": _STATE_PAGE_BYTES,
         "paired_rounds": args.paired_rounds,
         "verify_scope": "one layer; both retain payloads; candidate includes gate projection, original excludes gate GEMM; unequal work",
+        "candidate_gate_producer": "launcher selects inline projection or GEMM from total input rows",
         "commit_scope": "all layers; includes conv history; excludes verify",
         "lifecycle_scope": {
             "candidate": "all layers: records verify with gate production and QKV retention, then one batched commit",
