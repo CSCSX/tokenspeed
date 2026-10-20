@@ -370,6 +370,48 @@ def test_nan_outranks_a_client_abort_on_the_prefill_node():
     assert "prefill" not in processor.rid_to_state
 
 
+class _DecodeEndsItsGrammar:
+    """A step's grammar completion: the decode request's token ends its grammar."""
+
+    host_node_wait = 0.0
+
+    def wait(self, timeout):
+        return True
+
+    def advance_on_host(self, output_tokens, accept_lengths):
+        raise AssertionError("the completion has advanced")
+
+    def terminated_at(self):
+        return [-1, 0]
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_a_grammar_ending_keeps_check_finisheds_order(aborted):
+    """The token that ends the grammar finishes the request, unless an abort
+    already pending outranks it as check_finished orders them."""
+    from tokenspeed.runtime.engine.request_types import (
+        FINISH_ABORT,
+        FINISH_MATCHED_TOKEN,
+    )
+
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    decode = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["decode"] = decode
+    if aborted:
+        processor.mark_abort("decode", notify_client=False)
+
+    result = _ExecutionResult()
+    result.grammar_completion = _DecodeEndsItsGrammar()
+    processor.post_process_forward_op(_ForwardOp(), result, is_prefill_instance=False)
+
+    if aborted:
+        assert isinstance(decode.finished_reason, FINISH_ABORT)
+    else:
+        assert isinstance(decode.finished_reason, FINISH_MATCHED_TOKEN)
+        assert decode.finished_reason.matched == 22
+
+
 class _RecordingLogger:
     """Capture logger.info(fmt, *args) calls as formatted strings."""
 
