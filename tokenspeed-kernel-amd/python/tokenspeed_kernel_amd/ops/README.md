@@ -1150,8 +1150,8 @@ MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
 A supplied raw gate is used directly. GFX1250 retains the separate gate producer.
 Both save the gate used by verify. For one-token windows without value splits,
 GFX950 keeps four checkpoint panels in flight after it prepares the token vectors.
-Recovery keeps two panels in flight for one-token windows and four for four-token
-windows. Other recovery windows use one panel.
+Recovery keeps two panels in flight for one-token windows.
+Other recovery windows use one panel.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against

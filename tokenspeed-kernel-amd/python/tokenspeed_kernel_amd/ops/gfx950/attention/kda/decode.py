@@ -1048,9 +1048,9 @@ def gluon_kda_fused_replay_gfx950(
         k_values += (k_value,)
         decay_values += (decay,)
 
-    # These T1/T4 depths retain the current register occupancy.
-    # Other windows keep one panel in flight.
-    pipeline_depth: gl.constexpr = 2 if T == 1 else (4 if T == 4 else 1)
+    # T1 keeps its register occupancy with two panels.
+    # Four panels at T4 slowed recovery when only part of a window was accepted.
+    pipeline_depth: gl.constexpr = 2 if T == 1 else 1
     for prefetch_idx in gl.static_range(1, pipeline_depth):
         prefetch_offsets = (
             panel_value_offsets[:, None] + prefetch_idx * 16
