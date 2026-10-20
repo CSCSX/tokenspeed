@@ -476,8 +476,8 @@ def _reference_committed_states(harness, pages, inputs, accepted):
                 gate = torch.nn.functional.linear(
                     inputs["f_a_out"], params["f_b_weight"]
                 ).float()
-            produced_qkv = (
-                kda_verify_conv_update(
+            if harness.backend._replay_active:
+                produced_qkv = kda_verify_conv_update(
                     inputs["mixed_qkv"],
                     params["conv_weights"],
                     harness.pool.get_component(layer_id, "conv_state"),
@@ -487,10 +487,32 @@ def _reference_committed_states(harness, pages, inputs, accepted):
                     draft_token_num=width,
                     recurrent_layout="v_major",
                     bias=params.get("bias"),
-                )
-                .float()
-                .view(bs, width, CONV_DIM)
-            )
+                ).view(bs, width, CONV_DIM)
+            else:
+                from tokenspeed_kernel.ops.conv import causal_conv1d_update
+
+                # The scratch path uses the common convolution producer,
+                # whose intermediate rounding differs from the KDA producer.
+                produced_qkv = causal_conv1d_update(
+                    inputs["mixed_qkv"]
+                    .view(bs, width, CONV_DIM)
+                    .transpose(1, 2)
+                    .clone(),
+                    conv.to(inputs["mixed_qkv"].dtype).contiguous(),
+                    params["conv_weights"],
+                    bias=params.get("bias"),
+                    activation="silu",
+                    intermediate_conv_window=torch.empty(
+                        bs,
+                        width,
+                        CONV_DIM,
+                        3,
+                        dtype=inputs["mixed_qkv"].dtype,
+                        device=DEV,
+                    ),
+                    parent_indices=None,
+                ).transpose(1, 2)
+            produced_qkv = produced_qkv.float()
         gate = gate.view(bs, width, H, D) + params["dt_bias"].view(H, D)
         scale = params["A_log"].exp()[None, None, :, None]
         lower_bound = params["lower_bound"]
