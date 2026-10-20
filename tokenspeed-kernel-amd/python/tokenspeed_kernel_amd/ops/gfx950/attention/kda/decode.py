@@ -24,14 +24,17 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops._kda_records import (
+    kda_record_decay,
+    kda_record_interval,
+    kda_records_launch_metadata,
+    validate_kda_records_commit,
+    validate_kda_records_verify,
+)
 
 cdna4 = gl.amd.cdna4
 
 _CDNA4_NUM_CUS = 256
-
-
-def _kda_value_splits(batch: int) -> int:
-    return max(1, min(8, 16 // triton.next_power_of_2(batch)))
 
 
 @gluon.jit
@@ -484,508 +487,331 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     )
 
 
-@gluon.jit
+@gluon.jit(
+    launch_metadata=kda_records_launch_metadata,
+    do_not_specialize=[
+        "qkv_stride",
+        "gate_stride",
+        "beta_stride",
+        "state_stride",
+        "state_head_stride",
+        "state_v_stride",
+        "state_k_stride",
+        "read_stride",
+        "query_stride",
+        "u_slot_stride",
+        "u_head_stride",
+        "u_pos_stride",
+        "kg_slot_stride",
+        "kg_head_stride",
+        "kg_pos_stride",
+        "record_slots",
+        "lower_bound",
+    ],
+)
 def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
-    mixed_qkv: tl.const,
-    conv_weights: tl.const,
-    conv_pool: tl.const,
-    raw_g: tl.const,
-    beta_logits: tl.const,
-    state_pool: tl.const,
-    read_indices: tl.const,
+    conv_qkv,
+    raw_g,
+    beta,
+    a_log,
+    dt_bias,
+    state_pool,
+    reads,
+    correction,
+    key_gate,
+    metadata,
+    stamps,
+    query_start_loc,
     output,
-    replay_mixed_qkv,
-    replay_gate,
-    replay_beta,
-    a_log: tl.const,
-    dt_bias: tl.const,
+    qkv_stride,
+    gate_stride,
+    beta_stride,
+    state_stride,
+    state_head_stride,
+    state_v_stride,
+    state_k_stride,
+    read_stride,
+    query_stride,
+    u_slot_stride,
+    u_head_stride,
+    u_pos_stride,
+    kg_slot_stride,
+    kg_head_stride,
+    kg_pos_stride,
+    record_slots,
+    lower_bound,
     H: gl.constexpr,
     D: gl.constexpr,
-    TOKENS_PER_SEQUENCE: gl.constexpr,
-    VALUE_SPLITS: gl.constexpr,
-    MIXED_ROW_STRIDE: gl.constexpr,
-    CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
-    CONV_WEIGHT_COL_STRIDE: gl.constexpr,
-    CONV_POOL_PAGE_STRIDE: gl.constexpr,
-    CONV_POOL_CHANNEL_STRIDE: gl.constexpr,
-    CONV_POOL_HISTORY_STRIDE: gl.constexpr,
-    GATE_ROW_STRIDE: gl.constexpr,
-    BETA_ROW_STRIDE: gl.constexpr,
-    REPLAY_MIXED_ROW_STRIDE: gl.constexpr,
-    REPLAY_GATE_ROW_STRIDE: gl.constexpr,
-    REPLAY_BETA_ROW_STRIDE: gl.constexpr,
-    CAPTURE_REPLAY: gl.constexpr,
-    STATE_POOL_PAGE_STRIDE: gl.constexpr,
-    NUM_POOL_SLOTS: gl.constexpr,
-    HAS_LOWER_BOUND: gl.constexpr,
-    LOWER_BOUND: gl.constexpr,
+    T: gl.constexpr,
+    CAPACITY: gl.constexpr,
+    BOUNDED: gl.constexpr,
+    BV: gl.constexpr,
 ):
-    """Run dense no-store verify, optionally capturing its raw replay payload."""
-    # Every input pointer is const, so none of them may be written -- including
-    # through a replay name pointed at the same tensor, which the compiler
-    # cannot see. ``CAPTURE_REPLAY`` off prunes the three replay stores, and
-    # with it on the launch wrapper rejects a replay buffer that aliases an
-    # input.
-    head_program_idx = gl.program_id(0)
-    head_idx = head_program_idx // VALUE_SPLITS
-    value_split_idx = head_program_idx % VALUE_SPLITS
-    sequence_idx = gl.program_id(1)
-
-    # Physical state tiles are [V, K].
-    state_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8],
-        [4, 16],
-        [4, 1],
-        [1, 0],
-    )
-    key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
-    value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
-    key_offsets = gl.arange(0, D, layout=key_layout)
-    compact_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    output_offsets = gl.arange(0, D, layout=compact_layout)
-    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    shared_vectors = gl.allocate_shared_memory(
-        gl.float32, [TOKENS_PER_SEQUENCE, 4 * D], shared_layout
-    )
-    output_base = (sequence_idx * TOKENS_PER_SEQUENCE * H + head_idx) * D
-    token_base = sequence_idx * TOKENS_PER_SEQUENCE
-
-    read_idx = gl.load(read_indices + sequence_idx)
-    valid_read = (read_idx >= 0) & (read_idx < NUM_POOL_SLOTS)
-    if not valid_read:
-        if value_split_idx == 0:
-            for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-                gl.store(
-                    output + output_base + token_offset * H * D + output_offsets,
-                    0.0,
-                )
+    """Verify a candidate prefix without writing live state; save U and K/raw-g."""
+    pv, row, head = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    layout: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [4, 1], [1, 0])
+    kk = gl.arange(0, D, layout=gl.SliceLayout(0, layout))
+    vv = pv * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, layout))
+    bos = gl.load(query_start_loc + row * query_stride).to(gl.int64)
+    length = gl.load(query_start_loc + (row + 1) * query_stride).to(gl.int64) - bos
+    source = gl.load(reads + row * read_stride).to(gl.int64)
+    if source <= 0:
+        for t in gl.static_range(T):
+            gl.store(
+                output + (bos + t) * H * D + head * D + vv,
+                0.0,
+                mask=(t < length) & (vv < D),
+            )
         return
-
-    read_page_offset = read_idx.to(gl.int64)
-    read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
-    panel_value_offsets = gl.arange(0, 16, layout=value_layout)
-
-    # Keep PIPELINE_DEPTH state panels in flight to balance latency and VGPR use.
-    # static_range permits the unrolled tuple window to change length.
-    off_pipe = ()
-    raw_pipe = ()
-    if VALUE_SPLITS == 1:
-        _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-        _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
-        off_pipe = (_off,)
-        raw_pipe = (_raw,)
-
-    # Process Q/K/V/decay together so Q/K/V share convolution loads.
-    # Decay lanes use Q as an in-bounds dummy address and skip state writes.
-    qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D)
-
-    qkv_history0 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
+    slot = gl.load(metadata + row * 3)
+    generation = gl.load(metadata + row * 3 + 1)
+    start = gl.load(metadata + row * 3 + 2)
+    valid = (
+        (slot >= 0)
+        & (slot < record_slots)
+        & (generation >= 0)
+        & (start >= 0)
+        & (length >= 0)
+        & (length <= T)
+    )
+    gl.device_assert(valid, "invalid replay metadata")
+    if not valid:
+        return
+    state = gl.load(
+        state_pool
+        + source * state_stride
+        + head * state_head_stride
+        + vv[:, None] * state_v_stride
+        + kk[None, :] * state_k_stride,
+        mask=vv[:, None] < D,
+        other=0,
     ).to(gl.float32)
-    qkv_history1 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-        + CONV_POOL_HISTORY_STRIDE
-    ).to(gl.float32)
-    qkv_history2 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-        + 2 * CONV_POOL_HISTORY_STRIDE
-    ).to(gl.float32)
-    qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
-    weight0 = gl.load(qkv_weight_base)
-    weight1 = gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
-    weight2 = gl.load(qkv_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
-    weight3 = gl.load(qkv_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
-    decay_channel = head_idx * D + local_offset
-    a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
-
-    for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-        token_idx = token_base + token_offset
-        qkv_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel).to(
-            gl.float32
-        )
-        if CAPTURE_REPLAY:
-            replay_owner = (slot_id != 3) & (value_split_idx == 0)
-            gl.store(
-                replay_mixed_qkv + token_idx * REPLAY_MIXED_ROW_STRIDE + qkv_channel,
-                qkv_input,
-                mask=replay_owner,
-            )
-        qkv_value = _kda_conv_step(
-            qkv_history0,
-            qkv_history1,
-            qkv_history2,
-            qkv_input,
-            weight0,
-            weight1,
-            weight2,
-            weight3,
-        )
-
-        raw_gate_value = gl.load(
-            raw_g + token_idx * GATE_ROW_STRIDE + decay_channel
+    a = gl.exp(gl.load(a_log + head).to(gl.float32))
+    bias = gl.load(dt_bias + head * D + kk).to(gl.float32)
+    for t in gl.static_range(T):
+        live = t < length
+        token = bos + t
+        q = gl.load(
+            conv_qkv + token * qkv_stride + head * D + kk, mask=live, other=0
         ).to(gl.float32)
-        if CAPTURE_REPLAY:
-            replay_owner = is_decay & (value_split_idx == 0)
-            gl.store(
-                replay_gate + token_idx * REPLAY_GATE_ROW_STRIDE + decay_channel,
-                raw_gate_value,
-                mask=replay_owner,
-            )
-        decay_value = _kda_decay(
-            raw_gate_value,
-            gl.load(dt_bias + decay_channel).to(gl.float32),
-            a_value,
-            HAS_LOWER_BOUND,
-            LOWER_BOUND,
-        )
-        combined = gl.where(is_decay, decay_value, qkv_value)
-        shared_vectors.index(token_offset).store(combined)
-
-        qkv_history0 = qkv_history1
-        qkv_history1 = qkv_history2
-        qkv_history2 = qkv_input
-
-    q_values = ()
-    k_values = ()
-    decay_values = ()
-    beta_values = ()
-    key_queries = ()
-    value_panels_by_token = ()
-    for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-        token_idx = token_base + token_offset
-        vectors = shared_vectors.index(token_offset)
-        q_value = vectors.slice(0, D, dim=0).load(key_layout)
-        k_value = vectors.slice(D, D, dim=0).load(key_layout)
-        q_value *= gl.rsqrt(gl.sum(q_value * q_value, axis=0) + 1e-6) * (D**-0.5)
-        k_value *= gl.rsqrt(gl.sum(k_value * k_value, axis=0) + 1e-6)
-        decay = vectors.slice(3 * D, D, dim=0).load(key_layout)
-        beta_value = gl.load(beta_logits + token_idx * BETA_ROW_STRIDE + head_idx).to(
+        k = gl.load(
+            conv_qkv + token * qkv_stride + H * D + head * D + kk, mask=live, other=0
+        ).to(gl.float32)
+        v = gl.load(
+            conv_qkv + token * qkv_stride + 2 * H * D + head * D + vv,
+            mask=live & (vv < D),
+            other=0,
+        ).to(gl.float32)
+        g = gl.load(raw_g + token * gate_stride + head * D + kk, mask=live, other=0).to(
             gl.float32
         )
-        if CAPTURE_REPLAY:
-            replay_owner = value_split_idx == 0
-            gl.store(
-                replay_beta + token_idx * REPLAY_BETA_ROW_STRIDE + head_idx,
-                beta_value,
-                mask=replay_owner,
+        b = gl.load(beta + token * beta_stride + head, mask=live, other=0).to(
+            gl.float32
+        )
+        q *= gl.rsqrt(gl.sum(q * q, 0) + 1e-6) * (D**-0.5)
+        normalized_k = k * gl.rsqrt(gl.sum(k * k, 0) + 1e-6)
+        state *= kda_record_decay(g, bias, a, lower_bound, BOUNDED)[None, :]
+        u = v - gl.sum(state * normalized_k[None, :], 1)
+        u *= 1.0 / (1.0 + gl.exp(-b))
+        state += u[:, None] * normalized_k[None, :]
+        out = gl.sum(state * q[None, :], 1)
+        gl.store(output + token * H * D + head * D + vv, out, mask=live & (vv < D))
+        position = start + t
+        ring = position % CAPACITY
+        gl.store(
+            correction
+            + slot * u_slot_stride
+            + head * u_head_stride
+            + ring * u_pos_stride
+            + vv,
+            u,
+            mask=live & (vv < D),
+        )
+        if pv == 0:
+            kg = (
+                key_gate
+                + slot * kg_slot_stride
+                + head * kg_head_stride
+                + ring * kg_pos_stride
             )
-        beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
-        value_panels = _kda_value_panels(vectors, D, value_layout)
-        q_values = q_values + (q_value,)
-        k_values = k_values + (k_value,)
-        decay_values = decay_values + (decay,)
-        beta_values = beta_values + (beta_value,)
-        key_queries = key_queries + (gl.sum(k_value * q_value, axis=0),)
-        value_panels_by_token = value_panels_by_token + (value_panels,)
-
-    # Assign each panel to one value split. With one split, the same equation
-    # owns every panel and the pipeline window carries loads between iterations.
-    panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
-    for panel_idx in gl.static_range(8):
-        if value_split_idx == panel_idx // panels_per_split:
-            if VALUE_SPLITS == 1:
-                panel_offsets = off_pipe[0]
-                running = raw_pipe[0]
-            else:
-                panel_offsets = (
-                    panel_value_offsets[:, None] + panel_idx * 16
-                ) * D + key_offsets[None, :]
-                running = gl.load(state_pool + read_base + panel_offsets).to(gl.float32)
-
-            for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-                q_value = q_values[token_offset]
-                k_value = k_values[token_offset]
-                decay = decay_values[token_offset]
-                value_panel = value_panels_by_token[token_offset][panel_idx]
-                beta_value = beta_values[token_offset]
-
-                running *= decay[None, :]
-                running, panel_out = _kda_recurrent_step(
-                    running,
-                    k_value,
-                    q_value,
-                    value_panel,
-                    beta_value,
-                    key_queries[token_offset],
-                )
-                gl.store(
-                    output
-                    + output_base
-                    + token_offset * H * D
-                    + panel_idx * 16
-                    + panel_value_offsets,
-                    panel_out.to(output.dtype.element_ty),
-                )
-
-            if VALUE_SPLITS == 1:
-                next_idx = panel_idx + 1
-                if next_idx < 8:
-                    next_offsets = (
-                        panel_value_offsets[:, None] + next_idx * 16
-                    ) * D + key_offsets[None, :]
-                    next_raw = gl.load(state_pool + read_base + next_offsets).to(
-                        gl.float32
-                    )
-                    off_pipe = off_pipe[1:] + (next_offsets,)
-                    raw_pipe = raw_pipe[1:] + (next_raw,)
-                else:
-                    off_pipe = off_pipe[1:] + (off_pipe[-1],)
-                    raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
+            gl.store(kg + kk, k, mask=live)
+            gl.store(kg + D + kk, g, mask=live)
+            if head == 0:
+                stamp = stamps + (slot * CAPACITY + ring) * 2
+                gl.store(stamp, position, mask=live)
+                gl.store(stamp + 1, generation, mask=live)
 
 
-@gluon.jit
+@gluon.jit(
+    launch_metadata=kda_records_launch_metadata,
+    do_not_specialize=[
+        "BATCH",
+        "state_stride",
+        "u_stride",
+        "kg_stride",
+        "record_slots",
+        "stamp_layer_stride",
+        "lower_bound",
+    ],
+)
 def gluon_kda_fused_replay_gfx950(
     descriptors,
     group_indices,
-    read_indices,
-    write_indices,
-    accepted_length,
+    reads,
+    writes,
+    accepted,
+    metadata,
+    stamps,
+    activation_ref,
+    BATCH,
+    state_stride,
+    u_stride,
+    kg_stride,
+    record_slots,
+    stamp_layer_stride,
+    lower_bound,
     H: gl.constexpr,
     D: gl.constexpr,
-    TOKENS_PER_SEQUENCE: gl.constexpr,
-    MIXED_ROW_STRIDE: gl.constexpr,
-    CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
-    CONV_WEIGHT_COL_STRIDE: gl.constexpr,
-    CONV_POOL_PAGE_STRIDE: gl.constexpr,
-    CONV_POOL_CHANNEL_STRIDE: gl.constexpr,
-    CONV_POOL_HISTORY_STRIDE: gl.constexpr,
-    GATE_ROW_STRIDE: gl.constexpr,
-    BETA_ROW_STRIDE: gl.constexpr,
-    STATE_POOL_PAGE_STRIDE: gl.constexpr,
-    HAS_LOWER_BOUND: gl.constexpr,
-    LOWER_BOUND: gl.constexpr,
-    # Follows the batch; runtime so every batch size shares one binary.
-    BATCH_SIZE,
+    T: gl.constexpr,
+    CAPACITY: gl.constexpr,
+    BOUNDED: gl.constexpr,
+    BV: gl.constexpr,
 ):
-    """Replay accepted raw-g prefixes for every descriptor layer.
-
-    One program owns a head's whole eight-panel value loop. The grid already
-    spans every descriptor layer, so it covers the device without splitting a
-    head across programs, and splitting would only duplicate the convolution
-    and gate work every program has to redo per panel.
-    """
-    layer_idx = gl.program_id(2)
-    descriptor_base = layer_idx * 10
-    mixed_qkv = tl.cast(
-        gl.load(descriptors + descriptor_base + 0),
-        gl.pointer_type(gl.bfloat16),
-    )
-    conv_weights = tl.cast(
-        gl.load(descriptors + descriptor_base + 1),
-        gl.pointer_type(gl.bfloat16),
-    )
-    conv_pool = tl.cast(
-        gl.load(descriptors + descriptor_base + 2),
-        gl.pointer_type(gl.bfloat16),
-    )
-    beta_logits = tl.cast(
-        gl.load(descriptors + descriptor_base + 5),
-        gl.pointer_type(gl.bfloat16),
-    )
-    a_log = tl.cast(
-        gl.load(descriptors + descriptor_base + 6),
-        gl.pointer_type(gl.float32),
-    )
-    dt_bias = tl.cast(
-        gl.load(descriptors + descriptor_base + 7),
-        gl.pointer_type(gl.float32),
-    )
-    state_pool = tl.cast(
-        gl.load(descriptors + descriptor_base + 8),
-        gl.pointer_type(gl.float32),
-    )
-    raw_g = tl.cast(
-        gl.load(descriptors + descriptor_base + 9),
-        gl.pointer_type(gl.bfloat16),
-    )
-    group_idx = gl.load(group_indices + layer_idx).to(gl.int64)
-    group_offset = group_idx * BATCH_SIZE
-    read_indices += group_offset
-    write_indices += group_offset
-
-    head_idx = gl.program_id(0)
-    sequence_idx = gl.program_id(1)
-    token_base = sequence_idx * TOKENS_PER_SEQUENCE
-
-    state_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8],
-        [4, 16],
-        [4, 1],
-        [1, 0],
-    )
-    key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
-    value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
-    key_offsets = gl.arange(0, D, layout=key_layout)
-    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    shared_vectors = gl.allocate_shared_memory(
-        gl.float32, [TOKENS_PER_SEQUENCE, 4 * D], shared_layout
-    )
-
-    read_idx = gl.load(read_indices + sequence_idx)
-    valid_read = (read_idx >= 0) & (read_idx < 2**31 - 1)
-    if not valid_read:
+    """Recover accepted states from saved corrections for all layers."""
+    pv, row, lh = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    layer, head = lh // H, lh % H
+    group = gl.load(group_indices + layer).to(gl.int64)
+    source = gl.load(reads + group * BATCH + row).to(gl.int64)
+    target = gl.load(writes + group * BATCH + row).to(gl.int64)
+    if source <= 0 or target <= 0:
         return
-    read_page_offset = read_idx.to(gl.int64)
-    read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
-    panel_value_offsets = gl.arange(0, 16, layout=value_layout)
-    _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-    _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
-    off_pipe = (_off,)
-    raw_pipe = (_raw,)
-
-    qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D)
-    qkv_history0 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
+    steps = gl.load(accepted + row)
+    slot, start, valid = kda_record_interval(
+        metadata,
+        stamps,
+        row,
+        layer,
+        steps,
+        record_slots,
+        CAPACITY,
+        stamp_layer_stride,
+        T,
+        64,
+    )
+    if not valid:
+        return
+    desc = descriptors + layer * 10
+    state_pool = gl.load(desc + 8).to(gl.pointer_type(gl.float32))
+    u_ptr = gl.load(desc + 3).to(gl.pointer_type(gl.float32))
+    kg_ptr = gl.load(desc + 5).to(gl.pointer_type(activation_ref.dtype.element_ty))
+    a_ptr = gl.load(desc + 6).to(gl.pointer_type(gl.float32))
+    bias_ptr = gl.load(desc + 7).to(gl.pointer_type(gl.float32))
+    layout: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [4, 1], [1, 0])
+    kk = gl.arange(0, D, layout=gl.SliceLayout(0, layout))
+    vv = pv * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, layout))
+    offsets = head * D * D + vv[:, None] * D + kk[None, :]
+    state = gl.load(
+        state_pool + source * state_stride + offsets, mask=vv[:, None] < D, other=0
     ).to(gl.float32)
-    qkv_history1 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-        + CONV_POOL_HISTORY_STRIDE
-    ).to(gl.float32)
-    qkv_history2 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-        + 2 * CONV_POOL_HISTORY_STRIDE
-    ).to(gl.float32)
-    qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
-    weight0 = gl.load(qkv_weight_base)
-    weight1 = gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
-    weight2 = gl.load(qkv_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
-    weight3 = gl.load(qkv_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
-    decay_channel = head_idx * D + local_offset
-    a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
-    replay_steps = gl.load(accepted_length + sequence_idx)
-    write_idx = gl.load(write_indices + sequence_idx)
-    valid_write_idx = (write_idx >= 0) & (write_idx < 2**31 - 1)
-    safe_write_idx = gl.where(valid_write_idx, write_idx, 0).to(gl.int64)
-
-    for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-        token_idx = token_base + token_offset
-        token_active = token_offset < replay_steps
-        qkv_input = gl.load(
-            mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel,
-            mask=token_active,
-            other=0.0,
+    a = gl.exp(gl.load(a_ptr + head))
+    bias = gl.load(bias_ptr + head * D + kk)
+    for t in range(steps):
+        ring = (start + t) % CAPACITY
+        kg = kg_ptr + (slot * CAPACITY + ring) * kg_stride + head * 2 * D
+        k = gl.load(kg + kk).to(gl.float32)
+        g = gl.load(kg + D + kk).to(gl.float32)
+        u = gl.load(
+            u_ptr + (slot * CAPACITY + ring) * u_stride + head * D + vv,
+            mask=vv < D,
+            other=0,
         ).to(gl.float32)
-        qkv_value = _kda_conv_step(
-            qkv_history0,
-            qkv_history1,
-            qkv_history2,
-            qkv_input,
-            weight0,
-            weight1,
-            weight2,
-            weight3,
+        k *= gl.rsqrt(gl.sum(k * k, 0) + 1e-6)
+        state *= kda_record_decay(g, bias, a, lower_bound, BOUNDED)[None, :]
+        state += u[:, None] * k[None, :]
+    gl.store(state_pool + target * state_stride + offsets, state, mask=vv[:, None] < D)
+
+
+@gluon.jit(
+    launch_metadata=kda_records_launch_metadata,
+    do_not_specialize=[
+        "BATCH",
+        "qkv_stride",
+        "conv_stride",
+        "record_slots",
+        "stamp_layer_stride",
+    ],
+)
+def gluon_kda_commit_conv_history_gfx950(
+    descriptors,
+    group_indices,
+    reads,
+    writes,
+    accepted,
+    metadata,
+    stamps,
+    activation_ref,
+    history_ref,
+    BATCH,
+    qkv_stride,
+    conv_stride,
+    record_slots,
+    stamp_layer_stride,
+    H: gl.constexpr,
+    D: gl.constexpr,
+    T: gl.constexpr,
+    CAPACITY: gl.constexpr,
+    W: gl.constexpr,
+):
+    """Commit original QKV history after recurrent recovery has finished reading."""
+    tile, row, layer = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    group = gl.load(group_indices + layer).to(gl.int64)
+    source = gl.load(reads + group * BATCH + row).to(gl.int64)
+    target = gl.load(writes + group * BATCH + row).to(gl.int64)
+    if source <= 0 or target <= 0:
+        return
+    steps = gl.load(accepted + row)
+    _, _, valid = kda_record_interval(
+        metadata,
+        stamps,
+        row,
+        layer,
+        steps,
+        record_slots,
+        CAPACITY,
+        stamp_layer_stride,
+        T,
+        64,
+    )
+    if not valid:
+        return
+    desc = descriptors + layer * 10
+    qkv = gl.load(desc).to(gl.pointer_type(activation_ref.dtype.element_ty))
+    conv = gl.load(desc + 2).to(gl.pointer_type(history_ref.dtype.element_ty))
+    channels = tile * 256 + gl.arange(
+        0, 256, layout=gl.BlockedLayout([1], [64], [4], [0])
+    )
+    live = channels < 3 * H * D
+    # Load all old taps before storing any tap: source and target can alias.
+    values = ()
+    for tap in gl.static_range(W - 1):
+        position = steps + tap
+        old = gl.load(
+            conv + source * conv_stride + channels * (W - 1) + position,
+            mask=live & (position < W - 1),
+            other=0,
         )
-        valid_write = valid_write_idx & (replay_steps == token_offset + 1)
-        qkv_write_base = (
-            conv_pool
-            + safe_write_idx * CONV_POOL_PAGE_STRIDE
-            + qkv_channel * CONV_POOL_CHANNEL_STRIDE
+        new = gl.load(
+            qkv + (row.to(gl.int64) * T + position - (W - 1)) * qkv_stride + channels,
+            mask=live & (position >= W - 1),
+            other=0,
         )
-        write_mask = valid_write & (slot_id != 3)
-        gl.store(qkv_write_base, qkv_history1, mask=write_mask)
+        values += (gl.where(position < W - 1, old.to(gl.float32), new.to(gl.float32)),)
+    for tap in gl.static_range(W - 1):
         gl.store(
-            qkv_write_base + CONV_POOL_HISTORY_STRIDE,
-            qkv_history2,
-            mask=write_mask,
+            conv + target * conv_stride + channels * (W - 1) + tap,
+            values[tap],
+            mask=live,
         )
-        gl.store(
-            qkv_write_base + 2 * CONV_POOL_HISTORY_STRIDE,
-            qkv_input,
-            mask=write_mask,
-        )
-        decay_value = _kda_decay(
-            gl.load(
-                raw_g + token_idx * GATE_ROW_STRIDE + decay_channel,
-                mask=token_active,
-                other=0.0,
-            ).to(gl.float32),
-            gl.load(dt_bias + decay_channel).to(gl.float32),
-            a_value,
-            HAS_LOWER_BOUND,
-            LOWER_BOUND,
-        )
-        shared_vectors.index(token_offset).store(
-            gl.where(is_decay, decay_value, qkv_value)
-        )
-        qkv_history0 = gl.where(token_active, qkv_history1, qkv_history0)
-        qkv_history1 = gl.where(token_active, qkv_history2, qkv_history1)
-        qkv_history2 = gl.where(token_active, qkv_input, qkv_history2)
-
-    q_values = ()
-    k_values = ()
-    decay_values = ()
-    beta_values = ()
-    key_queries = ()
-    value_panels_by_token = ()
-    for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-        token_idx = token_base + token_offset
-        vectors = shared_vectors.index(token_offset)
-        q_value = vectors.slice(0, D, dim=0).load(key_layout)
-        k_value = vectors.slice(D, D, dim=0).load(key_layout)
-        q_value *= gl.rsqrt(gl.sum(q_value * q_value, axis=0) + 1e-6) * (D**-0.5)
-        k_value *= gl.rsqrt(gl.sum(k_value * k_value, axis=0) + 1e-6)
-        beta_value = gl.load(
-            beta_logits + token_idx * BETA_ROW_STRIDE + head_idx,
-            mask=token_offset < replay_steps,
-            other=0.0,
-        ).to(gl.float32)
-        beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
-        value_panels = _kda_value_panels(vectors, D, value_layout)
-        q_values = q_values + (q_value,)
-        k_values = k_values + (k_value,)
-        decay_values = decay_values + (vectors.slice(3 * D, D, dim=0).load(key_layout),)
-        beta_values = beta_values + (beta_value,)
-        key_queries = key_queries + (gl.sum(k_value * q_value, axis=0),)
-        value_panels_by_token = value_panels_by_token + (value_panels,)
-
-    for panel_idx in gl.static_range(8):
-        panel_offsets = off_pipe[0]
-        running = raw_pipe[0]
-
-        for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-            token_active = token_offset < replay_steps
-            panel_out = gl.zeros([16], gl.float32, layout=value_layout)
-            if token_active:
-                running *= decay_values[token_offset][None, :]
-                running, panel_out = _kda_recurrent_step(
-                    running,
-                    k_values[token_offset],
-                    q_values[token_offset],
-                    value_panels_by_token[token_offset][panel_idx],
-                    beta_values[token_offset],
-                    key_queries[token_offset],
-                )
-            valid_write = valid_write_idx & (replay_steps == token_offset + 1)
-            write_base = safe_write_idx * STATE_POOL_PAGE_STRIDE + head_idx * D * D
-            gl.store(
-                state_pool + write_base + panel_offsets,
-                running,
-                mask=valid_write,
-            )
-
-        next_idx = panel_idx + 1
-        if next_idx < 8:
-            next_offsets = (
-                panel_value_offsets[:, None] + next_idx * 16
-            ) * D + key_offsets[None, :]
-            next_raw = gl.load(state_pool + read_base + next_offsets).to(gl.float32)
-            off_pipe = off_pipe[1:] + (next_offsets,)
-            raw_pipe = raw_pipe[1:] + (next_raw,)
-        else:
-            off_pipe = off_pipe[1:] + (off_pipe[-1],)
-            raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
 
 
 def gluon_kda_recurrent_decode_gfx950(
@@ -1295,156 +1121,103 @@ def gluon_kda_fused_decode_gfx950(
 
 
 def gluon_kda_fused_verify_gfx950(
-    mixed_qkv: torch.Tensor,
-    conv_weights: torch.Tensor,
-    conv_pool: torch.Tensor,
-    conv_scratch: torch.Tensor,
+    *,
+    conv_qkv: torch.Tensor,
     raw_g: torch.Tensor,
     beta_logits: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
-    *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor | None,
     read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
+    correction: torch.Tensor,
+    key_gate: torch.Tensor,
+    record_metadata: torch.Tensor,
+    record_stamps: torch.Tensor,
+    query_start_loc: torch.Tensor,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
-    replay_mixed_qkv: torch.Tensor | None = None,
-    replay_gate: torch.Tensor | None = None,
-    replay_beta: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run fused no-store KDA verify and capture its raw-g replay payload."""
-    del conv_scratch, state_scratch, write_indices
-    if num_heads != 12 or head_dim != 128:
-        raise ValueError("gfx950 fused KDA verify requires H=12, D=128")
-    if draft_token_num <= 0:
-        raise ValueError("draft_token_num must be positive")
-    batch = read_indices.numel()
-    tokens = batch * draft_token_num
-    projection_width = num_heads * head_dim
-    tensors = (
-        mixed_qkv,
-        conv_weights,
-        conv_pool,
-        raw_g,
-        beta_logits,
-        A_log,
-        dt_bias,
-        state_pool,
-        read_indices,
-    )
-    if not all(
-        tensor.is_cuda and tensor.device == mixed_qkv.device for tensor in tensors
-    ):
-        raise ValueError("gfx950 fused KDA verify requires colocated GPU tensors")
-    if mixed_qkv.shape != (tokens, 3 * projection_width) or mixed_qkv.stride(1) != 1:
-        raise ValueError("mixed_qkv must be dense [batch * T, 3 * H * D]")
-    if (
-        conv_weights.shape != (3 * projection_width, 4)
-        or not conv_weights.is_contiguous()
-    ):
-        raise ValueError("conv_weights must be contiguous [3 * H * D, 4]")
-    conv_tail = (3 * projection_width, 3)
-    if conv_pool.ndim != 3 or conv_pool.shape[1:] != conv_tail:
-        raise ValueError("conv_pool must have shape [pages, 3 * H * D, 3]")
-    if conv_pool.stride()[1:] != (3, 1):
-        raise ValueError("convolution state inner dimensions must be contiguous")
-    if raw_g.shape != (tokens, projection_width) or raw_g.stride(1) != 1:
-        raise ValueError("raw_g must be dense [batch * T, H * D]")
-    if beta_logits.shape != (tokens, num_heads) or beta_logits.stride(1) != 1:
-        raise ValueError("beta_logits must be dense [batch * T, H]")
-    state_tail = (num_heads, head_dim, head_dim)
-    if state_pool.ndim != 4 or state_pool.shape[1:] != state_tail:
-        raise ValueError("state_pool must have shape [pages, H, V, K]")
-    expected_state_strides = (head_dim * head_dim, head_dim, 1)
-    if state_pool.stride()[1:] != expected_state_strides:
-        raise ValueError("recurrent state inner dimensions must be contiguous")
-    if read_indices.shape != (batch,):
-        raise ValueError("verify read_indices must have shape [batch]")
-    if A_log.shape != (num_heads,) or not A_log.is_contiguous():
-        raise ValueError("A_log must be contiguous [H]")
-    if dt_bias.shape != (projection_width,) or not dt_bias.is_contiguous():
-        raise ValueError("dt_bias must be contiguous [H * D]")
+    """Produce attention output and records without changing committed state.
 
-    read_indices = read_indices.to(
-        device=mixed_qkv.device, dtype=torch.int32
-    ).contiguous()
-    supplied = (
-        replay_mixed_qkv is not None,
-        replay_gate is not None,
-        replay_beta is not None,
-    )
-    if len(set(supplied)) != 1:
-        raise ValueError(
-            "replay_mixed_qkv, replay_gate and replay_beta must be supplied "
-            "together or all left unset"
-        )
-    capture_replay = supplied[0]
-    if capture_replay:
-        # The kernel declares the projections const, so it may not write them.
-        # Capturing into one would do exactly that, and the store would be
-        # invisible to the compiler: it targets a different parameter name.
-        aliased = [
-            name
-            for name, destination, source in (
-                ("replay_mixed_qkv", replay_mixed_qkv, mixed_qkv),
-                ("replay_gate", replay_gate, raw_g),
-                ("replay_beta", replay_beta, beta_logits),
-            )
-            if destination.data_ptr() == source.data_ptr()
-        ]
-        if aliased:
-            raise ValueError(
-                f"{', '.join(aliased)} must not alias the projections the "
-                "verify kernel reads; the replay payload needs its own buffers"
-            )
-    output = torch.empty(
-        (1, tokens, num_heads, head_dim),
-        dtype=mixed_qkv.dtype,
-        device=mixed_qkv.device,
-    )
-    value_splits = _kda_value_splits(batch)
-    gluon_kda_fused_paged_verify_nostore_vmajor_gfx950[
-        (num_heads * value_splits, batch)
-    ](
-        mixed_qkv,
-        conv_weights,
-        conv_pool,
+    conv_qkv contains activation-dtype post-convolution Q/K/V rows; raw_g and
+    beta_logits are projected gate inputs. state_pool is FP32 [page, head, V, K].
+    read_indices selects checkpoint pages; nonpositive pages are padding.
+    correction is FP32 [slot, head, capacity, V]. key_gate has the same layout
+    with activation-dtype unnormalized K followed by raw gate in its last axis.
+    record_metadata is INT64 [batch, 3] (slot, generation, absolute start), and
+    record_stamps is INT64 [slots, capacity, 2] (position, generation).
+    query_start_loc supplies packed token boundaries. draft_token_num bounds
+    the candidate window; ordinary decode uses one token. lower_bound selects
+    the bounded gate, or None selects softplus. Return [1, tokens, heads, dim].
+    """
+    validate_kda_records_verify(
+        conv_qkv,
         raw_g,
         beta_logits,
         state_pool,
         read_indices,
-        output,
-        replay_mixed_qkv,
-        replay_gate,
-        replay_beta,
+        correction,
+        key_gate,
+        record_metadata,
+        record_stamps,
+        query_start_loc,
         A_log,
         dt_bias,
+        num_heads,
+        head_dim,
+        draft_token_num,
+    )
+    batch = read_indices.numel()
+    output = torch.empty(
+        (1, conv_qkv.shape[0], num_heads, head_dim),
+        device=conv_qkv.device,
+        dtype=conv_qkv.dtype,
+    )
+    if not batch:
+        return output
+    gluon_kda_fused_paged_verify_nostore_vmajor_gfx950[
+        (triton.cdiv(head_dim, 8), batch, num_heads)
+    ](
+        conv_qkv,
+        raw_g,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool,
+        read_indices,
+        correction,
+        key_gate,
+        record_metadata,
+        record_stamps,
+        query_start_loc,
+        output,
+        conv_qkv.stride(0),
+        raw_g.stride(0),
+        beta_logits.stride(0),
+        state_pool.stride(0),
+        state_pool.stride(1),
+        state_pool.stride(2),
+        state_pool.stride(3),
+        read_indices.stride(0),
+        query_start_loc.stride(0),
+        correction.stride(0),
+        correction.stride(1),
+        correction.stride(2),
+        key_gate.stride(0),
+        key_gate.stride(1),
+        key_gate.stride(2),
+        correction.shape[0],
+        lower_bound,
         H=num_heads,
         D=head_dim,
-        TOKENS_PER_SEQUENCE=draft_token_num,
-        VALUE_SPLITS=value_splits,
-        MIXED_ROW_STRIDE=mixed_qkv.stride(0),
-        CONV_WEIGHT_ROW_STRIDE=conv_weights.stride(0),
-        CONV_WEIGHT_COL_STRIDE=conv_weights.stride(1),
-        CONV_POOL_PAGE_STRIDE=conv_pool.stride(0),
-        CONV_POOL_CHANNEL_STRIDE=conv_pool.stride(1),
-        CONV_POOL_HISTORY_STRIDE=conv_pool.stride(2),
-        GATE_ROW_STRIDE=raw_g.stride(0),
-        BETA_ROW_STRIDE=beta_logits.stride(0),
-        REPLAY_MIXED_ROW_STRIDE=(replay_mixed_qkv.stride(0) if capture_replay else 0),
-        REPLAY_GATE_ROW_STRIDE=replay_gate.stride(0) if capture_replay else 0,
-        REPLAY_BETA_ROW_STRIDE=replay_beta.stride(0) if capture_replay else 0,
-        CAPTURE_REPLAY=capture_replay,
-        STATE_POOL_PAGE_STRIDE=state_pool.stride(0),
-        NUM_POOL_SLOTS=state_pool.shape[0],
-        HAS_LOWER_BOUND=lower_bound is not None,
-        LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
+        T=draft_token_num,
+        CAPACITY=correction.shape[2],
+        BOUNDED=lower_bound is not None,
+        BV=8,
         num_warps=4,
-        num_stages=2,
+        debug=True,
     )
     return output
 
@@ -1459,65 +1232,123 @@ def launch_gluon_kda_fused_replay_gfx950(
     draft_token_num: int,
     num_heads: int,
     head_dim: int,
-    f_a_dim: int,
     qkv_stride: int,
     conv_stride: int,
-    f_a_stride: int,
-    beta_stride: int,
+    correction_stride: int,
+    key_gate_stride: int,
     state_stride: int,
-    gate_stride: int,
     conv_width: int,
-    lower_bound: float,
+    activation_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    lower_bound: float | None,
 ) -> None:
-    """Replay every raw-g layer through the established Gluon recurrence."""
-    del f_a_dim, f_a_stride
-    if num_heads != 12 or head_dim != 128 or conv_width != 4:
-        raise ValueError("gfx950 batched KDA replay requires H=12, D=128, W=4")
-    if descriptors.ndim != 2 or descriptors.shape[1] != 10:
-        raise ValueError("descriptors must have shape [layers, 10]")
-    if descriptors.dtype != torch.uint64 or not descriptors.is_contiguous():
-        raise ValueError("descriptors must be contiguous uint64")
-    layers = descriptors.shape[0]
-    if group_indices.shape != (layers,):
-        raise ValueError(
-            f"group_indices must have shape ({layers},), got {group_indices.shape}"
-        )
-    if group_indices.dtype != torch.int32:
-        raise TypeError("group_indices must use torch.int32")
-    if group_indices.device != descriptors.device:
-        raise ValueError("group_indices and descriptors must be on the same device")
-    if not group_indices.is_contiguous():
-        raise ValueError("group_indices must be contiguous")
-    if read_indices.ndim != 2 or write_indices.shape != read_indices.shape:
-        raise ValueError(
-            "replay page indices must have matching [groups, batch] shapes"
-        )
-    batch = accepted_length.numel()
-    if read_indices.shape[1] != batch:
-        raise ValueError("accepted_length must match the replay batch")
-    gluon_kda_fused_replay_gfx950[(num_heads, batch, descriptors.shape[0])](
+    """Recover all layers from saved U/K/raw-g records, then commit conv history.
+
+    Args:
+        descriptors: Contiguous uint64 [layers, 10] pointer table. Columns
+            0/2/8 hold original QKV, conv history and recurrent state; 3/5
+            hold FP32 U and activation-dtype K/raw-g; 6/7 hold A_log/dt_bias.
+            Columns 1/4/9 are reserved and are not read.
+        group_indices: INT32 cache-group row for each layer.
+        read_indices: Contiguous INT32 [groups, batch] checkpoint pages.
+        write_indices: Matching destination pages. Nonpositive source or
+            destination pages mark padding and leave both pools unchanged.
+        accepted_length: Contiguous INT32 [batch] counts in [0, draft_token_num].
+            Zero copies the checkpoint and conv history without reading records.
+        draft_token_num: Candidate window bound; standard decode uses 1.
+        num_heads: Local head count.
+        head_dim: Key/value width, currently 128.
+        qkv_stride: Original QKV row stride in elements.
+        conv_stride: Conv-history page stride in elements.
+        correction_stride: FP32 U token stride in elements.
+        key_gate_stride: K/raw-g token stride in elements.
+        state_stride: FP32 recurrent page stride in elements.
+        conv_width: Convolution taps, currently 4.
+        activation_dtype: Original QKV and K/raw-g storage dtype.
+        conv_state_dtype: Persistent conv-history dtype, independently of inputs.
+        record_metadata: INT64 [batch, 3] (slot, generation, absolute start).
+        record_stamps: INT64 [layers, slots, capacity, 2] position/generation.
+            Both metadata tensors can be None for standalone unstamped probes.
+        lower_bound: Bounded log-decay, or None for softplus.
+
+    Returns:
+        None. Updates accepted destination states and history. Source and
+        destination may alias within a request; writable pages cannot overlap
+        between requests. Recovery never recomputes the state-dependent U.
+    """
+    if head_dim != 128 or conv_width != 4:
+        raise ValueError("gfx950 records commit requires D=128 and W=4")
+    validate_kda_records_commit(
         descriptors,
         group_indices,
         read_indices,
         write_indices,
         accepted_length,
+        record_metadata,
+        record_stamps,
+        draft_token_num,
+    )
+    batch, layers = accepted_length.numel(), descriptors.shape[0]
+    if not batch:
+        return
+    capacity = draft_token_num if record_stamps is None else record_stamps.shape[2]
+    slots = batch if record_stamps is None else record_stamps.shape[1]
+    stamp_stride = 0 if record_stamps is None else record_stamps.stride(0)
+    activation_ref = torch.empty(0, dtype=activation_dtype, device=descriptors.device)
+    history_ref = torch.empty(0, dtype=conv_state_dtype, device=descriptors.device)
+    gluon_kda_fused_replay_gfx950[
+        (triton.cdiv(head_dim, 8), batch, layers * num_heads)
+    ](
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        record_metadata,
+        record_stamps,
+        activation_ref,
+        batch,
+        state_stride,
+        correction_stride,
+        key_gate_stride,
+        slots,
+        stamp_stride,
+        lower_bound,
         H=num_heads,
         D=head_dim,
-        TOKENS_PER_SEQUENCE=draft_token_num,
-        MIXED_ROW_STRIDE=qkv_stride,
-        CONV_WEIGHT_ROW_STRIDE=conv_width,
-        CONV_WEIGHT_COL_STRIDE=1,
-        CONV_POOL_PAGE_STRIDE=conv_stride,
-        CONV_POOL_CHANNEL_STRIDE=3,
-        CONV_POOL_HISTORY_STRIDE=1,
-        GATE_ROW_STRIDE=gate_stride,
-        BETA_ROW_STRIDE=beta_stride,
-        STATE_POOL_PAGE_STRIDE=state_stride,
-        HAS_LOWER_BOUND=True,
-        LOWER_BOUND=lower_bound,
-        BATCH_SIZE=batch,
+        T=draft_token_num,
+        CAPACITY=capacity,
+        BOUNDED=lower_bound is not None,
+        BV=8,
         num_warps=4,
-        num_stages=2,
+        debug=True,
+    )
+    gluon_kda_commit_conv_history_gfx950[
+        (triton.cdiv(3 * num_heads * head_dim, 256), batch, layers)
+    ](
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        record_metadata,
+        record_stamps,
+        activation_ref,
+        history_ref,
+        batch,
+        qkv_stride,
+        conv_stride,
+        slots,
+        stamp_stride,
+        H=num_heads,
+        D=head_dim,
+        T=draft_token_num,
+        CAPACITY=capacity,
+        W=conv_width,
+        num_warps=4,
+        debug=True,
     )
 
 

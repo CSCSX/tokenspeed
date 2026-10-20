@@ -31,7 +31,6 @@ import torch
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     KdaReplayRecords,
-    kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
@@ -47,7 +46,6 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
 from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
@@ -167,7 +165,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
         self._replay_active = False
         self._batched_replay_kernel = None
-        self._replay_uses_raw_gate = False
         self._verify_split_producers = False
         self._reset_replay_state()
         self.kda_backend = (kda_backend or "auto").strip().lower()
@@ -192,7 +189,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             int,
             tuple[
                 torch.Tensor,
-                torch.Tensor | None,
                 torch.Tensor,
                 torch.Tensor,
                 int,
@@ -290,9 +286,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             if self._replay_active
             else None
         )
-        self._replay_uses_raw_gate = self._replay_active and (
-            kda_batched_replay_uses_raw_gate(self.dtype, **shape)
-        )
         self._verify_split_producers = self._replay_active and (
             kda_fused_paged_verify_uses_split_producers(
                 self.dtype,
@@ -352,8 +345,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     conv_channels=first_conv.shape[1],
                     num_heads=hv,
                     head_dim=head_dim,
-                    records=self._verify_split_producers,
-                    raw_gate=self._replay_uses_raw_gate,
                 )
             )
             self._replay_descriptors = addresses
@@ -522,7 +513,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if layer_id in self._replay_descriptor_bound:
             return
         assert self._replay_descriptors is not None
-        conv_w, f_b, A_log, dt_bias, _num_heads, _head_dim, lower_bound = weights
+        conv_w, A_log, dt_bias, _num_heads, _head_dim, lower_bound = weights
         if dt_bias is None:
             return
         conv, state = self._state_components(layer_id)
@@ -536,7 +527,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     conv_w.data_ptr(),
                     conv.data_ptr(),
                     f_a.data_ptr(),
-                    0 if f_b is None else f_b.data_ptr(),
+                    0,
                     beta.data_ptr(),
                     A_log.data_ptr(),
                     dt_bias.data_ptr(),
@@ -550,11 +541,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._replay_descriptor_bound.add(layer_id)
         if len(self._replay_descriptor_bound) == len(self._descriptor_row_by_layer):
             first = next(iter(self._replay_weights.values()))
-            first_conv_w, first_f_b, _, _, first_heads, first_dim, _ = first
+            first_conv_w, _, _, first_heads, first_dim, _ = first
             geometry = (
                 first_heads,
                 first_dim,
-                0 if first_f_b is None else first_f_b.shape[1],
                 first_conv_w.shape[1],
             )
             first_layer = next(iter(self._replay_weights))
@@ -572,11 +562,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
             lower_bounds = set()
             for current_layer, layer_weights in self._replay_weights.items():
-                layer_conv_w, layer_f_b, _, _, layer_heads, layer_dim, _ = layer_weights
+                layer_conv_w, _, _, layer_heads, layer_dim, _ = layer_weights
                 if (
                     layer_heads,
                     layer_dim,
-                    0 if layer_f_b is None else layer_f_b.shape[1],
                     layer_conv_w.shape[1],
                 ) != geometry:
                     raise RuntimeError("batched KDA replay requires uniform geometry")
@@ -596,7 +585,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 lower_bounds.add(layer_weights[-1])
             if len(lower_bounds) != 1:
                 raise RuntimeError("batched KDA replay requires one lower bound")
-            conv_width = geometry[3]
+            conv_width = geometry[2]
             if self._batched_replay_kernel is not None:
                 descriptors = self._replay_descriptors
                 group_indices = self._replay_group_indices
@@ -604,18 +593,18 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 draft_tokens = self.speculative_num_draft_tokens
 
                 def launch(read_indices, write_indices, accepted_length):
-                    record_args = {}
-                    if self._verify_split_producers:
-                        assert self._replay_record_metadata is not None
-                        assert self._replay_record_stamps is not None
-                        record_args = {
-                            "activation_dtype": first_beta.dtype,
-                            "conv_state_dtype": first_conv.dtype,
-                            "record_metadata": self._replay_record_metadata[
-                                : accepted_length.shape[0]
-                            ],
-                            "record_stamps": self._replay_record_stamps,
-                        }
+                    assert self._replay_record_metadata is not None
+                    assert self._replay_record_stamps is not None
+                    record_args = {
+                        "correction_stride": strides[2],
+                        "key_gate_stride": strides[3],
+                        "activation_dtype": first_beta.dtype,
+                        "conv_state_dtype": first_conv.dtype,
+                        "record_metadata": self._replay_record_metadata[
+                            : accepted_length.shape[0]
+                        ],
+                        "record_stamps": self._replay_record_stamps,
+                    }
                     self._batched_replay_kernel(
                         descriptors=descriptors,
                         group_indices=group_indices,
@@ -625,13 +614,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         draft_token_num=draft_tokens,
                         num_heads=geometry[0],
                         head_dim=geometry[1],
-                        f_a_dim=geometry[2],
                         qkv_stride=strides[0],
                         conv_stride=strides[1],
-                        f_a_stride=strides[2],
-                        beta_stride=strides[3],
                         state_stride=strides[4],
-                        gate_stride=strides[5],
                         conv_width=conv_width,
                         lower_bound=next(iter(lower_bounds)),
                         **record_args,
@@ -660,18 +645,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         scratch = {}
         for layer_id in self._state_layer_ids():
             conv, _ = self._state_components(layer_id)
-            if self._replay_uses_raw_gate and conv.shape[0] < rows:
-                raise RuntimeError(
-                    f"KDA verify needs {rows} transient conv rows but the "
-                    f"bound pool's conv slab holds {conv.shape[0]}"
-                )
             scratch[layer_id] = (
-                (
-                    conv
-                    if self._replay_uses_raw_gate
-                    else torch.empty(
-                        (rows, *conv.shape[1:]), dtype=conv.dtype, device=conv.device
-                    )
+                torch.empty(
+                    (rows, *conv.shape[1:]), dtype=conv.dtype, device=conv.device
                 ),
                 None,
             )
@@ -682,11 +658,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if not self._replay_active:
             return super().preallocate_verify_workspace(max_bs, draft_token_num)
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        conv_bytes = (
-            0
-            if self._replay_uses_raw_gate
-            else sum(pair[0].nbytes for pair in self._verify_scratch.values())
-        )
+        conv_bytes = sum(pair[0].nbytes for pair in self._verify_scratch.values())
         payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
         metadata_bytes = sum(
             tensor.nbytes
@@ -858,26 +830,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
     ) -> torch.Tensor | None:
         """Keep live state read-only; acceptance commits the selected prefix."""
         if self._replay_active:
-            if not self._verify_split_producers and (
-                f_a_out is None or bias is not None
-            ):
-                raise RuntimeError(
-                    "KDA eager replay requires f_a_out and a bias-free convolution"
-                )
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
-            replay_payload = {}
             replay_records = None
             split_producers = {}
-            if self._replay_uses_raw_gate:
-                # Fused verify writes QKV, raw-g, and beta directly into the
-                # persistent replay payload, avoiding a separate capture launch.
-                replay_payload = {
-                    "replay_mixed_qkv": qkv[:rows, : mixed_qkv.shape[-1]],
-                    "replay_gate": gate[:rows],
-                    "replay_beta": beta[:rows, : beta_raw.shape[-1]],
-                }
-            elif self._verify_split_producers:
+            if self._verify_split_producers:
                 heads = value_dim // attn_tp_size // head_v_dim
                 fork = self._verify_producer_forks[layer_id]
                 with fork.scope(enable=True) as producer_fork:
@@ -922,22 +879,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     ],
                 )
             else:
-                capture_replay_payload(
-                    (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
-                    (
-                        qkv[:rows, : mixed_qkv.shape[-1]],
-                        f_a[:rows, : f_a_out.shape[-1]],
-                        beta[:rows, : beta_raw.shape[-1]],
-                    ),
-                    rows,
-                )
+                raise RuntimeError("KDA replay requires record-producing verification")
             num_value_heads = value_dim // attn_tp_size // head_v_dim
             if layer_id not in self._replay_weights:
                 # Parameters are stable objects; model weight updates copy into
                 # their storage, so binding their pointers once cannot stale.
                 self._replay_weights[layer_id] = (
                     conv_weights,
-                    f_b_weight,
                     A_log,
                     dt_bias,
                     num_value_heads,
@@ -966,7 +914,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=replay_records,
-                **replay_payload,
                 **split_producers,
             )
             if fused_out is None:
@@ -1085,7 +1032,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
-        from tokenspeed_kernel.ops.attention.kda import try_kda_replay_commit
 
         _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
@@ -1093,7 +1039,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         write_stack, steps = self._resolve_verify_commit_pages(
             accepted_length, group_ids
         )
-        rows = bs * draft_token_num
         if self._batched_replay_ready:
             self._batched_replay_launch(
                 (
@@ -1117,10 +1062,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
             # A layer subset uses the same record recovery kernel. Full model
             # forwards bind all layers and use the single batched launch above.
             for layer_id, weights in self._replay_weights.items():
-                conv_w, f_b, _, _, heads, dim, lower_bound = weights
+                conv_w, _, _, heads, dim, lower_bound = weights
                 row = self._descriptor_row_by_layer[layer_id]
                 conv, state = self._state_components(layer_id)
-                qkv, correction, key_gate, gate = self._replay_payload(layer_id)
+                qkv, correction, key_gate, _ = self._replay_payload(layer_id)
                 self._batched_replay_kernel(
                     descriptors=self._replay_descriptors[row : row + 1],
                     group_indices=self._replay_group_indices[row : row + 1],
@@ -1132,13 +1077,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     draft_token_num=draft_token_num,
                     num_heads=heads,
                     head_dim=dim,
-                    f_a_dim=0 if f_b is None else f_b.shape[1],
                     qkv_stride=qkv.stride(0),
                     conv_stride=conv.stride(0),
-                    f_a_stride=correction.stride(0),
-                    beta_stride=key_gate.stride(0),
+                    correction_stride=correction.stride(0),
+                    key_gate_stride=key_gate.stride(0),
                     state_stride=state.stride(0),
-                    gate_stride=gate.stride(0),
                     conv_width=conv_w.shape[1],
                     lower_bound=lower_bound,
                     activation_dtype=key_gate.dtype,
@@ -1148,45 +1091,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 )
             self._verify_commit_ctx = None
             return
-        if self._replay_uses_raw_gate:
-            raise RuntimeError("batched raw-g KDA replay was not ready at commit")
-        pages_by_group = {g: write_stack[i] for i, g in enumerate(group_ids)}
-        for layer_id, weights in self._replay_weights.items():
-            conv_w, f_b, A_log, dt_bias, num_heads, head_dim, lower_bound = weights
-            group_id = self._state_group_for(layer_id)
-            conv, state = self._state_components(layer_id)
-            qkv, f_a, beta, gate = self._replay_payload(layer_id)
-            if not try_kda_replay_commit(
-                qkv[:rows, : conv_w.shape[0]],
-                conv_w,
-                conv,
-                conv,
-                f_a[:rows, : f_b.shape[1]],
-                f_b,
-                beta[:rows, :num_heads],
-                A_log,
-                dt_bias,
-                state_pool=state,
-                state_out=state,
-                read_indices=read_pages_by_group[group_id][:bs],
-                write_indices=pages_by_group[group_id],
-                accepted_length=steps,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                draft_token_num=draft_token_num,
-                lower_bound=lower_bound,
-                gate_scratch=gate[:rows, : num_heads * head_dim],
-                replay_gate=(
-                    gate[:rows, : num_heads * head_dim]
-                    if self._replay_uses_raw_gate
-                    else None
-                ),
-                recurrent_layout=self.kda_recurrent_layout,
-            ):
-                raise RuntimeError(
-                    "KDA replay commit kernel vanished after capability probing"
-                )
-        self._verify_commit_ctx = None
+        raise RuntimeError("batched KDA replay was not ready at commit")
 
     @override
     def _prefill_scan(

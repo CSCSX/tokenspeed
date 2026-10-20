@@ -25,14 +25,12 @@ from __future__ import annotations
 import pytest
 import torch
 from kda_replay_reference import (
+    _gate_tiling,
+    _gate_tiling_dot,
     batched_kda_gate_precompute_dot_kernel,
     batched_kda_gate_precompute_kernel,
 )
 from tokenspeed_kernel._triton import triton
-from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-    _gate_tiling,
-    _gate_tiling_dot,
-)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"

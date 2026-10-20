@@ -1837,3 +1837,24 @@ FP32 bits of the quotient, and its codes are the correctly rounded
 `x / scale` cast to E4M3. Each program covers consecutive groups, with four
 threads per group and eight elements per thread: 32 groups and four warps
 below 49,152 groups, and 256 groups and eight warps from there.
+
+### KDA records verify and commit (gfx950 / gfx1250)
+
+Standard target decode is a one-token verify window. Both standard and
+speculative decode follow verify, acceptance, and commit. Verify consumes
+activation-dtype convolution outputs and projected gates, leaves committed
+FP32 state unchanged, and saves FP32 correction U plus unnormalized K and raw
+gate in the activation dtype. The current AMD registration supports BF16.
+
+Records use slot/head/ring-position/channel order. INT64 metadata supplies the
+slot, generation, and absolute start; position/generation stamps guard against
+reusing a stale window. Recovery reads the accepted prefix, recomputes key
+normalization and decay, and applies U without recomputing the prediction.
+A zero accepted count copies the checkpoint. Nonpositive source/destination
+pages are padding. Groups select independent page-table rows for each layer.
+
+Batched descriptors use the shared ten-column table: original QKV (0), conv
+history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
+The remaining columns are reserved. A separate convolution-history commit
+reads all old taps before writes, including when source and destination alias.
+History retains its bound pool dtype; original QKV is converted on commit.

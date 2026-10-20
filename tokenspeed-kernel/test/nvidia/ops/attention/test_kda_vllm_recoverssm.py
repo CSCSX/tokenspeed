@@ -706,8 +706,6 @@ def test_verify_derived_records_with_serving_producers(
             conv_channels=3 * channels,
             num_heads=heads,
             head_dim=dim,
-            records=True,
-            raw_gate=False,
         )
     )
     payloads[0].copy_(raw)

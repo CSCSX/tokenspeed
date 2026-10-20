@@ -497,36 +497,3 @@ class CacheRecipe(ABC):
     def pool_options(self) -> object | None:
         """Family-specific options the pool constructor needs."""
         return None
-
-
-def kda_verify_scratch_in_pool(server_args, attn_config) -> bool:
-    """Raw-gate KDA replay reuses the committed conv slab as verify scratch."""
-    # A PD prefill role never verifies, so it stages no verify scratch.
-    if (
-        server_args.speculative_algorithm is None
-        or server_args.disaggregation_mode == "prefill"
-    ):
-        return False
-    from tokenspeed_kernel.ops.attention.kda import (
-        kda_batched_replay_uses_raw_gate,
-        kda_recurrent_layout,
-        kda_replay_commit_supported,
-    )
-
-    linear_attn = attn_config.component(LinearAttnConfig)
-    if linear_attn is None:
-        # No linear attention, so no conv slab for verify scratch to alias.
-        return False
-
-    heads, head_dim, _ = linear_attn.temporal_state_shape
-    return bool(
-        kda_replay_commit_supported(
-            attn_config.dtype,
-            recurrent_layout=kda_recurrent_layout(),
-            num_heads=heads,
-            head_dim=head_dim,
-        )
-        and kda_batched_replay_uses_raw_gate(
-            attn_config.dtype, num_heads=heads, head_dim=head_dim
-        )
-    )

@@ -29,11 +29,147 @@ It supplies the main-branch accepted-state reference for differential tests.
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-    _gate_tiling,
-    _gate_tiling_dot,
-    _kda_window_step,
     batched_kda_commit_conv_window_kernel,
 )
+
+_SM_COUNT: dict[int, int] = {}
+
+
+@triton.jit
+def _kda_window_step(
+    qkv_raw,
+    beta,
+    tok,
+    stride_raw_tok,
+    stride_beta_tok,
+    i_hv,
+    qf,
+    kf,
+    vf,
+    mask_k,
+    mask_v,
+    w_q0,
+    w_q1,
+    w_q2,
+    w_q3,
+    w_k0,
+    w_k1,
+    w_k2,
+    w_k3,
+    w_v0,
+    w_v1,
+    w_v2,
+    w_v3,
+    s_q0,
+    s_q1,
+    s_q2,
+    s_k0,
+    s_k1,
+    s_k2,
+    s_v0,
+    s_v1,
+    s_v2,
+    b_h,
+    g_at,
+    scale,
+    COMPUTE_OUT: tl.constexpr,
+):
+    """One KDA token step: conv(+silu), f_b gate GEMV, delta-rule update.
+
+    The single source of the per-token math. Every consumer -- plain verify,
+    standalone replay, and the replay prefix fused into the next verify --
+    inlines this same body, so their states cannot drift apart numerically.
+
+    Returns the rolled conv window registers, the updated state, and the
+    attention output (zeros unless ``COMPUTE_OUT``; replayed positions never
+    need it, and skipping it drops the output dot from the critical path).
+    """
+    x_q = tl.load(qkv_raw + tok * stride_raw_tok + qf, mask=mask_k, other=0.0).to(
+        tl.float32
+    )
+    x_k = tl.load(qkv_raw + tok * stride_raw_tok + kf, mask=mask_k, other=0.0).to(
+        tl.float32
+    )
+    x_v = tl.load(qkv_raw + tok * stride_raw_tok + vf, mask=mask_v, other=0.0).to(
+        tl.float32
+    )
+
+    acc_q = x_q * w_q3 + s_q0 * w_q0 + s_q1 * w_q1 + s_q2 * w_q2
+    acc_k = x_k * w_k3 + s_k0 * w_k0 + s_k1 * w_k1 + s_k2 * w_k2
+    acc_v = x_v * w_v3 + s_v0 * w_v0 + s_v1 * w_v1 + s_v2 * w_v2
+    b_q = acc_q * tl.sigmoid(acc_q)
+    b_k = acc_k * tl.sigmoid(acc_k)
+    b_v = acc_v * tl.sigmoid(acc_v)
+
+    # roll the window: after consuming x_t the taps are (x_{t-2}, x_{t-1}, x_t)
+    s_q0, s_q1, s_q2 = s_q1, s_q2, x_q
+    s_k0, s_k1, s_k2 = s_k1, s_k2, x_k
+    s_v0, s_v1, s_v2 = s_v1, s_v2, x_v
+
+    # f_b gate for this token: read it, or run the GEMV inline. Reading wins
+    # whenever the caller can amortize the [K, D_FA] weight tile -- held live
+    # across the recurrence it costs 128 registers per thread and spills.
+    b_gk = tl.load(g_at, mask=mask_k, other=0.0)
+
+    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_q = b_q * scale
+
+    b_h *= tl.exp(b_gk)[None, :]
+    b_v = b_v - tl.sum(b_h * b_k[None, :], axis=1)
+    b_beta = tl.load(beta + tok * stride_beta_tok + i_hv).to(tl.float32)
+    b_beta = tl.sigmoid(b_beta)
+    b_v *= b_beta
+    b_h += b_v[:, None] * b_k[None, :]
+    b_o = tl.zeros_like(b_v)
+    if COMPUTE_OUT:
+        b_o = tl.sum(b_h * b_q[None, :], axis=1)
+    return s_q0, s_q1, s_q2, s_k0, s_k1, s_k2, s_v0, s_v1, s_v2, b_h, b_o
+
+
+def _sm_count(device) -> int:
+    """Multiprocessor count for the device, memoized per index."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    sms = _SM_COUNT.get(index)
+    if sms is None:
+        sms = torch.cuda.get_device_properties(index).multi_processor_count
+        _SM_COUNT[index] = sms
+    return sms
+
+
+def _gate_tiling(rows: int, num_heads: int, head_dim: int, device, layers: int = 1):
+    """Rows and gate channels per program: the widest tile the grid can afford.
+
+    Both knobs only decide which rows a program owns -- every row still
+    reduces over the whole D_FA axis -- but the tile shape does pick the
+    reduction tree, so two tilings agree to a few ulp rather than bit for bit.
+    What the choice really moves is the ``[BK, D_FA]`` weight traffic, which
+    scales with ``cdiv(rows, block_t)``: a narrower row block buys parallelism
+    by reading that tile again in every program, so taking one the grid did
+    not need is pure amplification.
+
+    ``layers`` is the batched caller's outer grid dimension. Omitting it made
+    the estimate short by that factor and drove the all-layer launch to the
+    narrowest tiling at every batch size.
+    """
+    sms = _sm_count(device)
+    for block_t, block_k in ((8, 32), (4, 32), (2, 16), (1, 16)):
+        if block_t > rows:
+            continue
+        programs = (
+            layers
+            * num_heads
+            * triton.cdiv(rows, block_t)
+            * triton.cdiv(head_dim, block_k)
+        )
+        if programs >= 4 * sms:
+            return block_t, min(block_k, triton.next_power_of_2(head_dim))
+    return 1, min(16, triton.next_power_of_2(head_dim))
+
+
+def _gate_tiling_dot(rows: int, head_dim: int):
+    """Tiling from shape alone, so looped and batched launches match bitwise."""
+    return 32 if rows >= 32 else 16, min(32, triton.next_power_of_2(head_dim))
 
 
 @triton.jit

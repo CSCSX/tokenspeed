@@ -24,7 +24,6 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_verify_conv_update,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
-    try_kda_replay_commit,
 )
 from tokenspeed_kernel.platform import Platform, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -649,7 +648,7 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             },
         ),
         (
-            "triton_nvidia_kda_verify_conv_update",
+            "triton_kda_verify_conv_update",
             {
                 "paged_state": frozenset({True}),
                 "split_producers": frozenset({True}),
@@ -748,24 +747,22 @@ def test_batched_replay_call_contract() -> None:
         draft_token_num=1,
         num_heads=1,
         head_dim=128,
-        f_a_dim=1,
         qkv_stride=1,
         conv_stride=1,
-        f_a_stride=1,
-        beta_stride=1,
         state_stride=1,
-        gate_stride=1,
         conv_width=4,
         lower_bound=-5.0,
         **(
             {
+                "correction_stride": 1,
+                "key_gate_stride": 1,
                 "activation_dtype": torch.bfloat16,
                 "conv_state_dtype": torch.bfloat16,
                 "record_metadata": tensor,
                 "record_stamps": tensor,
             }
             if "record_metadata" in parameters
-            else {}
+            else {"gate_stride": 1, "beta_stride": 1}
         ),
     )
 
@@ -787,7 +784,6 @@ def test_kda_split_verify_registration_traits() -> None:
     "kernel_name,extra_traits",
     [
         ("triton_nvidia_kda_paged_decode", {"indexed_state": True}),
-        ("triton_nvidia_kda_replay_commit", {"flat_state": True}),
         (
             "triton_nvidia_kda_batched_replay_commit",
             {"flat_state": True, "batched_layers": True},
@@ -828,17 +824,11 @@ def test_kda_decode_and_replay_select_layout_trait(
         cu_seqlens=torch.empty(2),
         recurrent_layout=recurrent_layout,
     )
-    try_kda_replay_commit(
-        *([tensor] * 9),
-        state_pool=tensor,
-        state_out=tensor,
-        read_indices=tensor,
-        write_indices=tensor,
-        accepted_length=tensor,
+    attention_ops.kda_replay_commit_supported(
+        torch.bfloat16,
+        recurrent_layout=recurrent_layout,
         num_heads=1,
         head_dim=1,
-        draft_token_num=1,
-        recurrent_layout=recurrent_layout,
     )
     assert selected[0]["recurrent_layout"] == recurrent_layout
     assert selected[1]["recurrent_layout"] == recurrent_layout

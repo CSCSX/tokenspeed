@@ -854,13 +854,8 @@ def test_no_store_fused_verify_matches_decomposed_outputs():
 
 
 def test_rebinding_the_pool_reissues_the_raw_gate_scratch(monkeypatch):
-    """Raw-gate scratch is issued against the bound pool; a rebind must not keep the old one."""
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: True,
-    )
+    """Rebinding drops the previous records workspace and its references to the old pool."""
     harness = _Harness(draft_tokens=T, eager_replay=True)
-    assert harness.backend._replay_uses_raw_gate
     harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
     old_pool = storages_of(
         *(
@@ -1038,17 +1033,16 @@ def test_a_rebound_backend_matches_a_fresh_one_field_by_field():
 
 
 def test_a_pool_too_small_for_the_raw_gate_scratch_is_refused(monkeypatch):
-    """The raw-gate scratch is the pool's own conv slab, so a probe pool must hold max_bs rows."""
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: True,
-    )
+    """Records workspace is independent of the small cache used during graph probing."""
     harness = _Harness(draft_tokens=T, eager_replay=True)
-    assert harness.backend._replay_uses_raw_gate
     harness.backend.set_kv_pool(_make_kimi_pool(DEV, usable_pages=4))
 
-    with pytest.raises(RuntimeError, match="transient conv rows"):
-        harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    for layer_id in harness.layer_ids:
+        conv = harness.backend._state_components(layer_id)[0]
+        scratch = harness.backend._verify_scratch[layer_id][0]
+        assert scratch.shape[0] >= harness.config.max_bs
+        assert scratch.untyped_storage().data_ptr() != conv.untyped_storage().data_ptr()
 
 
 def test_hybrid_rebinding_reaches_the_state_child():

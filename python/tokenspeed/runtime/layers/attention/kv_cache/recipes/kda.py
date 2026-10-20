@@ -82,7 +82,6 @@ def kda_verify_workspace_bytes(
         )
 
     from tokenspeed_kernel.ops.attention.kda import (
-        kda_batched_replay_uses_raw_gate,
         kda_fused_paged_verify_uses_split_producers,
         kda_recurrent_layout,
         kda_replay_payload_specs,
@@ -90,9 +89,6 @@ def kda_verify_workspace_bytes(
 
     linear = config.component(LinearAttnConfig)
     heads, head_dim, _ = linear.temporal_state_shape
-    raw_gate = kda_batched_replay_uses_raw_gate(
-        config.dtype, num_heads=heads, head_dim=head_dim
-    )
     records = kda_fused_paged_verify_uses_split_producers(
         config.dtype,
         store_states=False,
@@ -103,11 +99,7 @@ def kda_verify_workspace_bytes(
     conv_fields = tuple(
         field for field in state_fields if field.field_id.endswith(".conv_state")
     )
-    conv_bytes = (
-        0
-        if raw_gate
-        else config.max_bs * sum(field.payload_bytes for field in conv_fields)
-    )
+    conv_bytes = config.max_bs * sum(field.payload_bytes for field in conv_fields)
     row_bytes = sum(
         channels * payload_dtype.itemsize
         for channels, payload_dtype in kda_replay_payload_specs(
@@ -115,8 +107,6 @@ def kda_verify_workspace_bytes(
             conv_channels=linear.conv_state_shape[0],
             num_heads=heads,
             head_dim=head_dim,
-            records=records,
-            raw_gate=raw_gate,
         )
     )
     group_count = sum(spec.attn_kind == "state" for spec, _ in groups)

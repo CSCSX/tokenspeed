@@ -1058,7 +1058,11 @@ after decode/mixed execution or graph replay, with live acceptance and
 its verify width and accepted count are one when there are no draft tokens.
 Its cache recipe reserves the record workspace for this case before sizing
 the arena. Replay capability determines this reservation even without a drafter;
-prefill-only engines do not reserve decode records. Since forward mode is
+prefill-only engines do not reserve decode records. NVIDIA target verification and
+commit use saved corrections for both BF16 and FP16 activations; the same
+batched recovery also handles a layer subset. AMD retains its registered
+batched raw-g replay. A missing batched binding is an error, not a reason to
+recompute each layer through a second commit path. Since forward mode is
 derived from the extend count, zero means decode at this entry. Hybrid
 delegates to the recurrent child.
 A mixed batch gives prefill and decode rows their existing metadata and
