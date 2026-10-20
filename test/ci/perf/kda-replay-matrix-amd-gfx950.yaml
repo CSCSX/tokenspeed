@@ -17,6 +17,8 @@ perf:
   command: |
     set -eu
     export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
+    python3 -m pytest -q --confcutdir=tokenspeed-kernel/test/amd/ops/attention \
+      tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_ignores_rejected_records
     baseline_revision=3461560d467a76401ce3cb3d72742fccb05dd591
     baseline_source=.ci-artifacts/original-kda-gfx950.py
     mkdir -p .ci-artifacts/published

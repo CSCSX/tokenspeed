@@ -312,6 +312,31 @@ class ReplayCase:
             )
 
 
+@pytest.mark.skipif(
+    not (current_platform().is_cdna4 or current_platform().is_cdna5),
+    reason="requires AMD gfx950 or gfx1250",
+)
+def test_commit_ignores_rejected_records():
+    case = ReplayCase(3, 4, 2, in_place=True, seed=8900)
+    case.accepted.copy_(torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32))
+    case.verify_all()
+    case.commit()
+    expected = [(x["h_pool"].clone(), x["conv_pool"].clone()) for x in case.layers]
+    case.reset()
+    offsets = torch.arange(case.t, device="cuda")
+    rejected = offsets[None, :] >= case.accepted[:, None]
+    for x in case.layers:
+        positions = x["metadata"][:, 2, None] + offsets
+        ring = positions % case.t
+        slots = x["metadata"][:, 0, None].expand_as(positions)
+        x["correction"][slots[rejected], ring[rejected]] = float("nan")
+        x["key_gate"][slots[rejected], ring[rejected]] = float("nan")
+    case.commit()
+    for x, (state, history) in zip(case.layers, expected, strict=True):
+        torch.testing.assert_close(x["h_pool"], state, atol=0, rtol=0)
+        torch.testing.assert_close(x["conv_pool"], history, atol=0, rtol=0)
+
+
 def _check_original(
     case: ReplayCase,
     original: OriginalKda,

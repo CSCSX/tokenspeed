@@ -924,10 +924,22 @@ def gluon_kda_fused_replay_gfx1250(
 
     a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
     bias = gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
+    # Stage accepted corrections once, then read value panels from LDS.
+    correction_layout: gl.constexpr = gl.BlockedLayout([1], [32], [8], [0])
+    correction_offsets = gl.arange(0, D, layout=correction_layout)
+    correction_shared = gl.allocate_shared_memory(
+        gl.float32, [T, D], gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    )
     k_values = ()
     decay_values = ()
     for token_offset in gl.static_range(T):
         record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
+        correction_value = gl.load(
+            correction + record_row * u_stride + head_idx * D + correction_offsets,
+            mask=token_offset < replay_steps,
+            other=0.0,
+        )
+        correction_shared.index(token_offset).store(correction_value)
         record_base = key_gate + record_row * kg_stride + head_idx * 2 * D
         k_value = gl.load(
             record_base + key_offsets, mask=token_offset < replay_steps, other=0.0
@@ -944,15 +956,13 @@ def gluon_kda_fused_replay_gfx1250(
         panel_offsets = off_pipe[0]
         running = raw_pipe[0]
         for token_offset in gl.static_range(T):
+            # Inactive rows are initialized; unconditional reads share one barrier.
+            delta = (
+                correction_shared.index(token_offset)
+                .slice(panel_idx * 16, 16, dim=0)
+                .load(value_layout)
+            )
             if token_offset < replay_steps:
-                record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
-                delta = gl.load(
-                    correction
-                    + record_row * u_stride
-                    + head_idx * D
-                    + panel_idx * 16
-                    + panel_value_offsets,
-                )
                 running *= decay_values[token_offset][None, :]
                 running += delta[:, None] * k_values[token_offset][None, :]
         write_base = write_idx * state_stride + head_idx * D * D
