@@ -575,8 +575,8 @@ class Host {
         std::vector<std::shared_ptr<Batch>> retired;
         std::lock_guard<std::mutex> lock(queue_mutex_);
         retired.swap(retired_);
-        // Room for every batch the queued executions retire, so retiring never allocates.
-        retired_.reserve(queue_.size() + 1);
+        // Room for every batch the running and queued executions retire, so retiring never allocates.
+        retired_.reserve(running_ + queue_.size() + 1);
         queue_.push_back(batch);
         return batch;
     }
@@ -627,6 +627,7 @@ class Host {
             batch = std::move(queue_.front());
             queue_.pop_front();
             previous = std::exchange(current_, batch);
+            ++running_;
         }
         try {
             if (previous != nullptr) {
@@ -644,6 +645,7 @@ class Host {
     void Retire(std::shared_ptr<Batch> batch) {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         retired_.push_back(std::move(batch));
+        --running_;
     }
 
     const std::shared_ptr<Filler> filler_;
@@ -654,6 +656,7 @@ class Host {
     std::deque<std::shared_ptr<Batch>> queue_;
     std::shared_ptr<Batch> current_;
     std::vector<std::shared_ptr<Batch>> retired_;
+    size_t running_ = 0;
 };
 #endif
 
