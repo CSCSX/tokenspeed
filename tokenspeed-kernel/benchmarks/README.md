@@ -37,7 +37,7 @@ The two source revisions must be available in the local Git checkout:
 ```bash
 export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
 baseline_revision=3461560d467a76401ce3cb3d72742fccb05dd591
-accepted_parent_revision=b4afc05351bcb16aae5eabf1a6d18c37ba5ef072
+accepted_parent_revision=d84269c5a222c2dcfb46c333c84b4967bd892a7a
 source_path=tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py
 git show "$baseline_revision:$source_path" > /tmp/original-kda.py
 git show "$accepted_parent_revision:$source_path" > /tmp/accepted-parent-kda.py

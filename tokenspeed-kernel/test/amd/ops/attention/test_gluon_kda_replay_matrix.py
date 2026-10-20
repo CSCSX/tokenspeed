@@ -27,6 +27,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 import statistics
 import subprocess
 import time
@@ -555,6 +556,116 @@ def test_inline_gate_matches_supplied_gate(graph):
         torch.testing.assert_close(x["key_gate"], key_gate, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="requires AMD gfx950")
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+def test_one_token_recovery_preserves_decay(lower_bound):
+    source_dir = os.environ.get("TOKENSPEED_KDA_BASELINE_DIR")
+    if source_dir is None:
+        pytest.skip("set TOKENSPEED_KDA_BASELINE_DIR to the accepted-parent source")
+    parent = _original_module(
+        Path(source_dir) / "accepted-parent-kda-gfx950.py", "gfx950"
+    )
+    current = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
+    )
+    case = ReplayCase(3, 1, 2, in_place=True, seed=8940)
+    case.accepted.copy_(torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32))
+    sweep = torch.linspace(-80, 80, _HEADS * K, device="cuda")
+    sweep[:7] = torch.tensor([-1e-2, -1e-4, -1e-6, 0, 1e-6, 1e-4, 1e-2], device="cuda")
+    raw_gate = sweep.repeat(case.batch, 1).to(torch.bfloat16)
+    for layer, x in enumerate(case.layers):
+        # K = U = 0 and checkpoint = 1 make one accepted update equal decay.
+        x["conv_w"].zero_()
+        x["h_pool"].fill_(1)
+        case.originals[layer][1].fill_(1)
+        x["correction"].fill_(float("nan"))
+        x["key_gate"].fill_(float("nan"))
+        x["stamps"].fill_(-1)
+        retained = case.retained_qkv[layer]
+        retained.fill_(float("nan"))
+        output = prepare_records_verify(
+            current.gluon_kda_fused_verify_gfx950,
+            x,
+            1,
+            raw_gate=raw_gate,
+            original_qkv=retained,
+            lower_bound=lower_bound,
+        )()
+        for value in (output, x["correction"], x["key_gate"][..., :K]):
+            torch.testing.assert_close(value, torch.zeros_like(value), atol=0, rtol=0)
+        torch.testing.assert_close(
+            x["key_gate"][..., K:],
+            raw_gate.view(case.batch, 1, _HEADS, K),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(retained, x["qkv_raw"], atol=0, rtol=0)
+        torch.testing.assert_close(
+            x["stamps"], x["metadata"][:, [2, 1]][:, None], atol=0, rtol=0
+        )
+
+    def commit(launcher):
+        x = case.layers[0]
+        launcher(
+            descriptors=case.descriptors,
+            group_indices=case.groups,
+            read_indices=case.reads,
+            write_indices=case.writes,
+            accepted_length=case.accepted,
+            draft_token_num=1,
+            num_heads=_HEADS,
+            head_dim=K,
+            qkv_stride=case.retained_qkv[0].stride(0),
+            conv_stride=x["conv_pool"].stride(0),
+            correction_stride=x["correction"].stride(1),
+            key_gate_stride=x["key_gate"].stride(1),
+            state_stride=x["h_pool"].stride(0),
+            conv_width=4,
+            activation_dtype=torch.bfloat16,
+            conv_state_dtype=x["conv_pool"].dtype,
+            record_metadata=x["metadata"],
+            record_stamps=case.stamps,
+            lower_bound=lower_bound,
+        )
+
+    case.reset()
+    commit(parent.launch_gluon_kda_fused_replay_gfx950)
+    expected = [(x["h_pool"].clone(), x["conv_pool"].clone()) for x in case.layers]
+    for layer, x in enumerate(case.layers):
+        decay = kda_gate(
+            raw_gate.view(case.batch, _HEADS, K),
+            x["A_log"],
+            x["dt_bias"].view(_HEADS, K),
+            lower_bound=lower_bound,
+        ).exp()
+        writes = x["write_indices"].long()
+        reference = case.originals[layer][1].clone()
+        reference[writes] = torch.where(
+            (case.accepted > 0)[:, None, None, None], decay[:, :, None, :], 1.0
+        )
+        assert bool((x["h_pool"][writes[case.accepted > 0]] != 1).any())
+        torch.testing.assert_close(x["h_pool"], reference, atol=1e-7, rtol=1e-5)
+        torch.testing.assert_close(
+            x["h_pool"][writes[case.accepted == 0]],
+            reference[writes[case.accepted == 0]],
+            atol=0,
+            rtol=0,
+        )
+    for graph in (False, True):
+        case.reset()
+        if graph:
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture):
+                commit(current.launch_gluon_kda_fused_replay_gfx950)
+            case.reset()
+            capture.replay()
+        else:
+            commit(current.launch_gluon_kda_fused_replay_gfx950)
+        for x, (state, conv) in zip(case.layers, expected, strict=True):
+            torch.testing.assert_close(x["h_pool"], state, atol=0, rtol=0)
+            torch.testing.assert_close(x["conv_pool"], conv, atol=0, rtol=0)
+
+
 def _check_original(
     case: ReplayCase,
     original: OriginalKda,
@@ -712,7 +823,14 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
         (positions, original_metadata[:, 1, None].expand_as(positions)), dim=-1
     )
     invocations = [
-        prepare_records_verify(launcher, x, t, raw_gate=raw_gate, original_qkv=retained)
+        prepare_records_verify(
+            launcher,
+            x,
+            t,
+            raw_gate=raw_gate,
+            original_qkv=retained,
+            lower_bound=LOWER_BOUND,
+        )
         for launcher in (
             gluon_kda_fused_verify_gfx950,
             parent_module.gluon_kda_fused_verify_gfx950,

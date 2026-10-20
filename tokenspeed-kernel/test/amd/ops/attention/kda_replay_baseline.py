@@ -118,7 +118,7 @@ def _original_module(source: Path, arch: str):
     return module
 
 
-def prepare_records_verify(launcher, x, window, *, raw_gate, original_qkv):
+def prepare_records_verify(launcher, x, window, *, raw_gate, original_qkv, lower_bound):
     """Bind a gfx950 records wrapper to fixed buffers for checks and timing.
 
     A supplied gate excludes projection from the invocation. None selects the
@@ -150,7 +150,7 @@ def prepare_records_verify(launcher, x, window, *, raw_gate, original_qkv):
         num_heads=heads,
         head_dim=128,
         draft_token_num=window,
-        lower_bound=-5.0,
+        lower_bound=lower_bound,
     )
 
     def invoke():

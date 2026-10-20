@@ -94,17 +94,23 @@ def _inputs(window, device, *, batch):
 
 
 @pytest.mark.parametrize(
-    ("arch", "window", "batch", "capacity"),
+    ("arch", "window", "batch", "capacity", "lower_bound"),
     [
-        (arch, window, 3, window + 1)
+        (arch, window, 3, window + 1, -5.0)
         for arch in ("gfx950", "gfx1250")
         for window in (1, 4, 8)
     ]
     # Cover a wide ring, unsplit T1, and the GEMM producer above 64 rows.
-    + [("gfx950", 1, 1, 129), ("gfx950", 1, 17, 2), ("gfx950", 4, 17, 5)],
+    + [
+        ("gfx950", 1, 1, 129, -5.0),
+        ("gfx950", 1, 17, 2, -5.0),
+        ("gfx950", 4, 17, 5, -5.0),
+    ]
+    # Softplus keeps the existing recovery path for every tested window.
+    + [("gfx950", window, 3, window + 1, None) for window in (1, 4, 8)],
 )
 def test_kda_records_wrapper_launches_compile(
-    monkeypatch, arch, window, batch, capacity
+    monkeypatch, arch, window, batch, capacity, lower_bound
 ):
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.kda.decode"
@@ -165,7 +171,7 @@ def test_kda_records_wrapper_launches_compile(
                 num_heads=heads,
                 head_dim=dim,
                 draft_token_num=window,
-                lower_bound=-5.0,
+                lower_bound=lower_bound,
             )
             assert output.shape == (1, batch * window, heads, dim)
             assert output.dtype == x["qkv_raw"].dtype
@@ -188,7 +194,7 @@ def test_kda_records_wrapper_launches_compile(
         conv_state_dtype=x["conv_pool"].dtype,
         record_metadata=metadata,
         record_stamps=stamps,
-        lower_bound=-5.0,
+        lower_bound=lower_bound,
     )
 
 
@@ -342,6 +348,7 @@ def test_kda_accepted_parent_verify_launches_compile(monkeypatch, batch):
                 1,
                 raw_gate=gate,
                 original_qkv=retained,
+                lower_bound=-5.0,
             )()
             assert output.shape == (1, batch, heads, dim)
             assert output.dtype == x["qkv_raw"].dtype
