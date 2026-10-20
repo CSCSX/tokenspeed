@@ -661,13 +661,13 @@ def load_grammar_host_ext() -> Any:
     with _ext_lock:
         if _ext is not None:
             return _ext
+        import glob
         import os
+        import sys
 
         from torch.utils.cpp_extension import CUDA_HOME, load_inline
         from tvm_ffi import libinfo
 
-        # Resolve CUDA headers explicitly — PyTorch's CUDA_HOME discovery
-        # sometimes misses conda-forge's ``$PREFIX/targets/.../include`` layout.
         cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME")
         include_dirs = list(libinfo.include_paths())
         library_dirs = []
@@ -678,12 +678,12 @@ def load_grammar_host_ext() -> Any:
                 include_dirs.append(inc)
             if os.path.isdir(lib):
                 library_dirs.append(lib)
-        for cand in (
-            "/home/jue/miniforge3/targets/x86_64-linux/include",
-            "/opt/conda/targets/x86_64-linux/include",
-        ):
-            if os.path.isdir(cand) and cand not in include_dirs:
-                include_dirs.append(cand)
+        # conda-forge keeps the toolkit under <prefix>/targets/<platform>, which CUDA_HOME misses.
+        for root in dict.fromkeys(r for r in (cuda_home, sys.prefix) if r):
+            include_dirs += sorted(
+                glob.glob(os.path.join(root, "targets", "*", "include"))
+            )
+            library_dirs += sorted(glob.glob(os.path.join(root, "targets", "*", "lib")))
         # Link the libtvm_ffi xgrammar already loaded: the error state is per library.
         tvm_ffi_dir = os.path.dirname(libinfo.find_libtvm_ffi())
 
