@@ -1181,7 +1181,10 @@ original semantics and are not used for speedup claims. The original gfx950
 T=1 reference preserves the fused gate producer's reduction and BF16 rounding;
 an independent FP64 projection checks its rounding interval. Other gate
 references use the same GEMM as their producer. Reports list incomplete
-baseline checks and complete-operation regressions explicitly. Local compile
+baseline checks and complete-operation regressions explicitly. A separate GFX950
+comparison pairs the current and accepted-parent records lifecycles in the same
+run, including gate production and commit for every acceptance pattern. Both
+pass independent correctness checks before timing. Local compile
 tests check real wrapper launches for gfx950 and gfx1250 without a GPU; device
 tests remain responsible for numerical correctness and performance.
 

@@ -28,6 +28,7 @@ import pytest
 import torch
 from amd.ops.attention.kda_replay_baseline import (
     OriginalKda,
+    RecordsKda,
     _bf16_neighbors,
     _check_gate_rounding,
     _original_gate_projection_gfx950,
@@ -314,8 +315,10 @@ def test_gate_reference_accepts_valid_fp32_cancellation_orders():
     _check_gate_rounding(alternatives, exact, error)
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8])
-def test_kda_accepted_parent_verify_launches_compile(monkeypatch, batch):
+@pytest.mark.parametrize(
+    ("batch", "window"), [(1, 1), (4, 1), (8, 1), (17, 1), (17, 4)]
+)
+def test_kda_accepted_parent_lifecycle_launches_compile(monkeypatch, batch, window):
     directory = os.environ.get("TOKENSPEED_KDA_BASELINE_DIR")
     if directory is None:
         pytest.skip("requires the accepted-parent source snapshot")
@@ -325,30 +328,66 @@ def test_kda_accepted_parent_verify_launches_compile(monkeypatch, batch):
     current = importlib.import_module(
         "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
     )
-    x = _inputs(1, "cpu", batch=batch)
     heads, dim = 12, 128
-    x["correction"] = torch.empty(batch, 1, heads, dim)
-    x["key_gate"] = torch.empty(batch, 1, heads, 2 * dim, dtype=torch.bfloat16)
-    x["metadata"] = torch.tensor(
-        [[row, 7, 2**33 + 1] for row in range(batch)], dtype=torch.int64
-    )
-    x["stamps"] = torch.empty(batch, 1, 2, dtype=torch.int64)
-    raw_gate = torch.empty(batch, heads * dim, dtype=torch.bfloat16)
-    retained = torch.empty_like(x["qkv_raw"])
-    for module in (current, parent):
-        _offline_launch(
-            monkeypatch,
-            module.gluon_kda_fused_paged_verify_nostore_vmajor_gfx950,
-            "gfx950",
+    layers = [_inputs(window, "cpu", batch=batch) for _ in range(2)]
+    stamps = torch.empty(len(layers), batch, window, 2, dtype=torch.int64)
+    retained = [torch.empty_like(x["qkv_raw"]) for x in layers]
+    for layer, x in enumerate(layers):
+        x["correction"] = torch.empty(batch, window, heads, dim)
+        x["key_gate"] = torch.empty(batch, window, heads, 2 * dim, dtype=torch.bfloat16)
+        x["metadata"] = torch.tensor(
+            [[row, 7, 2**33 + 1] for row in range(batch)], dtype=torch.int64
         )
-        for gate in (raw_gate, None):
-            output = prepare_records_verify(
-                module.gluon_kda_fused_verify_gfx950,
-                x,
-                1,
-                raw_gate=gate,
-                original_qkv=retained,
-                lower_bound=-5.0,
-            )()
-            assert output.shape == (1, batch, heads, dim)
-            assert output.dtype == x["qkv_raw"].dtype
+        x["stamps"] = stamps[layer]
+    descriptors = torch.tensor(
+        [
+            [
+                qkv.data_ptr(),
+                x["conv_w"].data_ptr(),
+                x["conv_pool"].data_ptr(),
+                x["correction"].data_ptr(),
+                x["w_fb"].data_ptr(),
+                x["key_gate"].data_ptr(),
+                x["A_log"].data_ptr(),
+                x["dt_bias"].data_ptr(),
+                x["h_pool"].data_ptr(),
+                0,
+            ]
+            for x, qkv in zip(layers, retained, strict=True)
+        ],
+        dtype=torch.uint64,
+    )
+    raw_gate = torch.empty(batch * window, heads * dim, dtype=torch.bfloat16)
+    for module in (current, parent):
+        for kernel in (
+            module.gluon_kda_fused_paged_verify_nostore_vmajor_gfx950,
+            module.gluon_kda_fused_replay_gfx950,
+        ):
+            _offline_launch(monkeypatch, kernel, "gfx950")
+        output = prepare_records_verify(
+            module.gluon_kda_fused_verify_gfx950,
+            layers[0],
+            window,
+            raw_gate=raw_gate,
+            original_qkv=retained[0],
+            lower_bound=-5.0,
+        )()
+        assert output.shape == (1, batch * window, heads, dim)
+        assert output.dtype == layers[0]["qkv_raw"].dtype
+        runner = RecordsKda(
+            module,
+            layers,
+            retained,
+            descriptors,
+            torch.arange(len(layers), dtype=torch.int32),
+            torch.stack([x["read_indices"] for x in layers]),
+            torch.stack([x["write_indices"] for x in layers]),
+            torch.arange(batch, dtype=torch.int32) % (window + 1),
+            stamps,
+            window,
+            lower_bound=-5.0,
+        )
+        runner.lifecycle()
+        for x in layers:
+            assert x["verify_output"].shape == (1, batch * window, heads, dim)
+            assert x["verify_output"].dtype == x["qkv_raw"].dtype

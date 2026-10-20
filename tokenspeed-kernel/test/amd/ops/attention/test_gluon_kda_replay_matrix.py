@@ -38,6 +38,7 @@ import pytest
 import torch
 from amd.ops.attention.kda_replay_baseline import (
     OriginalKda,
+    RecordsKda,
     _original_module,
     check_original_gate_projection,
     original_gate_projection,
@@ -256,18 +257,21 @@ class ReplayCase:
         self.verify_all()
         self.commit()
 
-    def check(self, *, graph: bool):
+    def check(self, *, graph: bool, runner):
         """Check output, records, accepted state and every untouched pool page."""
         self.reset()
-        self.verify_all()
+        runner.verify_all()
         if graph:
             capture = torch.cuda.CUDAGraph()
             with torch.cuda.graph(capture):
-                self.verify_all()
+                runner.verify_all()
             capture.replay()
         references = []
         self.gate_reference_mismatches = 0
-        for x, (conv, state) in zip(self.layers, self.originals, strict=True):
+        for x, (conv, state), retained in zip(
+            self.layers, self.originals, self.retained_qkv, strict=True
+        ):
+            torch.testing.assert_close(retained, x["qkv_raw"], atol=0, rtol=0)
             torch.testing.assert_close(x["conv_pool"], conv, atol=0, rtol=0)
             torch.testing.assert_close(x["h_pool"], state, atol=0, rtol=0)
             positions = x["metadata"][:, 2, None] + torch.arange(self.t, device="cuda")
@@ -304,12 +308,12 @@ class ReplayCase:
         if graph:
             capture = torch.cuda.CUDAGraph()
             with torch.cuda.graph(capture):
-                self.commit()
+                runner.commit()
             # Capture may execute the operation on some backends.
             self.reset()
             capture.replay()
         else:
-            self.commit()
+            runner.commit()
         for layer, (x, original, reference) in enumerate(
             zip(self.layers, self.originals, references, strict=True)
         ):
@@ -890,6 +894,70 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
     }
 
 
+def _check_full_lifecycle_graph(case, runner):
+    """Match a full graph to independently checked eager verify and commit."""
+    inputs = [(x["qkv_raw"].clone(), x["metadata"].clone()) for x in case.layers]
+    case.check(graph=False, runner=runner)
+    fields = (
+        "verify_output",
+        "correction",
+        "key_gate",
+        "stamps",
+        "h_pool",
+        "conv_pool",
+    )
+    expected = [{name: x[name].clone() for name in fields} for x in case.layers]
+    capture = torch.cuda.CUDAGraph()
+    case.reset()
+    with torch.cuda.graph(capture):
+        runner.lifecycle()
+    # Capture can execute kernels. Poison after capture to require fresh writes.
+    case.reset()
+    for x, retained in zip(case.layers, case.retained_qkv, strict=True):
+        for name in ("verify_output", "correction", "key_gate"):
+            x[name].fill_(float("nan"))
+        x["stamps"].fill_(-1)
+        retained.fill_(float("nan"))
+    capture.replay()
+    for x, retained, values, (qkv, metadata) in zip(
+        case.layers, case.retained_qkv, expected, inputs, strict=True
+    ):
+        for name, value in values.items():
+            torch.testing.assert_close(x[name], value, atol=0, rtol=0)
+        torch.testing.assert_close(retained, qkv, atol=0, rtol=0)
+        torch.testing.assert_close(x["qkv_raw"], qkv, atol=0, rtol=0)
+        torch.testing.assert_close(x["metadata"], metadata, atol=0, rtol=0)
+    case.reset()
+
+
+def _measure_parent_lifecycle(timer, case, parent, measure_options):
+    """Pair complete records lifecycles with equal work for all accepted counts."""
+    case.check(graph=True, runner=parent)
+    for runner in (case, parent):
+        _check_full_lifecycle_graph(case, runner)
+    measured = _paired_measurements(
+        timer, case.lifecycle, parent.lifecycle, equivalent=True, **measure_options
+    )
+    measured["accepted_parent"] = measured.pop("original")
+    measured["round_speedups"] = [
+        accepted["median_us"] / candidate["median_us"]
+        for accepted, candidate in zip(
+            measured["accepted_parent"]["rounds"],
+            measured["candidate"]["rounds"],
+            strict=True,
+        )
+    ]
+    case.reset()
+    return {
+        "concurrency": case.batch,
+        "window_length": case.t,
+        "accepted_counts": case.accepted.cpu().tolist(),
+        "layers": len(case.layers),
+        "correctness": "both_passed_eager_and_graph",
+        "measurement": measured,
+    }
+
+
 def _acceptance_patterns(batch: int, t: int):
     for length in range(t + 1):
         yield str(length), torch.full(
@@ -914,8 +982,8 @@ def test_gluon_kda_verify_commit_matrix(batch, t, in_place):
     case = ReplayCase(batch, t, layers=3, in_place=in_place, seed=7100)
     for _, accepted in _acceptance_patterns(batch, t):
         case.accepted.copy_(accepted)
-        case.check(graph=False)
-        case.check(graph=True)
+        case.check(graph=False, runner=case)
+        case.check(graph=True, runner=case)
 
 
 def main():
@@ -996,6 +1064,16 @@ def main():
             "scope": "one layer; same supplied raw gate and retention; excludes gate projection and commit",
             "results": [],
         },
+        "accepted_parent_lifecycle": {
+            "status": "running" if arch == "gfx950" else "not_run",
+            "reason": None if arch == "gfx950" else "gfx950-only comparison",
+            "revision": args.accepted_parent_revision,
+            "source_sha256": hashlib.sha256(
+                args.accepted_parent_source.read_bytes()
+            ).hexdigest(),
+            "scope": "all layers on both sides: automatic gate production, records verify and QKV retention, then one batched commit; equal work for every acceptance pattern",
+            "results": [],
+        },
         "results": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1033,6 +1111,23 @@ def main():
                     case.accepted,
                     t,
                 )
+                parent = (
+                    RecordsKda(
+                        _original_module(args.accepted_parent_source.resolve(), arch),
+                        case.layers,
+                        case.retained_qkv,
+                        case.descriptors,
+                        case.groups,
+                        case.reads,
+                        case.writes,
+                        case.accepted,
+                        case.stamps,
+                        t,
+                        lower_bound=LOWER_BOUND,
+                    )
+                    if arch == "gfx950"
+                    else None
+                )
                 reference_gates = []
                 if arch == "gfx950" and t == 1:
                     for x in case.layers:
@@ -1069,8 +1164,9 @@ def main():
                         flush=True,
                     )
                     case.accepted.copy_(accepted)
-                    case.check(graph=False)
-                    case.check(graph=True)
+                    case.check(graph=False, runner=case)
+                    case.check(graph=True, runner=case)
+                    candidate_gate_reference_mismatches = case.gate_reference_mismatches
                     all_positive = bool(torch.all(accepted > 0))
                     decode = t == 1 and all_positive
                     original_correctness = _check_original(
@@ -1128,6 +1224,23 @@ def main():
                         equivalent=all_positive and baseline_valid,
                         **measure_options,
                     )
+                    if parent is not None:
+                        parent_result = _measure_parent_lifecycle(
+                            timer, case, parent, measure_options
+                        )
+                        parent_result["accepted_length"] = name
+                        report["accepted_parent_lifecycle"]["results"].append(
+                            parent_result
+                        )
+                        measured = parent_result["measurement"]
+                        print(
+                            f"PARENT C{batch} T{t} accepted={name} "
+                            f"candidate_us={measured['candidate']['median_us']:.3f} "
+                            f"parent_us={measured['accepted_parent']['median_us']:.3f} "
+                            f"speedup={measured['speedup']:.3f}x "
+                            f"round_speedups={measured['round_speedups']}",
+                            flush=True,
+                        )
                     report["results"].append(
                         {
                             "concurrency": batch,
@@ -1144,7 +1257,7 @@ def main():
                                 else "torch_mm"
                             ),
                             "candidate_gate_reference": "record gate checked against FP64 before recurrence",
-                            "candidate_gate_helper_mismatches": case.gate_reference_mismatches,
+                            "candidate_gate_helper_mismatches": candidate_gate_reference_mismatches,
                             "elapsed_seconds": time.monotonic() - started,
                             "verify": verify_measurement,
                             "commit": commit_measurement,
@@ -1166,7 +1279,7 @@ def main():
                         f"baseline={original_correctness['status']}",
                         flush=True,
                     )
-                del original, case
+                del original, parent, case
     except Exception as error:
         report["status"] = "failed"
         report["error"] = f"{type(error).__name__}: {error}"
@@ -1175,6 +1288,7 @@ def main():
     report["status"] = "complete"
     if arch == "gfx950":
         report["accepted_parent_verify"]["status"] = "complete"
+        report["accepted_parent_lifecycle"]["status"] = "complete"
     report["baseline_validation_failures"] = sum(
         row["original_correctness"]["status"] == "failed" for row in report["results"]
     )

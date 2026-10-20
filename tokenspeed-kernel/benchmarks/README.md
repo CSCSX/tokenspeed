@@ -72,8 +72,23 @@ On gfx950, an auxiliary measurement compares one-layer verify with an accepted
 parent source. Both sides use the same supplied raw gate and retain QKV; gate
 projection and commit are excluded. Both pass independent eager and graph
 correctness checks before paired timing. Results name the parent revision and
-source hash separately from the immutable original. This auxiliary measurement
-is not run on gfx1250.
+source hash separately from the immutable original.
+
+A second auxiliary measurement compares the complete current and accepted-parent
+records lifecycles on the same buffers. Each side runs its own automatic gate
+producer, verify with QKV retention, and batched commit. All acceptance patterns
+have equal work, including zero and mixed lengths. Both sides pass independent
+eager checks and reproduce those results through one complete captured graph.
+The timer alternates sides across rounds and resets pools outside the timed
+interval. The report includes each round's parent/current latency ratio, along
+with aggregate medians and MADs. Neither parent comparison runs on gfx1250.
+
+After accepting a kernel change, advance the accepted-parent revision in the
+CI task and this example for the next comparison. Read the calibration whenever
+the parent changes. Identical-source runs show the measured spread; a later
+candidate within that spread needs another measurement before acceptance.
+The immutable original remains fixed, and its complete-operation timings remain
+the final performance target.
 
 Use `--page-relation in-place` to measure aliasing; the timer restores the
 checkpoint outside the timed interval. `--cache hot` selects hot-cache timing.

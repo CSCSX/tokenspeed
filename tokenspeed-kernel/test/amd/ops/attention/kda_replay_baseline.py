@@ -159,6 +159,84 @@ def prepare_records_verify(launcher, x, window, *, raw_gate, original_qkv, lower
     return invoke
 
 
+class RecordsKda:
+    """Bind accepted-parent gfx950 records wrappers to shared case buffers.
+
+    Current and parent runners use these buffers sequentially. Reset state
+    outside the timed interval; each lifecycle regenerates its own records.
+    """
+
+    def __init__(
+        self,
+        module,
+        layers,
+        retained_qkv,
+        descriptors,
+        groups,
+        reads,
+        writes,
+        accepted,
+        stamps,
+        window,
+        *,
+        lower_bound,
+    ):
+        self.layers = layers
+        self.retained_qkv = retained_qkv
+        self.descriptors = descriptors
+        self.groups = groups
+        self.reads = reads
+        self.writes = writes
+        self.accepted = accepted
+        self.stamps = stamps
+        self.window = window
+        self.lower_bound = lower_bound
+        self.verifies = [
+            prepare_records_verify(
+                module.gluon_kda_fused_verify_gfx950,
+                x,
+                window,
+                raw_gate=None,
+                original_qkv=retained,
+                lower_bound=lower_bound,
+            )
+            for x, retained in zip(layers, retained_qkv, strict=True)
+        ]
+        self.commit_kernel = module.launch_gluon_kda_fused_replay_gfx950
+
+    def verify_all(self):
+        for x, verify in zip(self.layers, self.verifies, strict=True):
+            x["verify_output"] = verify()
+
+    def commit(self):
+        x = self.layers[0]
+        self.commit_kernel(
+            descriptors=self.descriptors,
+            group_indices=self.groups,
+            read_indices=self.reads,
+            write_indices=self.writes,
+            accepted_length=self.accepted,
+            activation_dtype=x["qkv_raw"].dtype,
+            conv_state_dtype=x["conv_pool"].dtype,
+            draft_token_num=self.window,
+            num_heads=x["beta"].shape[-1],
+            head_dim=x["h_pool"].shape[-1],
+            qkv_stride=self.retained_qkv[0].stride(0),
+            conv_stride=x["conv_pool"].stride(0),
+            correction_stride=x["correction"].stride(1),
+            key_gate_stride=x["key_gate"].stride(1),
+            state_stride=x["h_pool"].stride(0),
+            conv_width=4,
+            lower_bound=self.lower_bound,
+            record_metadata=x["metadata"],
+            record_stamps=self.stamps,
+        )
+
+    def lifecycle(self):
+        self.verify_all()
+        self.commit()
+
+
 class OriginalKda:
     """Run immutable baseline source against the candidate's input and page views."""
 
