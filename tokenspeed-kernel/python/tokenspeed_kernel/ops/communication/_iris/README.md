@@ -36,6 +36,17 @@ also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
 model-specific head layouts, route packets, or normalization semantics stay in
 the model package, along with dispatch and capacities.
 
+Lamport reductions use data as the ready signal: peers push BF16 packs into
+mailboxes initialized to an empty marker (negative zero in odd elements, so
+inputs and reduced values replace negative zero with zero), the receiver polls
+until no marker remains, then restores the markers and advances a per-program
+stage counter over three stages. The one-shot pushes the whole payload to every
+peer; for larger TP8 payloads the two-shot reduce-scatters through one mailbox
+and all-gathers through another, sending each peer 2/8 of the payload. Its
+reduced values also replace negative zero with zero. These all-reduces,
+including Kimi K3's one-shot, rotate their push order by program so concurrent
+stores use all links.
+
 Muse Spark prepares its collectives for TP4/EP4, TP8/EP8, or expert TP on gfx950.
 Pure expert TP and EP share the owned-row and QKVG token thresholds; full-row
 reductions retain their payload-based protocol policies. Owned rows use

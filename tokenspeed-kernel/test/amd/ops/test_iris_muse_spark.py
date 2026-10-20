@@ -419,6 +419,7 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
 def _muse_collective_policy_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
         iris_pull_twoshot_allreduce,
         iris_push_twoshot_allreduce,
     )
@@ -484,6 +485,8 @@ def _muse_collective_policy_worker(rank, world_size, device):
     state.reduction.epochs.fill_(2**32 - 4)
     state.reduction.ready_flags.fill_(2**32 - 4)
     state.reduction.lamport_epochs.fill_(2)
+    if state.reduction.lamport_two_shot_epochs is not None:
+        state.reduction.lamport_two_shot_epochs.fill_(2)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
@@ -521,6 +524,7 @@ def _muse_collective_policy_worker(rank, world_size, device):
             )
     with assert_no_triton_compile(
         iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
         iris_push_twoshot_allreduce,
         iris_pull_twoshot_allreduce,
     ):
@@ -1102,6 +1106,113 @@ def _muse_routed_lamport_worker(rank, world_size, device):
         dist.barrier()
 
 
+def _muse_lamport_payload_worker(rank, world_size, device):
+    """Distinct per-rank data through each Lamport protocol, grid, and stage."""
+    state = _muse_state(rank, device, 128, True)
+    reduction = state.reduction
+    two_shot = world_size == 8
+    if two_shot:
+        assert reduction.lamport_two_shot_max_numel == 128 * 8192
+    else:
+        assert reduction.lamport_two_shot_epochs is None
+    # (elements, in place, protocol). One-shot: one and eight tiles, one
+    # route token, and a two-shot-sized payload of partial two-shot tiles. TP8 two-shot: the smallest payload,
+    # route tokens 2..32 including the largest one-shot payload, and the full
+    # capacity. TP4 has no two-shot; its larger payloads use push.
+    cases = (
+        (512, False, "one"),
+        (8 * 512, False, "one"),
+        (32768, False, "one"),
+        (32768, True, "one"),
+        (48 * 1024 + 512, False, "one"),
+        (48 * 1024, False, "two"),
+        (65536, False, "two"),
+        (98304, True, "two"),
+        (131072, False, "two"),
+        (43 * 4096, False, "two"),
+        (262144, False, "two"),
+        (524288, True, "two"),
+        (1048576, False, "two"),
+    )
+    if not two_shot:
+        cases = tuple(
+            (count, in_place, "one" if count <= 43 * 4096 else "push")
+            for count, in_place, _ in cases
+        )
+    generator = torch.Generator().manual_seed(4096 + world_size)
+    payloads = []
+    for count, _, _ in cases:
+        values = torch.randint(-512, 512, (world_size, count), generator=generator)
+        values = (values.float() / 64).bfloat16()
+        values[:, 1::97] = -0.0
+        values[:, 2::97] = float("inf")
+        values[:, 3::97] = float("nan")
+        payloads.append(values)
+    inputs = [
+        torch.empty(count, dtype=torch.bfloat16, device=device) for count, _, _ in cases
+    ]
+    outputs = [
+        value if in_place else torch.empty_like(value)
+        for value, (_, in_place, _) in zip(inputs, cases, strict=True)
+    ]
+
+    def load(scale):
+        for values, value in zip(payloads, inputs, strict=True):
+            value.copy_(values[rank] * scale)
+
+    def expected(values, scale):
+        # These FP32 sums are exact, so every protocol's addition order agrees.
+        reduced = (values[0] * scale).float()
+        for peer in range(1, world_size):
+            reduced += (values[peer] * scale).float()
+        return reduced.bfloat16().to(device)
+
+    def run():
+        # Push returns borrowed storage that the next reduction overwrites.
+        return [
+            reduction.run(value, output, value.numel())[: value.numel()].clone()
+            for value, output in zip(inputs, outputs, strict=True)
+        ]
+
+    def check(results, scale):
+        for values, actual in zip(payloads, results, strict=True):
+            torch.testing.assert_close(
+                actual, expected(values, scale), atol=0, rtol=0, equal_nan=True
+            )
+
+    # Each Lamport call advances the stage of exactly the programs it launched.
+    for (count, _, protocol), value, output in zip(cases, inputs, outputs, strict=True):
+        one_shot = reduction.lamport_epochs.clone()
+        two = two_shot and reduction.lamport_two_shot_epochs.clone()
+        value.copy_(payloads[0][rank, :1].expand(count))
+        reduction.run(value, output, count)
+        advanced = (reduction.lamport_epochs != one_shot).sum().item()
+        assert advanced == (count // 512 if protocol == "one" else 0)
+        if two_shot:
+            advanced = (reduction.lamport_two_shot_epochs != two).sum().item()
+            assert advanced == (count // 1024 if protocol == "two" else 0)
+    load(1)
+    check(run(), 1)
+    # Start the capture from the last stage so replays wrap the rotation.
+    reduction.lamport_epochs.fill_(2)
+    if two_shot:
+        reduction.lamport_two_shot_epochs.fill_(2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        results = run()
+    for step in range(5):
+        scale = float(2**step)
+        load(scale)
+        if rank == step % world_size:
+            torch.cuda._sleep(20000)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(results, scale)
+    dist.barrier()
+
+
 def _muse_tp_routes_worker(rank, world_size, device):
     """Expert TP sums aligned partial routes before nonlinear normalization."""
     from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
@@ -1524,6 +1635,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
+        pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(_muse_tp_owned_forward_worker, "nccl", id="tp_owned_forward"),
