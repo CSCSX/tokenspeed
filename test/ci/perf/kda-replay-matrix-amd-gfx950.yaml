@@ -27,6 +27,10 @@ perf:
     mkdir -p .ci-artifacts/published
     git fetch --no-tags --depth=1 origin "$baseline_revision"
     git show "$baseline_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py" > "$baseline_source"
+    accepted_parent_revision=b4afc05351bcb16aae5eabf1a6d18c37ba5ef072
+    accepted_parent_source=.ci-artifacts/accepted-parent-kda-gfx950.py
+    git fetch --no-tags --depth=1 origin "$accepted_parent_revision"
+    git show "$accepted_parent_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py" > "$accepted_parent_source"
     for page_relation in distinct in-place; do
       python3 tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
         --concurrency 1 2 4 8 16 32 64 128 \
@@ -38,6 +42,8 @@ perf:
         --paired-rounds 3 \
         --baseline-revision "$baseline_revision" \
         --baseline-source "$baseline_source" \
+        --accepted-parent-source "$accepted_parent_source" \
+        --accepted-parent-revision "$accepted_parent_revision" \
         --output ".ci-artifacts/published/kda-replay-matrix-$page_relation.json"
     done
 

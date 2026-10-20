@@ -118,6 +118,47 @@ def _original_module(source: Path, arch: str):
     return module
 
 
+def prepare_records_verify(launcher, x, window, *, raw_gate, original_qkv):
+    """Bind a gfx950 records wrapper to fixed buffers for checks and timing.
+
+    A supplied gate excludes projection from the invocation. None selects the
+    wrapper's gate producer. The wrapper allocates its output in both cases.
+    """
+    heads = x["beta"].shape[-1]
+    batch = x["read_indices"].numel()
+    kwargs = dict(
+        mixed_qkv=x["qkv_raw"],
+        original_qkv=original_qkv,
+        conv_weights=x["conv_w"],
+        conv_pool=x["conv_pool"],
+        raw_g=raw_gate,
+        f_a_out=x["f_a"] if raw_gate is None else None,
+        f_b_weight=x["w_fb"] if raw_gate is None else None,
+        beta_logits=x["beta"],
+        A_log=x["A_log"],
+        dt_bias=x["dt_bias"],
+        state_pool=x["h_pool"],
+        read_indices=x["read_indices"],
+        correction=x["correction"].transpose(1, 2),
+        key_gate=x["key_gate"].transpose(1, 2),
+        record_metadata=x["metadata"],
+        record_stamps=x["stamps"],
+        query_start_loc=torch.arange(
+            batch + 1, device=x["qkv_raw"].device, dtype=torch.int32
+        )
+        * window,
+        num_heads=heads,
+        head_dim=128,
+        draft_token_num=window,
+        lower_bound=-5.0,
+    )
+
+    def invoke():
+        return launcher(**kwargs)
+
+    return invoke
+
+
 class OriginalKda:
     """Run immutable baseline source against the candidate's input and page views."""
 

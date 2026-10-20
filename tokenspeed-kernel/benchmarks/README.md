@@ -31,10 +31,16 @@ convolution history, verify's read-only checkpoint, and untouched pool pages.
 The unit tests use three independent layers and cache groups; the timing
 command checks every requested layer before measuring.
 
-Run the matrix from the repository root in a prepared AMD kernel environment:
+Run the matrix from the repository root in a prepared AMD kernel environment.
+The two source revisions must be available in the local Git checkout:
 
 ```bash
 export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
+baseline_revision=3461560d467a76401ce3cb3d72742fccb05dd591
+accepted_parent_revision=b4afc05351bcb16aae5eabf1a6d18c37ba5ef072
+source_path=tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py
+git show "$baseline_revision:$source_path" > /tmp/original-kda.py
+git show "$accepted_parent_revision:$source_path" > /tmp/accepted-parent-kda.py
 python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
   --concurrency 1 2 4 8 16 32 64 128 \
   --window-lengths 1 4 \
@@ -42,16 +48,32 @@ python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py 
   --page-relation distinct \
   --cache cold \
   --measurement-blocks 30 \
+  --paired-rounds 3 \
+  --baseline-source /tmp/original-kda.py \
+  --baseline-revision "$baseline_revision" \
+  --accepted-parent-source /tmp/accepted-parent-kda.py \
+  --accepted-parent-revision "$accepted_parent_revision" \
   --output /tmp/kda-replay-matrix.json
 ```
 
-The command validates each case eagerly and with graph replay before reporting
-its timing. Verify measures one fused convolution/recurrence kernel, with the
-gate projection already prepared. Commit measures all requested layers,
-including convolution-history updates, and excludes verify. Verify does not
-consume accepted lengths, so its measurement is reused across the acceptance
-rows for each concurrency/window pair. These scopes differ from the existing
-`kda_fused_paged_verify` suite, which includes producer work.
+The command checks each case eagerly and with graph replay. Full-lifecycle
+timing includes all requested layers. The candidate runs gate production,
+records verify and QKV retention, then one batched commit. The immutable
+original uses fused decode at T1, and gate GEMM, capture verify and raw-gate
+replay at T4. On gfx1250, T1 also includes gate GEMM. These directly measured
+totals determine performance acceptance.
+
+The separate one-layer verify timing includes gate production for the candidate
+but excludes it for the original, so it has no speedup ratio. Commit timing
+includes convolution-history updates and excludes verify. Neither phase is
+subtracted from the full-lifecycle timing.
+
+On gfx950, an auxiliary measurement compares one-layer verify with an accepted
+parent source. Both sides use the same supplied raw gate and retain QKV; gate
+projection and commit are excluded. Both pass independent eager and graph
+correctness checks before paired timing. Results name the parent revision and
+source hash separately from the immutable original. This auxiliary measurement
+is not run on gfx1250.
 
 Use `--page-relation in-place` to measure aliasing; the timer restores the
 checkpoint outside the timed interval. `--cache hot` selects hot-cache timing.

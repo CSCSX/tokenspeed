@@ -1489,7 +1489,7 @@ def gluon_kda_fused_verify_gfx950(
         raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
         f_a_out = None
         f_b_weight = None
-    value_splits = _kda_value_splits(batch)
+    value_splits = 1 if draft_token_num == 1 else _kda_value_splits(batch)
     gluon_kda_fused_paged_verify_nostore_vmajor_gfx950[
         (num_heads * value_splits, batch)
     ](

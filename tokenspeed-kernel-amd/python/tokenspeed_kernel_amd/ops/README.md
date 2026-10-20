@@ -1148,9 +1148,10 @@ retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
 inside verify for up to 64 total input rows and uses a separate GEMM above that.
 MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
 A supplied raw gate is used directly. GFX1250 retains the separate gate producer.
-Both save the gate used by verify. For one-token windows, each GFX950 value split
-starts its first checkpoint-panel load before preparing the token vectors.
-Without value splits, it keeps four panels in flight after preparation.
+Both save the gate used by verify. GFX950 one-token verify uses one CTA per
+head and request. It starts its first checkpoint-panel load before preparing
+the token vectors, then keeps four panels in flight. Longer windows retain
+the batch-bucketed value splits.
 Recovery keeps two panels in flight for one-token windows.
 Other recovery windows use one panel.
 

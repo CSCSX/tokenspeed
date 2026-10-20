@@ -31,7 +31,9 @@ from amd.ops.attention.kda_replay_baseline import (
     _bf16_neighbors,
     _check_gate_rounding,
     _original_gate_projection_gfx950,
+    _original_module,
     original_gate_projection,
+    prepare_records_verify,
 )
 from tokenspeed_kernel_amd._triton import gluon, triton
 
@@ -304,3 +306,42 @@ def test_gate_reference_accepts_valid_fp32_cancellation_orders():
     gamma = 128 * 2**-24 / (1 - 128 * 2**-24)
     error = torch.full_like(exact, gamma * (2 + 2**-26))
     _check_gate_rounding(alternatives, exact, error)
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+def test_kda_accepted_parent_verify_launches_compile(monkeypatch, batch):
+    directory = os.environ.get("TOKENSPEED_KDA_BASELINE_DIR")
+    if directory is None:
+        pytest.skip("requires the accepted-parent source snapshot")
+    parent = _original_module(
+        Path(directory) / "accepted-parent-kda-gfx950.py", "gfx950"
+    )
+    current = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
+    )
+    x = _inputs(1, "cpu", batch=batch)
+    heads, dim = 12, 128
+    x["correction"] = torch.empty(batch, 1, heads, dim)
+    x["key_gate"] = torch.empty(batch, 1, heads, 2 * dim, dtype=torch.bfloat16)
+    x["metadata"] = torch.tensor(
+        [[row, 7, 2**33 + 1] for row in range(batch)], dtype=torch.int64
+    )
+    x["stamps"] = torch.empty(batch, 1, 2, dtype=torch.int64)
+    raw_gate = torch.empty(batch, heads * dim, dtype=torch.bfloat16)
+    retained = torch.empty_like(x["qkv_raw"])
+    for module in (current, parent):
+        _offline_launch(
+            monkeypatch,
+            module.gluon_kda_fused_paged_verify_nostore_vmajor_gfx950,
+            "gfx950",
+        )
+        for gate in (raw_gate, None):
+            output = prepare_records_verify(
+                module.gluon_kda_fused_verify_gfx950,
+                x,
+                1,
+                raw_gate=gate,
+                original_qkv=retained,
+            )()
+            assert output.shape == (1, batch, heads, dim)
+            assert output.dtype == x["qkv_raw"].dtype

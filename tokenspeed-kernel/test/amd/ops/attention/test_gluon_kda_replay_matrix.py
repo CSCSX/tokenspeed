@@ -37,8 +37,10 @@ import pytest
 import torch
 from amd.ops.attention.kda_replay_baseline import (
     OriginalKda,
+    _original_module,
     check_original_gate_projection,
     original_gate_projection,
+    prepare_records_verify,
 )
 from ops.attention.test_kda_replay_commit import (
     LOWER_BOUND,
@@ -689,6 +691,87 @@ def _paired_measurements(
     return result
 
 
+def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
+    """Compare one-layer verify using the same supplied gate on both sides."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_verify_gfx950,
+    )
+
+    case.reset()
+    x, t = case.layers[0], case.t
+    raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    original_input = x["qkv_raw"].clone()
+    original_metadata = x["metadata"].clone()
+    original_gate = raw_gate.clone()
+    retained = case.retained_qkv[0]
+    reference = _reference(x, t, case.accepted, rounded_conv=True, raw_gate=raw_gate)
+    positions = original_metadata[:, 2, None] + torch.arange(t, device="cuda")
+    rows = torch.arange(case.batch, device="cuda")[:, None]
+    ring = positions % t
+    expected_stamps = torch.stack(
+        (positions, original_metadata[:, 1, None].expand_as(positions)), dim=-1
+    )
+    invocations = [
+        prepare_records_verify(launcher, x, t, raw_gate=raw_gate, original_qkv=retained)
+        for launcher in (
+            gluon_kda_fused_verify_gfx950,
+            parent_module.gluon_kda_fused_verify_gfx950,
+        )
+    ]
+
+    def poison():
+        x["correction"].fill_(float("nan"))
+        x["key_gate"].fill_(float("nan"))
+        retained.fill_(float("nan"))
+        x["stamps"].fill_(-1)
+
+    def check(output):
+        expected_output, correction, kg = reference[:3]
+        torch.testing.assert_close(
+            output.view_as(expected_output), expected_output, atol=1.6e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            x["correction"][rows, ring], correction, atol=2e-6, rtol=2e-5
+        )
+        torch.testing.assert_close(x["key_gate"][rows, ring], kg, atol=0, rtol=0)
+        torch.testing.assert_close(
+            x["stamps"][rows, ring], expected_stamps, atol=0, rtol=0
+        )
+        for actual, expected in (
+            (retained, original_input),
+            (x["qkv_raw"], original_input),
+            (x["metadata"], original_metadata),
+            (raw_gate, original_gate),
+            (x["conv_pool"], case.originals[0][0]),
+            (x["h_pool"], case.originals[0][1]),
+        ):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    for invoke in invocations:
+        case.reset()
+        poison()
+        check(invoke())
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            output = invoke()
+        case.reset()
+        poison()
+        output.fill_(float("nan"))
+        capture.replay()
+        check(output)
+    measured = _paired_measurements(
+        timer, *invocations, equivalent=True, **measure_options
+    )
+    measured["accepted_parent"] = measured.pop("original")
+    case.reset()
+    return {
+        "concurrency": case.batch,
+        "window_length": t,
+        "correctness": "both_passed_eager_and_graph",
+        "measurement": measured,
+    }
+
+
 def _acceptance_patterns(batch: int, t: int):
     for length in range(t + 1):
         yield str(length), torch.full(
@@ -731,6 +814,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline-source", type=Path, required=True)
     parser.add_argument("--baseline-revision", required=True)
+    parser.add_argument("--accepted-parent-source", type=Path, required=True)
+    parser.add_argument("--accepted-parent-revision", required=True)
     parser.add_argument("--measurement-blocks", type=int, default=30)
     parser.add_argument("--paired-rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7100)
@@ -783,6 +868,16 @@ def main():
             "original_t4": "all layers: gate GEMM, capture verify, then one batched raw-g replay",
         },
         "comparison_note": "Ratios apply only to equal work. Original replay does not copy zero-acceptance pages. Original standard decode accepts one token.",
+        "accepted_parent_verify": {
+            "status": "running" if arch == "gfx950" else "not_run",
+            "reason": None if arch == "gfx950" else "gfx950-only comparison",
+            "revision": args.accepted_parent_revision,
+            "source_sha256": hashlib.sha256(
+                args.accepted_parent_source.read_bytes()
+            ).hexdigest(),
+            "scope": "one layer; same supplied raw gate and retention; excludes gate projection and commit",
+            "results": [],
+        },
         "results": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -832,6 +927,21 @@ def main():
                     measurement_blocks=args.measurement_blocks,
                     rounds=args.paired_rounds,
                 )
+                if arch == "gfx950" and (
+                    (t == 1 and batch in (1, 2, 4, 8, 16, 128))
+                    or (t == 4 and batch == 1)
+                ):
+                    report["accepted_parent_verify"]["results"].append(
+                        _measure_explicit_gate_verify(
+                            timer,
+                            case,
+                            _original_module(
+                                args.accepted_parent_source.resolve(), arch
+                            ),
+                            measure_options,
+                        )
+                    )
+                    publish()
                 verify_measurements = {}
                 for name, accepted in _acceptance_patterns(batch, t):
                     report["active_case"]["accepted_length"] = name
@@ -945,6 +1055,8 @@ def main():
         publish()
         raise
     report["status"] = "complete"
+    if arch == "gfx950":
+        report["accepted_parent_verify"]["status"] = "complete"
     report["baseline_validation_failures"] = sum(
         row["original_correctness"]["status"] == "failed" for row in report["results"]
     )
