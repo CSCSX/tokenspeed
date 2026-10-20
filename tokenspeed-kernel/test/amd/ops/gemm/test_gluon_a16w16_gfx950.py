@@ -33,7 +33,7 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.gemm import kimi3_router_projection  # noqa: E402
+from tokenspeed_kernel.ops.gemm import kimi3_router_projection, mm  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
@@ -517,6 +517,46 @@ def test_qwen38_decode_row_count_does_not_recompile() -> None:
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+# Muse TP8 decode projections: QKV with the output gate, the o_proj and this
+# rank's pre-expert column view (split-K), at ragged rows of each bucket.
+_MUSE_TP8_DECODE_SHAPES = [(2304, 8192), (8192, 1024), (512, 8192)]
+
+
+@pytest.mark.parametrize("n,k", _MUSE_TP8_DECODE_SHAPES)
+@pytest.mark.parametrize("m", [2, 3, 7, 16])
+def test_muse_tp8_decode_gemm_is_selected_and_matches_reference(
+    m: int, n: int, k: int
+) -> None:
+    torch.manual_seed(0)
+    assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = _decode(a, b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+        # gemm.mm hands the rows to the same kernel.
+        assert torch.equal(mm(a, b), out)
+
+
+def test_muse_tp8_decode_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    a = torch.randn((16, 8192), device="cuda", dtype=torch.bfloat16) * 0.25
+    weights = {
+        (n, k): torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        for n, k in _MUSE_TP8_DECODE_SHAPES
+    }
+
+    def run(rows):
+        for (n, k), b in weights.items():
+            _decode(a[:rows, :k].contiguous(), b, torch.bfloat16)
+
+    for rows in (3, 4, 5, 8, 9, 16):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 15):
             run(rows)
 
 
