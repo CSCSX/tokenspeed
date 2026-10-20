@@ -34,7 +34,11 @@ from pathlib import Path
 
 import pytest
 import torch
-from amd.ops.attention.kda_replay_baseline import OriginalKda
+from amd.ops.attention.kda_replay_baseline import (
+    OriginalKda,
+    check_original_gate_projection,
+    original_gate_projection,
+)
 from ops.attention.test_kda_replay_commit import (
     LOWER_BOUND,
     K,
@@ -59,7 +63,7 @@ _HEADS = 12
 _STATE_PAGE_BYTES = 884736
 
 
-def _reference(x, t, accepted, *, rounded_conv: bool):
+def _reference(x, t, accepted, *, rounded_conv: bool, raw_gate=None):
     """Check recurrence independently of saved corrections and keys.
 
     The candidate uses rounded BF16 convolution outputs. The original keeps
@@ -98,7 +102,9 @@ def _reference(x, t, accepted, *, rounded_conv: bool):
             values.append(torch.nn.functional.silu(value))
             history = torch.cat((history[:, :, 1:], rows[:, token, :, None]), dim=-1)
         convolved = torch.stack(values, dim=1).view(batch, t, 3, heads, K)
-    raw_gate = torch.mm(x["f_a"], x["w_fb"].t()).view(batch, t, heads, K)
+    if raw_gate is None:
+        raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    raw_gate = raw_gate.view(batch, t, heads, K)
     decay = (
         kda_gate(
             raw_gate.flatten(0, 1),
@@ -307,11 +313,23 @@ class ReplayCase:
 
 
 def _check_original(
-    case: ReplayCase, original: OriginalKda, *, graph: bool, decode: bool
+    case: ReplayCase,
+    original: OriginalKda,
+    *,
+    graph: bool,
+    decode: bool,
+    reference_gates,
 ):
     case.reset()
     references = [
-        _reference(x, case.t, case.accepted, rounded_conv=False) for x in case.layers
+        _reference(
+            x,
+            case.t,
+            case.accepted,
+            rounded_conv=False,
+            raw_gate=reference_gates[layer] if decode and reference_gates else None,
+        )
+        for layer, x in enumerate(case.layers)
     ]
     invoke = original.decode_lifecycle if decode else original.replay_lifecycle
     if graph:
@@ -560,6 +578,12 @@ def main():
                     case.accepted,
                     t,
                 )
+                reference_gates = []
+                if arch == "gfx950" and t == 1:
+                    for x in case.layers:
+                        gate = original_gate_projection(x["f_a"], x["w_fb"])
+                        check_original_gate_projection(gate, x["f_a"], x["w_fb"])
+                        reference_gates.append(gate)
                 measure_options = dict(
                     reset=case.reset,
                     cold_cache=args.cache == "cold",
@@ -580,11 +604,19 @@ def main():
                     all_positive = bool(torch.all(accepted > 0))
                     decode = t == 1 and all_positive
                     original_correctness = _check_original(
-                        case, original, graph=False, decode=decode
+                        case,
+                        original,
+                        graph=False,
+                        decode=decode,
+                        reference_gates=reference_gates,
                     )
                     if original_correctness["status"] == "passed_eager":
                         original_correctness = _check_original(
-                            case, original, graph=True, decode=decode
+                            case,
+                            original,
+                            graph=True,
+                            decode=decode,
+                            reference_gates=reference_gates,
                         )
                     baseline_valid = (
                         original_correctness["status"] == "passed_eager_and_graph"
@@ -636,6 +668,11 @@ def main():
                             "pool_pages": case.layers[0]["h_pool"].shape[0],
                             "correctness": "passed_eager_and_graph",
                             "original_correctness": original_correctness,
+                            "reference_gate_producer": (
+                                "gluon_projection_layout"
+                                if decode and reference_gates
+                                else "torch_mm"
+                            ),
                             "elapsed_seconds": time.monotonic() - started,
                             "verify": verify_measurement,
                             "commit": commit_measurement,
@@ -668,6 +705,16 @@ def main():
         row["original_correctness"]["status"] == "failed" for row in report["results"]
     )
     report["comparison_complete"] = report["baseline_validation_failures"] == 0
+    report["lifecycle_regressions"] = [
+        {
+            "concurrency": row["concurrency"],
+            "window_length": row["window_length"],
+            "accepted_length": row["accepted_length"],
+            "speedup": row["lifecycle"]["speedup"],
+        }
+        for row in report["results"]
+        if row["lifecycle"]["speedup"] is not None and row["lifecycle"]["speedup"] < 1
+    ]
     report.pop("active_case")
     publish()
     # Keep raw samples in the artifact; log only aggregates below the summary limit.

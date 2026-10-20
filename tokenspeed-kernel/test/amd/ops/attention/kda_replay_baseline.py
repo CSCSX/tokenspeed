@@ -27,6 +27,90 @@ from functools import cache
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel_amd._triton import gl, gluon
+
+
+@gluon.jit
+def _original_gate_projection_gfx950(
+    f_a,
+    f_b,
+    output,
+    H: gl.constexpr,
+    D: gl.constexpr,
+    F_A: gl.constexpr,
+    F_A_ROW_STRIDE: gl.constexpr,
+):
+    # Match the original decode reduction before its BF16 rounding boundary.
+    head = gl.program_id(0)
+    row = gl.program_id(1)
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 4], [4, 1], [1, 0])
+    channels = gl.arange(0, D, layout=gl.SliceLayout(1, layout))
+    columns = gl.arange(0, F_A, layout=gl.SliceLayout(0, layout))
+    weight = gl.load(f_b + (head * D + channels)[:, None] * F_A + columns[None, :])
+    activation = gl.load(f_a + row * F_A_ROW_STRIDE + columns)
+    gate = gl.sum(weight.to(gl.float32) * activation.to(gl.float32)[None, :], 1)
+    gl.store(
+        output + row * H * D + head * D + channels, gate.to(output.dtype.element_ty)
+    )
+
+
+def original_gate_projection(f_a: torch.Tensor, f_b: torch.Tensor) -> torch.Tensor:
+    """Reproduce only the original gfx950 gate producer, outside timed calls."""
+    output = torch.empty(
+        (f_a.shape[0], f_b.shape[0]), dtype=f_a.dtype, device=f_a.device
+    )
+    _original_gate_projection_gfx950[(f_b.shape[0] // 128, f_a.shape[0])](
+        f_a,
+        f_b,
+        output,
+        H=f_b.shape[0] // 128,
+        D=128,
+        F_A=128,
+        F_A_ROW_STRIDE=f_a.stride(0),
+        num_warps=4,
+        num_stages=2,
+    )
+    return output
+
+
+def _bf16_neighbors(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    bits = value.view(torch.int16).to(torch.int32)
+    lower = torch.where(value > 0, bits - 1, bits + 1)
+    upper = torch.where(value > 0, bits + 1, bits - 1)
+    # Both signed zeros have the same adjacent nonzero BF16 values.
+    lower = torch.where(value == 0, -32767, lower)
+    upper = torch.where(value == 0, 1, upper)
+    return (
+        lower.to(torch.int16).view(torch.bfloat16),
+        upper.to(torch.int16).view(torch.bfloat16),
+    )
+
+
+def _check_gate_rounding(projected, exact, error, gemm):
+    if not bool((projected.abs() < torch.finfo(torch.bfloat16).max).all()):
+        raise AssertionError("Gate reference must have finite BF16 neighbors")
+    lower, upper = _bf16_neighbors(projected)
+    low = (lower.double() + projected.double()) * 0.5
+    high = (upper.double() + projected.double()) * 0.5
+    if not bool(((low - error <= exact) & (exact <= high + error)).all()):
+        raise AssertionError("Gate reference is outside its BF16 rounding interval")
+    different = projected != gemm
+    adjacent = (lower == gemm) | (upper == gemm)
+    midpoint = (projected.double() + gemm.double()) * 0.5
+    straddles = (exact - midpoint).abs() <= error
+    if not bool((~different | (adjacent & straddles)).all()):
+        raise AssertionError("Gate producers differ away from a BF16 rounding boundary")
+
+
+def check_original_gate_projection(projected, f_a, f_b):
+    """Check projection and boundary differences against independent FP64 math."""
+    activation, weight = f_a.double(), f_b.double()
+    exact = torch.mm(activation, weight.t())
+    # BF16 products are exact in FP32; bound the sum's accumulated rounding.
+    unit_roundoff = 2**-24
+    gamma = 128 * unit_roundoff / (1 - 128 * unit_roundoff)
+    error = gamma * torch.mm(activation.abs(), weight.abs().t())
+    _check_gate_rounding(projected, exact, error, torch.mm(f_a, f_b.t()))
 
 
 @cache

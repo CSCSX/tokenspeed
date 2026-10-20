@@ -1164,9 +1164,13 @@ The AMD replay matrix compares these kernels with an immutable original
 implementation on the same GPU. It measures verify, commit, and the complete
 69-layer operation with both in-place and distinct pages. Complete timings
 include gate projection and QKV retention. Zero-acceptance cases have different
-original semantics and are not used for speedup claims. Local compile tests
-check real wrapper launches for gfx950 and gfx1250 without a GPU; device tests
-remain responsible for numerical correctness and performance.
+original semantics and are not used for speedup claims. The original gfx950
+T=1 reference preserves the fused gate producer's reduction and BF16 rounding;
+an independent FP64 projection checks its rounding interval. Other gate
+references use the same GEMM as their producer. Reports list incomplete
+baseline checks and complete-operation regressions explicitly. Local compile
+tests check real wrapper launches for gfx950 and gfx1250 without a GPU; device
+tests remain responsible for numerical correctness and performance.
 
 ## Transform
 

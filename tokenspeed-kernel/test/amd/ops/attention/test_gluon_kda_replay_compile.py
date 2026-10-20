@@ -26,7 +26,13 @@ from pathlib import Path
 
 import pytest
 import torch
-from amd.ops.attention.kda_replay_baseline import OriginalKda
+from amd.ops.attention.kda_replay_baseline import (
+    OriginalKda,
+    _bf16_neighbors,
+    _check_gate_rounding,
+    _original_gate_projection_gfx950,
+    original_gate_projection,
+)
 from tokenspeed_kernel_amd._triton import gluon, triton
 
 
@@ -182,3 +188,40 @@ def test_original_kda_comparison_launches_compile(monkeypatch, arch, window):
     if window == 1:
         original.decode_lifecycle()
     assert original.outputs[0].shape == (1, 3 * window, 12, 128)
+
+
+def test_original_gfx950_gate_projection_launch_compiles(monkeypatch):
+    _offline_launch(monkeypatch, _original_gate_projection_gfx950, "gfx950")
+    x = _inputs(1, "cpu")
+    projected = original_gate_projection(x["f_a"], x["w_fb"])
+    assert projected.shape == (3, 12 * 128)
+    assert projected.dtype == torch.bfloat16
+
+
+def test_bf16_rounding_intervals_include_both_signs_and_binade_edges():
+    value = torch.tensor([0.0, -0.0, 1.0, -1.0, 2.0, -2.0], dtype=torch.bfloat16)
+    lower, upper = _bf16_neighbors(value)
+    low = (lower.double() + value.double()) * 0.5
+    high = (upper.double() + value.double()) * 0.5
+    expected_low = torch.tensor(
+        [-(2**-134), -(2**-134), 1 - 2**-9, -1 - 2**-8, 2 - 2**-8, -2 - 2**-7],
+        dtype=torch.float64,
+    )
+    expected_high = torch.tensor(
+        [2**-134, 2**-134, 1 + 2**-8, -1 + 2**-9, 2 + 2**-7, -2 + 2**-8],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(low, expected_low, atol=0, rtol=0)
+    torch.testing.assert_close(high, expected_high, atol=0, rtol=0)
+
+
+def test_gate_reference_allows_boundary_straddles_but_rejects_wrong_values():
+    projected = torch.tensor([1.0, -1.0], dtype=torch.bfloat16)
+    gemm = torch.tensor([1 + 2**-7, -1 - 2**-7], dtype=torch.bfloat16)
+    exact = torch.tensor([1 + 2**-8, -1 - 2**-8], dtype=torch.float64)
+    error = torch.full_like(exact, 2**-24)
+    _check_gate_rounding(projected, exact, error, gemm)
+    with pytest.raises(AssertionError, match="rounding interval"):
+        _check_gate_rounding(projected + 0.25, exact, error, gemm)
+    with pytest.raises(AssertionError, match="rounding boundary"):
+        _check_gate_rounding(projected, projected.double(), error, gemm)
