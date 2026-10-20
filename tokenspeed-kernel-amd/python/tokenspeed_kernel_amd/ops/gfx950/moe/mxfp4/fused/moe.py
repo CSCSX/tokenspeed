@@ -37,6 +37,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
     RaggedTensorMetadata,
     swiglu_fn,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._output import (
+    validate_deferred_output,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _extract_gluon_raw_s,
     _extract_gluon_raw_w,
@@ -1547,6 +1550,7 @@ def _maybe_gluon_package_mxfp4_prefill(
     expert_start: int = 0,
     global_num_experts: int | None = None,
     out: torch.Tensor | None = None,
+    deferred_out: torch.Tensor | None = None,
     force_reduce: bool | None = None,
     activation_format: str = "e2m1",
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor] | None:
@@ -1585,6 +1589,33 @@ def _maybe_gluon_package_mxfp4_prefill(
         for t in (package_w13, package_w13_scale, package_w2, package_w2_scale)
     ):
         return None
+
+    if deferred_out is not None:
+        validate_deferred_output(
+            deferred_out,
+            tokens=n_tokens,
+            topk=top_k,
+            width=hidden_dim,
+            device=device,
+            do_finalize=do_finalize,
+            inputs=(
+                *(
+                    hidden_states
+                    if isinstance(hidden_states, tuple)
+                    else (hidden_states,)
+                ),
+                *(x_quantized if x_quantized is not None else ()),
+                package_w13,
+                package_w13_scale,
+                package_w2,
+                package_w2_scale,
+                router_logits,
+                correction_bias,
+                precomputed_topk_weights,
+                precomputed_topk_ids,
+                out,
+            ),
+        )
 
     topk_weights = precomputed_topk_weights
     topk_ids = precomputed_topk_ids
@@ -1828,6 +1859,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         do_finalize,
         # Deferred E2M1 consumers use expanded_idx to mask nonlocal routes.
         initialize_unowned_routes=do_finalize or activation_format != "e2m1",
+        deferred_out=deferred_out,
         w2_scale=package_w2_scale.view(torch.uint8),
         a2_scale=stage2_scale,
         sorted_weights=s2_sorted_weights,
@@ -2066,8 +2098,12 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     are defined; consumers must not read routes marked ``-1``.
     Deferred mode returns one canonical row per route so
     the shared model epilogue can normalize, weight, and reduce across ranks.
+    ``out`` may supply contiguous BF16 ``[tokens * top_k, hidden]`` deferred
+    storage that does not overlap any input; None allocates it. Its contents
+    remain valid until the caller reuses that storage. Finalized ``out`` keeps
+    its existing ``[tokens, hidden]`` contract.
     """
-    rows, hidden_dim, device, input_dtype = _mxfp4_input_metadata(hidden_states)
+    rows, hidden_dim, device, _ = _mxfp4_input_metadata(hidden_states)
     if isinstance(hidden_states, tuple):
         _resolve_mxfp4_activation(hidden_states, x_quantized)
     if topk_ids.ndim != 2:
@@ -2091,11 +2127,45 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     n_tokens, top_k = topk_ids.shape
     if n_tokens != rows:
         raise ValueError("input and top-k must have the same token count")
+    if out is not None and not do_finalize:
+        if out_dtype != torch.bfloat16:
+            raise ValueError("deferred output requires BF16 output dtype")
+        validate_deferred_output(
+            out,
+            tokens=n_tokens,
+            topk=top_k,
+            width=hidden_dim,
+            device=device,
+            do_finalize=do_finalize,
+            inputs=(
+                *(
+                    hidden_states
+                    if isinstance(hidden_states, tuple)
+                    else (hidden_states,)
+                ),
+                *(x_quantized if x_quantized is not None else ()),
+                topk_weights,
+                topk_ids,
+                w13_raw,
+                _extract_gluon_raw_w(w13_weight),
+                _extract_gluon_raw_w_unshuffled(w2_weight),
+                _extract_gluon_raw_w(w2_weight),
+                _extract_gluon_raw_s(w13_mx_scale),
+                _extract_gluon_raw_s(w2_mx_scale),
+                w13_bias,
+                w2_bias,
+            ),
+        )
     if n_tokens == 0:
+        empty = (
+            out
+            if out is not None
+            else torch.empty((0, hidden_dim), dtype=out_dtype, device=device)
+        )
         if do_finalize:
-            return torch.empty((0, hidden_dim), dtype=input_dtype, device=device)
+            return empty
         return (
-            torch.empty((0, hidden_dim), dtype=input_dtype, device=device),
+            empty,
             None,
             torch.empty((0,), dtype=torch.int32, device=device),
         )
@@ -2122,7 +2192,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         global_num_experts=global_num_experts,
         do_finalize=do_finalize,
         x_quantized=x_quantized,
-        out=out if do_finalize else None,
+        out=out,
     )
     if direct_out is not None:
         return direct_out
@@ -2152,6 +2222,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         expert_start=expert_start,
         global_num_experts=global_num_experts,
         out=out if do_finalize else None,
+        deferred_out=out if not do_finalize else None,
     )
     if package_out is not None:
         return package_out

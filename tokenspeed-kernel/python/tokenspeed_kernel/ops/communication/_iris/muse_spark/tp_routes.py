@@ -58,6 +58,15 @@ class MuseTPRouteReduceScatter:
         )
         self.flags = peers.ctx.zeros((_PROGRAMS, peers.world_size), dtype=torch.uint32)
 
+    def acquire_input(self, rows: int) -> torch.Tensor:
+        """Borrow canonical BF16 ``[rows*8,4096]`` producer storage.
+
+        The producer and ``run`` must use the same stream. The next call may
+        overwrite this storage after every peer has finished reading it.
+        """
+        assert 0 < rows <= self.max_rows
+        return self.input[:rows].view(rows * _TOPK, _WIDTH)
+
     def run(
         self, routes: torch.Tensor, route_map: torch.Tensor | None, rows: int
     ) -> torch.Tensor:
@@ -66,13 +75,22 @@ class MuseTPRouteReduceScatter:
         ``routes`` holds this TP rank's partial expert outputs. A supplied
         ``route_map`` maps canonical token/route order into its physical rows;
         without a map the input must already be canonical and contiguous.
+        An exact ``acquire_input`` view skips staging. Other overlapping
+        sources are invalid because staging would overwrite unread routes.
         """
         assert 0 < rows <= self.max_rows
         assert routes.dtype == torch.bfloat16 and routes.device == self.peers.device
-        staged = self.input[:rows]
+        staged = self.acquire_input(rows).view(rows, _TOPK, _WIDTH)
         if route_map is None:
             assert routes.is_contiguous() and routes.numel() == staged.numel()
-            staged.copy_(routes.view_as(staged))
+            if routes.data_ptr() != staged.data_ptr():
+                size = staged.numel() * staged.element_size()
+                if (
+                    routes.data_ptr() < staged.data_ptr() + size
+                    and staged.data_ptr() < routes.data_ptr() + size
+                ):
+                    raise ValueError("route staging must not overlap its source")
+                staged.copy_(routes.view_as(staged))
         else:
             gather_moe_routes(routes, route_map, rows, _TOPK, _WIDTH, output=staged)
         output = self.output[: triton.cdiv(rows, self.peers.world_size)]
