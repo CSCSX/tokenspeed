@@ -114,7 +114,11 @@ def gluon_fp32_router_gemv_gfx950(
     if rows == 0:
         return x.new_empty((0, weight.shape[0]))
     if rows > 2:
-        return torch.matmul(x, weight.T) * multiplier
+        # hipBLASLt applies alpha once to the finished FP32 dot product, which
+        # matches a separate multiply bit for bit without its extra launch.
+        return torch.addmm(
+            x.new_empty((rows, weight.shape[0])), x, weight.T, beta=0, alpha=multiplier
+        )
     out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
     _fp32_router_gemv_kernel[(weight.shape[0], rows)](
         x,

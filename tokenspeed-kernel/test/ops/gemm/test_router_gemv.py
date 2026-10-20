@@ -185,3 +185,29 @@ def test_planned_fp32_router_gemv_prepares_weight_and_replays(device: str) -> No
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+@pytest.mark.parametrize("rows", [64, 192, 1031])
+def test_planned_fp32_router_matches_scaled_matmul_bitwise(
+    device: str, rows: int
+) -> None:
+    """Prefill-sized rows go to BLAS with the multiplier folded into alpha, bit for bit."""
+    if not current_platform().is_cdna4:
+        pytest.skip("the prepared gfx950 router owns the BLAS fallback here")
+    torch.manual_seed(31)
+    hidden, columns, multiplier = 8192, 256, 0.17677669529663687
+    x = torch.randn(rows, hidden, dtype=torch.float32, device=device)
+    weight = torch.randn(hidden, columns, dtype=torch.float32, device=device) * 0.02
+    plan = fp32_router_gemv_plan(
+        hidden_size=hidden,
+        output_size=columns,
+        dtype=torch.float32,
+        solution=None,
+    )
+    prepared_weight = fp32_router_gemv_process_weight(plan, weight)
+    counters = fp32_router_gemv_counters(columns, torch.device(device))
+    out = fp32_router_gemv_execute(
+        plan, x, prepared_weight, multiplier, counters, False
+    )
+    expected = torch.matmul(x, prepared_weight.T) * multiplier
+    assert torch.equal(out.view(torch.int32), expected.view(torch.int32))
