@@ -80,7 +80,7 @@ def _window(n, t, pages=32, seed=0, num_heads=HV):
     )
 
 
-def _prepare_records(x, t):
+def _prepare_records(x, t, *, raw_gate=None):
     """Produce BF16 K/raw-gate and FP32 U through the registered serving path."""
     from tokenspeed_kernel.ops.attention.kda import (
         KdaReplayRecords,
@@ -109,7 +109,8 @@ def _prepare_records(x, t):
             bias=None,
             recurrent_layout="v_major",
         )
-    raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    if raw_gate is None:
+        raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
     x["correction"] = torch.empty(n, t, heads, V, device=DEV, dtype=torch.float32)
     x["key_gate"] = torch.empty(n, t, heads, 2 * K, device=DEV, dtype=torch.bfloat16)
     x["metadata"] = torch.zeros(n, 3, device=DEV, dtype=torch.int64)

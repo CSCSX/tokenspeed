@@ -1160,6 +1160,14 @@ head's convolution history after loading all old taps, including when source
 and destination alias. History retains its bound pool dtype; original QKV
 is converted on commit.
 
+The AMD replay matrix compares these kernels with an immutable original
+implementation on the same GPU. It measures verify, commit, and the complete
+69-layer operation with both in-place and distinct pages. Complete timings
+include gate projection and QKV retention. Zero-acceptance cases have different
+original semantics and are not used for speedup claims. Local compile tests
+check real wrapper launches for gfx950 and gfx1250 without a GPU; device tests
+remain responsible for numerical correctness and performance.
+
 ## Transform
 
 ### gfx950 Hadamard query transform

@@ -17,13 +17,24 @@ perf:
   command: |
     set -eu
     export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
-    python3 tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
-      --concurrency 1 2 4 8 16 32 64 128 \
-      --window-lengths 1 4 \
-      --layers 69 \
-      --page-relation distinct \
-      --cache cold \
-      --measurement-blocks 30 \
-      --output .ci-artifacts/published/kda-replay-matrix.json
+    baseline_revision=3461560d467a76401ce3cb3d72742fccb05dd591
+    baseline_source=.ci-artifacts/original-kda-gfx950.py
+    mkdir -p .ci-artifacts/published
+    git fetch --no-tags --depth=1 origin "$baseline_revision"
+    git show "$baseline_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py" > "$baseline_source"
+    for page_relation in distinct in-place; do
+      python3 tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
+        --concurrency 1 2 4 8 16 32 64 128 \
+        --window-lengths 1 4 \
+        --layers 69 \
+        --page-relation "$page_relation" \
+        --cache cold \
+        --measurement-blocks 30 \
+        --paired-rounds 3 \
+        --baseline-revision "$baseline_revision" \
+        --baseline-source "$baseline_source" \
+        --output ".ci-artifacts/published/kda-replay-matrix-$page_relation.json"
+    done
+
 report:
   github_step_summary: true
