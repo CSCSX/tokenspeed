@@ -1325,6 +1325,7 @@ def bf16_moe_routes(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_start: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return unweighted BF16 SwiGLU outputs for every selected local expert.
 
@@ -1334,12 +1335,16 @@ def bf16_moe_routes(
         w2: Local down weights ``[experts, hidden, I]``.
         topk_ids: Global selected expert ids ``[tokens, topk]``.
         expert_start: First global expert represented by ``w13`` and ``w2``.
+        out: Optional caller-owned contiguous ``[tokens * topk, hidden]`` (or
+            ``[tokens, topk, hidden]``) destination with ``x``'s dtype that does
+            not overlap any input. None allocates the routes.
 
     Returns:
-        Route outputs ``[tokens, topk, hidden]``; routes to other ranks' experts are zero.
+        Route outputs ``[tokens, topk, hidden]``, backed by ``out`` when given;
+        routes to other ranks' experts are zero.
     """
     kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
-    return kernel(x, w13, w2, topk_ids, expert_start)
+    return kernel(x, w13, w2, topk_ids, expert_start, out=out)
 
 
 def moe_plan(

@@ -19,6 +19,11 @@ and must not overlap either the route values or their map.
 Expert parallel ranks instead normalize their complete local expert outputs
 before combining weighted token sums.
 
+`bf16_moe_routes` and `routed_input_scale_rmsnorm_sum` also take an optional
+caller-owned destination (contiguous, same dtype, disjoint from their inputs),
+so a prepared collective input receives the routes or route sum directly.
+Absent routes are still zero in a supplied route destination.
+
 The selected kernel may declare `deferred_output_is_token_order`: output row
 `token * topk + slot` already holds that token's selected route. `moe_plan`
 and `MoELayer` expose this contract. The route map still marks absent rows;

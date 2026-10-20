@@ -2144,6 +2144,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                None,
             )
             output = state.all_reduce.acquire_outputs((tuple(combined.shape),))[0]
             output.copy_(combined)

@@ -67,11 +67,12 @@ before the next route reduction. Pool/unpool, the residual boundary, and the
 next attention input remain on owned rows; QKVG exchange restores head sharding.
 
 The route state lends its canonical symmetric input through `acquire_input`.
-Eligible TP/EP1 A4W4 experts write directly into it; `run` skips staging only
-for the exact contiguous destination with no route map. Other sources keep
-copy/gather staging and must not overlap its destination. These ordinary
-producer stores retain the reduction's release publication and exit barrier;
-being in symmetric memory does not establish a write-through store contract.
+Eligible TP/EP1 A4W4 experts and BF16 route experts write directly into it;
+`run` skips staging only for the exact contiguous destination with no route
+map. Other sources keep copy/gather staging and must not overlap its
+destination. These ordinary producer stores retain the reduction's release
+publication and exit barrier; being in symmetric memory does not establish a
+write-through store contract.
 Producer, reduction, and local normalization use the same stream.
 
 Full-row expert TP reduces raw route partials before normalization. Oversized
