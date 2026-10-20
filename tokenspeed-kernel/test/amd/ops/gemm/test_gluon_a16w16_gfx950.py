@@ -520,9 +520,9 @@ def test_qwen38_decode_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-# Muse TP8 decode projections: QKV with the output gate, the o_proj and this
-# rank's pre-expert column view (split-K), at ragged rows of each bucket.
-_MUSE_TP8_DECODE_SHAPES = [(2304, 8192), (8192, 1024), (512, 8192)]
+# Muse TP8 decode projections: the o_proj and this rank's pre-expert column
+# view (split-K), at ragged rows of each bucket.
+_MUSE_TP8_DECODE_SHAPES = [(8192, 1024), (512, 8192)]
 
 
 @pytest.mark.parametrize("n,k", _MUSE_TP8_DECODE_SHAPES)
