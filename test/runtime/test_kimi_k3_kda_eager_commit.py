@@ -463,12 +463,13 @@ def _reference_committed_states(harness, pages, inputs, accepted):
                 * params["f_b_weight"].float()[None, :, :]
             ).sum(-1)
         )
-        # The split vLLM path materializes both producers in BF16; the
-        # original fused scratch path keeps their intermediates in FP32.
-        split_producers = (
+        # Records verification materializes both producers in BF16. AMD's
+        # decomposed scratch fallback does too; NVIDIA's fused scratch
+        # verification retains FP32 intermediates.
+        materialized_producers = (
             harness.backend._verify_split_producers and harness.backend._replay_active
-        )
-        if split_producers:
+        ) or (not harness.backend._replay_active and torch.version.hip is not None)
+        if materialized_producers:
             from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
 
             if raw_gate is None:
@@ -502,7 +503,7 @@ def _reference_committed_states(harness, pages, inputs, accepted):
         states, windows = [], []
         for token in range(width):
             current = raw[:, token]
-            if split_producers:
+            if materialized_producers:
                 qkv = produced_qkv[:, token]
             else:
                 acc = current * weight[:, 3]

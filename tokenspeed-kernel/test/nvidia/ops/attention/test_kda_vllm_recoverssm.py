@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import is_nvidia
 
-if not torch.cuda.is_available():
+if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
     vllm_triton_kda_recoverssm_commit,

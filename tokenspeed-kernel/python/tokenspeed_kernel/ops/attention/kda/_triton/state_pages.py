@@ -274,7 +274,11 @@ def _commit_state_groups_kernel(
     group = tl.program_id(1)
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < bs
-    table = table_base + tl.load(tables + group * 4)
+    # A group table may be a separate allocation, outside table_base's buffer.
+    # Form its full address before indexing rows so AMD buffer loads do not
+    # interpret a cross-allocation offset as an offset within table_base.
+    table_address = table_base.to(tl.int64) + tl.load(tables + group * 4) * 4
+    table = table_address.to(tl.pointer_type(tl.int32))
     reads = tl.load(tables + group * 4 + 3).to(tl.pointer_type(tl.int32))
     source = tl.load(reads + row, mask=live, other=-1)
     tl.store(reads_out + group * out_stride + row, source, mask=live)
