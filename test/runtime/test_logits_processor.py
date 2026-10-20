@@ -28,6 +28,9 @@ from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     fused_softcap,
     prepare_logits_communication,
 )
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
+    ParallelLMHead,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
 
@@ -42,6 +45,91 @@ def nvidia_logits(monkeypatch):
     """Exercise CUDA state handling without requiring a CUDA test host."""
     platform = replace(logits_processor_module.current_platform(), vendor="nvidia")
     monkeypatch.setattr(logits_processor_module, "current_platform", lambda: platform)
+
+
+@pytest.mark.parametrize("do_argmax", [False, True])
+def test_cpu_tp_logits_do_not_query_an_accelerator_capture(monkeypatch, do_argmax):
+    """The prepared argmax and the lazy gather gate need no CUDA context."""
+    from transformers import PretrainedConfig
+
+    def cuda_query():
+        raise RuntimeError("CPU-only torch has no CUDA capture API")
+
+    def collective(output, shard, group):
+        # Only the missing second process is substituted; the GEMM and gates run.
+        output.copy_(torch.cat((shard, shard), dim=0))
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", cuda_query)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    processor = LogitsProcessor(
+        config=PretrainedConfig(vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        do_argmax=do_argmax,
+        dp_lm_head_tp=False,
+    )
+    hidden = torch.tensor([[1, 2], [-2, 1]], dtype=torch.bfloat16)
+    head = ParallelLMHead(
+        8,
+        2,
+        params_dtype=torch.bfloat16,
+        padding_size=1,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    with torch.no_grad():
+        head.weight.copy_(torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]]))
+    processor.prepare_communication(head)
+    local = hidden @ head.weight.T
+    output = processor._get_logits(hidden, head, None, require_full_vocab=False)
+    expected = local if do_argmax else torch.cat((local, local), dim=-1)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_dist_argmax_ineligibility_uses_the_device_collective(monkeypatch, tmp_path):
+    """A real Gloo vote needs no NCCL group when the fused kernel is unavailable."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    if torch.distributed.is_initialized():
+        pytest.skip("needs its own isolated one-process Gloo world")
+    manager = ProcessGroupManager()
+    manager.init_emulated_rank_zero(
+        f"file://{tmp_path / 'rendezvous'}", "gloo", None, None
+    )
+    try:
+        manager.init_process_group((0, 1))
+        monkeypatch.setattr(logits_processor_module, "pg_manager", manager)
+        monkeypatch.setattr(
+            logits_processor_module, "dist_argmax_available", lambda: False
+        )
+        monkeypatch.setattr(LogitsProcessor, "_LOGITS_DIST_ARGMAX_STATES", {})
+        processor = LogitsProcessor(
+            config=PretrainedConfig(vocab_size=8192),
+            tp_rank=0,
+            tp_size=2,
+            tp_group=(0, 1),
+            dp_lm_head_tp=False,
+        )
+        head = ParallelLMHead(
+            8192,
+            2,
+            params_dtype=torch.float32,
+            tp_rank=0,
+            tp_size=2,
+            tp_group=(0, 1),
+        )
+        assert (
+            processor.acquire_dist_argmax_state(
+                head, max_M=8, skip_ping_pong=False, dtype=torch.float32
+            )
+            is None
+        )
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
@@ -446,9 +534,9 @@ def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
     )
     capturing = {"on": True}
     monkeypatch.setattr(
-        logits_processor_module.torch.cuda,
+        logits_processor_module,
         "is_current_stream_capturing",
-        lambda: capturing["on"],
+        lambda device: capturing["on"],
     )
     monkeypatch.setattr(
         logits_processor_module.pg_manager,
@@ -831,7 +919,9 @@ def test_prepared_argmax_reuses_weight_updates_and_rebinds_padded_head(monkeypat
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     capturing = {"active": False}
     monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: capturing["active"]
+        logits_processor_module,
+        "is_current_stream_capturing",
+        lambda device: capturing["active"],
     )
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=8),
@@ -993,7 +1083,9 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
         "_init_all_gather_state",
         lambda lm_head: pytest.fail("the gate must not run inside a capture"),
     )
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module, "is_current_stream_capturing", lambda device: True
+    )
     monkeypatch.setattr(
         logits_processor_module,
         "all_gather_single",
@@ -1007,7 +1099,9 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
     assert proc._dist_argmax_state is None
 
     # A subsequent eager forward must still be able to initialize the states.
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        logits_processor_module, "is_current_stream_capturing", lambda device: False
+    )
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
     monkeypatch.setattr(
         logits_processor_module,
