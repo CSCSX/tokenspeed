@@ -39,6 +39,7 @@ from tokenspeed_kernel.signature import (
 
 __all__ = [
     "bf16_moe_routes",
+    "bf16_moe_routes_warmup",
     "gather_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
@@ -1335,16 +1336,89 @@ def bf16_moe_routes(
         w2: Local down weights ``[experts, hidden, I]``.
         topk_ids: Global selected expert ids ``[tokens, topk]``.
         expert_start: First global expert represented by ``w13`` and ``w2``.
-        out: Optional caller-owned contiguous ``[tokens * topk, hidden]`` (or
-            ``[tokens, topk, hidden]``) destination with ``x``'s dtype that does
-            not overlap any input. None allocates the routes.
+        out: Optional caller-owned contiguous BF16 destination of
+            ``tokens * topk * hidden`` elements (for example a prepared
+            collective buffer). It must not overlap the inputs; every route row
+            is overwritten.
 
     Returns:
-        Route outputs ``[tokens, topk, hidden]``, backed by ``out`` when given;
-        routes to other ranks' experts are zero.
+        Route outputs ``[tokens, topk, hidden]`` (a view of ``out`` when
+        given); routes to other ranks' experts are zero.
     """
-    kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
-    return kernel(x, w13, w2, topk_ids, expert_start, out=out)
+    if out is not None:
+        _check_route_destination(x, w13, w2, topk_ids, out)
+    kernel = select_kernel(
+        "moe",
+        "routes",
+        dense_format_signature(("x",), (x.dtype,)),
+        traits={
+            "hidden": x.shape[1],
+            "ispp": w2.shape[2],
+            "topk": topk_ids.shape[1],
+        },
+    )
+    return kernel(x, w13, w2, topk_ids, expert_start, out)
+
+
+def _check_route_destination(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    if out.dtype != x.dtype or out.device != x.device or not out.is_contiguous():
+        raise ValueError("route destination must be contiguous and match x")
+    if out.numel() != topk_ids.numel() * x.shape[1]:
+        raise ValueError("route destination must hold tokens * topk * hidden values")
+    start = out.data_ptr()
+    end = start + out.numel() * out.element_size()
+    for tensor in (x, w13, w2, topk_ids):
+        # Each kernel streams these inputs while it writes routes.
+        first = tensor.data_ptr()
+        if (
+            out.numel()
+            and tensor.numel()
+            and first < end
+            and start < first + tensor.numel() * tensor.element_size()
+        ):
+            raise ValueError("route destination must not overlap the route inputs")
+
+
+# Token counts that compile every binary of the selected route kernels: decode
+# and prefill tiles on both sides of the 16-token boundary, each runtime
+# integer specialization class (1, multiple of 16, other), and odd and even
+# route counts.
+_BF16_ROUTES_WARMUP_TOKENS = (1, 2, 16, 17, 18, 32)
+
+
+def bf16_moe_routes_warmup(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    top_k: int,
+    expert_start: int,
+    *,
+    max_num_tokens: int,
+) -> None:
+    """Compile the route kernels a layer can launch, before graph capture.
+
+    Args:
+        w13: Local gate/up weights ``[experts, 2I, hidden]``.
+        w2: Local down weights ``[experts, hidden, I]``.
+        top_k: Routes per token.
+        expert_start: First global expert represented by the weights.
+        max_num_tokens: Largest token count the layer routes.
+    """
+    experts, _, hidden = w13.shape
+    for tokens in _BF16_ROUTES_WARMUP_TOKENS:
+        if tokens > max_num_tokens:
+            break
+        ids = (
+            torch.arange(tokens * top_k, dtype=torch.int32, device=w13.device) % experts
+            + expert_start
+        ).view(tokens, top_k)
+        x = torch.zeros((tokens, hidden), dtype=w13.dtype, device=w13.device)
+        bf16_moe_routes(x, w13, w2, ids, expert_start)
 
 
 def moe_plan(

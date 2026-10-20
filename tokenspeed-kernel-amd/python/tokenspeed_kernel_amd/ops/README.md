@@ -1378,6 +1378,52 @@ This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
 of order-dependent BF16 rounding. Stage 2 clears the destination on each call
 and graph replay. Larger token counts retain the FP32 reduction path.
 
+### gfx950 BF16 expert routes
+
+`gluon_bf16_moe_routes_gfx950` (`moe/fp16/routes.py`) computes the unweighted
+SwiGLU output of every selected local expert,
+`out[t * top_k + k] = (silu(x[t] @ gate_e.T) * (x[t] @ up_e.T)) @ w2_e.T` with
+`e = topk_ids[t, k]`, for layers whose experts stay BF16 (Muse layers 0 and
+61). Routes to experts outside the local range get zero rows.
+
+#### Contract
+
+- `x` is contiguous BF16 `[T, H]`, `w13` contiguous `[E, 2I, H]` (gate rows
+  first), `w2` contiguous `[E, H, I]`, `topk_ids` contiguous int32
+  `[T, top_k]` with global ids and `out` a contiguous BF16 `[T * top_k, H]`
+  that does not overlap the inputs. Every row of `out` is written.
+- `H % 512 == 0`, `I % 256 == 0` and `top_k` a power of two up to 16.
+- A token may select one expert in several slots; every such route is
+  written.
+
+#### Algorithm
+
+Through 16 tokens two direct decode kernels (`routes_decode.py`) launch one
+program per (output tile, route slot), tiles fastest so an expert's tiles
+spread over all XCDs. The first slot that selects an expert leads it: its
+program gathers every token routed to that expert (at most 16) into one
+16-row MFMA tile and streams the expert's weight tile once; later slots of the
+same expert exit. The waves split each K step and reduce through LDS once,
+and the unrolled K loop issues the next step's `.cg` weight loads before the
+current MFMAs. Stage 1 interleaves gate and up rows in the weight tile so
+each SwiGLU pair lands in one lane; stage 2's program of a non-local slot
+writes that route's zeros. The token count is a runtime argument, so one
+binary serves every decode batch.
+
+Above 16 tokens a three-launch aligner (`routes_align.py`: per-chunk
+histograms, one prefix-sum program, per-chunk ranking) packs each local
+expert's routes contiguously in route order, without atomics, and cuts them
+into 256-row tiles plus at most one 128-row tile for a remainder that fits
+it. Two grouped GEMMs (`routes_prefill.py`), each launched once per tile
+height, run the dense prefill GEMM's eight-wave 256-column warp-pipelined
+MFMA/LDS schedule on one expert's tile, gathering activation rows through the
+sorted route ids. Programs number only the live tiles, read from the device,
+before the XCD remap, so the live tiles spread over all XCDs. Stage 1's two
+128-column halves read gate rows and the matching up rows, so SwiGLU is
+elementwise on the accumulators. A separate kernel writes zero rows only for
+routes whose expert is not local, so a rank that owns every selected expert
+only reads the ids.
+
 ### MoE route from precomputed top-k
 
 `_precomputed_topk_route` builds the ragged expert metadata, gather/scatter

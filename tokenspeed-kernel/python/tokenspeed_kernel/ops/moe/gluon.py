@@ -366,6 +366,74 @@ if platform.is_amd:
         )
 
 
+if platform.is_amd:
+    from tokenspeed_kernel.ops.moe._triton.bf16 import (
+        _check_route_tensors as _check_bf16_route_tensors,
+    )
+    from tokenspeed_kernel.ops.moe.triton import triton_bf16_moe_routes
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes import (
+        launch_gluon_bf16_moe_routes_gfx950,
+    )
+
+    @register_kernel(
+        "moe",
+        "routes",
+        name="gluon_bf16_moe_routes_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            # Decode stage 1 reduces the hidden size in 512-wide steps, stage 2
+            # the intermediate size in 256-wide steps; prefill tiles both by 128.
+            "hidden_alignment": frozenset({512}),
+            "ispp_alignment": frozenset({256}),
+            "topk": frozenset({1, 2, 4, 8, 16}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_bf16_moe_routes_gfx950(
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_start: int,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gluon kernel of :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`.
+
+        Direct per-expert decode GEMMs through 16 tokens, block-aligned grouped
+        GEMMs above; both write zeros for non-local routes, so ``out`` needs
+        no clearing.
+        """
+        _check_bf16_route_tensors(x, w13, w2, topk_ids)
+        if x.dtype != torch.bfloat16:
+            raise TypeError("x must use torch.bfloat16")
+        if expert_start < 0:
+            raise ValueError("expert_start must be non-negative")
+        tokens, top_k = topk_ids.shape
+        if tokens * top_k * max(x.shape[1], w2.shape[2]) >= 2**31:
+            # The Gluon kernels address routes with 32-bit buffer offsets.
+            return triton_bf16_moe_routes(x, w13, w2, topk_ids, expert_start, out)
+        if out is None:
+            out = torch.empty(
+                (tokens * top_k, x.shape[1]), dtype=x.dtype, device=x.device
+            )
+        if tokens:
+            launch_gluon_bf16_moe_routes_gfx950(
+                x,
+                w13,
+                w2,
+                topk_ids.to(torch.int32).contiguous(),
+                expert_start,
+                out.view(tokens * top_k, x.shape[1]),
+            )
+        return out.view(tokens, top_k, x.shape[1])
+
+
 # ===-----------------------------------------------------------------------===#
 # FP8 block-scaled experts (AMD gfx950, gfx1250)
 # ===-----------------------------------------------------------------------===#
