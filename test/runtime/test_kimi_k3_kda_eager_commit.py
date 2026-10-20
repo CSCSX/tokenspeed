@@ -463,12 +463,12 @@ def _reference_committed_states(harness, pages, inputs, accepted):
                 * params["f_b_weight"].float()[None, :, :]
             ).sum(-1)
         )
-        # Records verification materializes both producers in BF16. AMD's
-        # decomposed scratch fallback does too; NVIDIA's fused scratch
-        # verification retains FP32 intermediates.
-        materialized_producers = (
-            harness.backend._verify_split_producers and harness.backend._replay_active
-        ) or (not harness.backend._replay_active and torch.version.hip is not None)
+        # Records verification uses activation-dtype convolution values,
+        # including AMD's fused producer. The decomposed scratch path
+        # does too; NVIDIA's fused scratch path retains FP32 intermediates.
+        materialized_producers = (harness.backend._replay_active) or (
+            not harness.backend._replay_active and torch.version.hip is not None
+        )
         if materialized_producers:
             from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
 

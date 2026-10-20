@@ -469,13 +469,15 @@ def try_kda_fused_paged_verify(
     registry's choice. ``replay_records`` holds FP32 corrections,
     activation-dtype unnormalized keys and raw gates, and query boundaries
     for same-round recovery. Commit recomputes key normalization and gate decay.
+    A raw gate may be supplied to fused-convolution verification; supplying
+    ``conv_qkv`` additionally selects split producers.
     Returns ``None`` only when no implementation
     supports the current platform.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
-    if (g_raw is None) != (conv_qkv is None):
-        raise ValueError("g_raw and conv_qkv must be provided together")
-    split_producers = g_raw is not None
+    if conv_qkv is not None and g_raw is None:
+        raise ValueError("precomputed convolution requires a projected raw gate")
+    split_producers = conv_qkv is not None
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -500,11 +502,12 @@ def try_kda_fused_paged_verify(
     except NoKernelFoundError:
         return None
     kwargs = {}
+    if g_raw is not None:
+        kwargs["g_raw"] = g_raw
     if split_producers:
-        kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
+        kwargs["conv_qkv"] = conv_qkv
+    if split_producers or replay_records is not None:
         kwargs["replay_records"] = replay_records
-    elif replay_records is not None:
-        raise ValueError("KDA replay records require split producers")
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,

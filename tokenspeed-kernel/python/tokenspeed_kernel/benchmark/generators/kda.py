@@ -919,7 +919,8 @@ def prepare_kda_fused_paged_verify(
 
     load_builtin_kernels()
     spec = _select_registration(request, platform, traits)
-    records = spec.traits.get("split_producers") == frozenset({True})
+    records = not store_states
+    split_producers = spec.traits.get("split_producers") == frozenset({True})
     if records and not capture_replay:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
@@ -999,16 +1000,20 @@ def prepare_kda_fused_paged_verify(
                 "g_raw": torch.nn.functional.linear(
                     projection.f_a_out, weights.f_b_weight
                 ),
-                "conv_qkv": kda_ops.kda_verify_conv_update(
-                    mixed_qkv,
-                    weights.conv_weights,
-                    conv_pool,
-                    read_indices,
-                    num_heads=profile.heads,
-                    head_dim=profile.head_dim,
-                    draft_token_num=draft_token_num,
-                    recurrent_layout=common["recurrent_layout"],
-                    bias=None,
+                "conv_qkv": (
+                    kda_ops.kda_verify_conv_update(
+                        mixed_qkv,
+                        weights.conv_weights,
+                        conv_pool,
+                        read_indices,
+                        num_heads=profile.heads,
+                        head_dim=profile.head_dim,
+                        draft_token_num=draft_token_num,
+                        recurrent_layout=common["recurrent_layout"],
+                        bias=None,
+                    )
+                    if split_producers
+                    else None
                 ),
             }
         return kda_ops.try_kda_fused_paged_verify(
@@ -1158,16 +1163,26 @@ def prepare_kda_replay_commit(
             store_states=False,
             replay_records=record_payload,
             g_raw=torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight),
-            conv_qkv=kda_ops.kda_verify_conv_update(
-                payload_qkv[layer],
-                weights.conv_weights,
-                conv_pool,
-                read_pages,
-                num_heads=profile.heads,
-                head_dim=profile.head_dim,
-                draft_token_num=draft_token_num,
-                recurrent_layout=common["recurrent_layout"],
-                bias=None,
+            conv_qkv=(
+                kda_ops.kda_verify_conv_update(
+                    payload_qkv[layer],
+                    weights.conv_weights,
+                    conv_pool,
+                    read_pages,
+                    num_heads=profile.heads,
+                    head_dim=profile.head_dim,
+                    draft_token_num=draft_token_num,
+                    recurrent_layout=common["recurrent_layout"],
+                    bias=None,
+                )
+                if kda_ops.kda_fused_paged_verify_uses_split_producers(
+                    dtype,
+                    store_states=False,
+                    recurrent_layout=common["recurrent_layout"],
+                    num_heads=profile.heads,
+                    head_dim=profile.head_dim,
+                )
+                else None
             ),
         )
         if output is None:

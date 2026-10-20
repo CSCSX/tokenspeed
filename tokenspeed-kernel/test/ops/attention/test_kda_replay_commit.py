@@ -15,10 +15,8 @@ What has to hold for that to be lossless:
 4. requests in one batch may accept different lengths;
 5. committing into the source page (the usual case -- the new position rarely
    crosses a flat page boundary) matches committing into a fresh page. The
-   conv window is committed by its own launch precisely so this holds: its
-   q/k channels are indexed by head alone, so every program of the recurrence
-   kernel's NV column split would otherwise rewrite channels its siblings
-   have not read yet.
+   conv history must have one writer per head. NVIDIA uses a separate
+   history launch; AMD's unsplit recovery program owns that head's history.
 """
 
 import pytest
@@ -86,22 +84,31 @@ def _prepare_records(x, t):
     """Produce BF16 K/raw-gate and FP32 U through the registered serving path."""
     from tokenspeed_kernel.ops.attention.kda import (
         KdaReplayRecords,
+        kda_fused_paged_verify_uses_split_producers,
         kda_verify_conv_update,
         try_kda_fused_paged_verify,
     )
 
     n, heads = x["read_indices"].numel(), x["beta"].shape[-1]
-    conv_qkv = kda_verify_conv_update(
-        x["qkv_raw"],
-        x["conv_w"],
-        x["conv_pool"],
-        x["read_indices"],
+    producers = {}
+    if kda_fused_paged_verify_uses_split_producers(
+        x["qkv_raw"].dtype,
+        store_states=False,
+        recurrent_layout="v_major",
         num_heads=heads,
         head_dim=K,
-        draft_token_num=t,
-        bias=None,
-        recurrent_layout="v_major",
-    )
+    ):
+        producers["conv_qkv"] = kda_verify_conv_update(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            x["read_indices"],
+            num_heads=heads,
+            head_dim=K,
+            draft_token_num=t,
+            bias=None,
+            recurrent_layout="v_major",
+        )
     raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
     x["correction"] = torch.empty(n, t, heads, V, device=DEV, dtype=torch.float32)
     x["key_gate"] = torch.empty(n, t, heads, 2 * K, device=DEV, dtype=torch.bfloat16)
@@ -142,7 +149,7 @@ def _prepare_records(x, t):
             store_states=False,
             replay_records=records,
             g_raw=raw_gate,
-            conv_qkv=conv_qkv,
+            **producers,
         )
         assert x["verify_output"] is not None
 
@@ -439,18 +446,12 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches(t, graph):
 
     if is_cdna4():
         from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
-            gluon_kda_commit_conv_history_gfx950 as conv_kernel,
-        )
-        from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
             gluon_kda_fused_paged_verify_nostore_vmajor_gfx950 as verify_kernel,
         )
         from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
             gluon_kda_fused_replay_gfx950 as commit_kernel,
         )
     else:
-        from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
-            gluon_kda_commit_conv_history_gfx1250 as conv_kernel,
-        )
         from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
             gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250 as verify_kernel,
         )
@@ -462,7 +463,18 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches(t, graph):
     next_reads = torch.tensor([[1, 2, 3]], device=DEV, dtype=torch.int32)
     next_writes = torch.tensor([[4, 5, 6]], device=DEV, dtype=torch.int32)
     next_accepted = torch.tensor([0, 1, t], device=DEV, dtype=torch.int32)
-    with assert_no_triton_compile(verify_kernel, commit_kernel, conv_kernel):
+    # Verify keeps the original power-of-two value-split buckets.
+    # Warm B=4, then B=3 must reuse that bucket despite its different strides.
+    warm = _window(4, t, pages=10, seed=731)
+    _records_commit(
+        [warm],
+        [0],
+        torch.tensor([[1, 2, 3, 4]], device=DEV, dtype=torch.int32),
+        torch.tensor([[5, 6, 7, 8]], device=DEV, dtype=torch.int32),
+        torch.full((4,), t, device=DEV, dtype=torch.int32),
+        t,
+    )
+    with assert_no_triton_compile(verify_kernel, commit_kernel):
         _records_commit([wider], [0], next_reads, next_writes, next_accepted, t)
     _check_against_reference(original, wider, next_writes[0], 3, t, next_accepted)
 

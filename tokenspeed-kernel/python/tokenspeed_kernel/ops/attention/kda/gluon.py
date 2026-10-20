@@ -218,15 +218,18 @@ if current_platform().is_amd:
         head_dim: int,
         draft_token_num: int,
         lower_bound: float | None,
-        g_raw: torch.Tensor,
-        conv_qkv: torch.Tensor,
         replay_records: KdaReplayRecords,
+        g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Consume shared producers and save records for deferred accepted-state commit."""
+        """Fuse convolution and verification, saving records for accepted-state commit."""
         if replay_records is None:
             raise ValueError("AMD no-store verify requires recovery records")
+        if g_raw is None:
+            g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_verify_impl(
-            conv_qkv=conv_qkv,
+            mixed_qkv=mixed_qkv,
+            conv_weights=conv_weights,
+            conv_pool=conv_states,
             raw_g=g_raw,
             beta_logits=beta_logits,
             A_log=A_log,
@@ -261,7 +264,7 @@ if current_platform().is_amd:
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
             "store_states": frozenset({False}),
-            "split_producers": frozenset({True}),
+            "split_producers": frozenset({False}),
         },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(*args, **kwargs):
@@ -437,15 +440,18 @@ if current_platform().is_amd:
         head_dim: int,
         draft_token_num: int,
         lower_bound: float | None,
-        g_raw: torch.Tensor,
-        conv_qkv: torch.Tensor,
         replay_records: KdaReplayRecords,
+        g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Consume shared producers and save records for deferred accepted-state commit."""
+        """Fuse convolution and verification, saving records for accepted-state commit."""
         if replay_records is None:
             raise ValueError("AMD no-store verify requires recovery records")
+        if g_raw is None:
+            g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_verify_gfx1250_impl(
-            conv_qkv=conv_qkv,
+            mixed_qkv=mixed_qkv,
+            conv_weights=conv_weights,
+            conv_pool=conv_states,
             raw_g=g_raw,
             beta_logits=beta_logits,
             A_log=A_log,
@@ -480,7 +486,7 @@ if current_platform().is_amd:
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
             "store_states": frozenset({False}),
-            "split_producers": frozenset({True}),
+            "split_producers": frozenset({False}),
         },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(*args, **kwargs):

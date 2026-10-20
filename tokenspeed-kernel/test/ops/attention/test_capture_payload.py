@@ -30,6 +30,8 @@ if not torch.cuda.is_available():
 
 from tokenspeed_kernel.ops.attention.kda import (
     KdaReplayRecords,
+    kda_fused_paged_verify_uses_split_producers,
+    kda_verify_conv_update,
     try_kda_fused_paged_verify,
 )
 
@@ -94,10 +96,32 @@ def _capture(sources, key_gate, correction, rows):
         stamps=stamps,
         query_start_loc=torch.arange(rows + 1, device="cuda", dtype=torch.int32),
     )
+    conv_weights = torch.zeros(3 * DIM, 4, device="cuda", dtype=torch.bfloat16)
+    conv_weights[:, -1] = 1
+    conv_pool = torch.zeros(2, 3 * DIM, 3, device="cuda", dtype=torch.bfloat16)
+    producers = {}
+    if kda_fused_paged_verify_uses_split_producers(
+        torch.bfloat16,
+        store_states=False,
+        recurrent_layout="v_major",
+        num_heads=1,
+        head_dim=DIM,
+    ):
+        producers["conv_qkv"] = kda_verify_conv_update(
+            conv_qkv,
+            conv_weights,
+            conv_pool,
+            reads,
+            num_heads=1,
+            head_dim=DIM,
+            draft_token_num=1,
+            recurrent_layout="v_major",
+            bias=None,
+        )
     output = try_kda_fused_paged_verify(
         conv_qkv,
-        torch.empty(3 * DIM, 4, device="cuda", dtype=torch.bfloat16),
-        torch.zeros(2, 3 * DIM, 3, device="cuda", dtype=torch.bfloat16),
+        conv_weights,
+        conv_pool,
         torch.empty(0, device="cuda"),
         torch.empty(0, device="cuda"),
         torch.empty(0, device="cuda"),
@@ -116,9 +140,14 @@ def _capture(sources, key_gate, correction, rows):
         store_states=False,
         replay_records=records,
         g_raw=gate.view(-1, DIM),
-        conv_qkv=conv_qkv,
+        **producers,
     )
     assert output is not None
+
+
+def _activated(source):
+    # Only the current-input convolution tap is nonzero.
+    return torch.nn.functional.silu(source.float()).to(source.dtype)
 
 
 @pytest.mark.parametrize("rows", [1, 8, 128, 1024])
@@ -127,9 +156,9 @@ def test_matches_three_copies(rows, pad):
     """K, raw gate and the independent U oracle land in the selected layer."""
     src, kg, u = _stacks(4, rows, pad=pad, seed=rows)
     expected_kg, expected_u = kg.clone(), u.clone()
-    expected_kg[2, :rows, 0, 0, :DIM].copy_(src[0][:rows])
+    expected_kg[2, :rows, 0, 0, :DIM].copy_(_activated(src[0][:rows]))
     expected_kg[2, :rows, 0, 0, DIM : 2 * DIM].copy_(src[1][:rows])
-    expected_u[2, :rows, 0, 0, :DIM].copy_(src[2][:rows].float() * 0.5)
+    expected_u[2, :rows, 0, 0, :DIM].copy_(_activated(src[2][:rows]).float() * 0.5)
     _capture(src, kg[2, ..., : 2 * DIM], u[2, ..., :DIM], rows)
     torch.testing.assert_close(kg, expected_kg, atol=0, rtol=0)
     torch.testing.assert_close(u, expected_u, atol=0, rtol=0)
@@ -157,9 +186,11 @@ def test_a_source_row_inside_a_wider_projection():
     src = (wide[:, :DIM], wide[:, DIM : 2 * DIM], wide[:, 2 * DIM : 3 * DIM])
     _, kg, u = _stacks(1, rows)
     _capture(src, kg[0], u[0], rows)
-    torch.testing.assert_close(kg[0, :, 0, 0, :DIM], src[0], atol=0, rtol=0)
+    torch.testing.assert_close(kg[0, :, 0, 0, :DIM], _activated(src[0]), atol=0, rtol=0)
     torch.testing.assert_close(kg[0, :, 0, 0, DIM:], src[1], atol=0, rtol=0)
-    torch.testing.assert_close(u[0, :, 0, 0], src[2].float() * 0.5, atol=0, rtol=0)
+    torch.testing.assert_close(
+        u[0, :, 0, 0], _activated(src[2]).float() * 0.5, atol=0, rtol=0
+    )
 
 
 def test_layouts_the_kernel_cannot_address_are_rejected():
@@ -167,7 +198,7 @@ def test_layouts_the_kernel_cannot_address_are_rejected():
     rows = 8
     src, kg, u = _stacks(1, rows)
     wide = torch.randn(rows, 2 * DIM, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="contiguous"):
+    with pytest.raises(ValueError, match="contiguous|last stride 1"):
         _capture((wide[:, ::2], src[1], src[2]), kg[0], u[0], rows)
     with pytest.raises(ValueError, match="correction buffer"):
         _capture(src, kg[0], u[0, ..., :-1], rows)

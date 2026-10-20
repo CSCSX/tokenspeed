@@ -65,8 +65,8 @@ def kda_verify_workspace_bytes(
 
     Returns:
         Transient convolution rows and captured replay payloads, or the dense
-        state tape. Raw-gate replay's convolution scratch aliases the arena
-        and contributes zero. Callers decide whether this engine verifies.
+        state tape. Records metadata is required for both fused and split
+        producers. Callers decide whether this engine verifies.
     """
     state_fields = tuple(
         field
@@ -82,20 +82,11 @@ def kda_verify_workspace_bytes(
         )
 
     from tokenspeed_kernel.ops.attention.kda import (
-        kda_fused_paged_verify_uses_split_producers,
-        kda_recurrent_layout,
         kda_replay_payload_specs,
     )
 
     linear = config.component(LinearAttnConfig)
     heads, head_dim, _ = linear.temporal_state_shape
-    records = kda_fused_paged_verify_uses_split_producers(
-        config.dtype,
-        store_states=False,
-        recurrent_layout=kda_recurrent_layout(),
-        num_heads=heads,
-        head_dim=head_dim,
-    )
     conv_fields = tuple(
         field for field in state_fields if field.field_id.endswith(".conv_state")
     )
@@ -113,9 +104,8 @@ def kda_verify_workspace_bytes(
     metadata_bytes = len(conv_fields) * (10 * 8 + 4)
     metadata_bytes += group_count * 4 * 8
     metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
-    if records:
-        metadata_bytes += config.max_bs * 3 * 8
-        metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
+    metadata_bytes += config.max_bs * 3 * 8
+    metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
     return (
         conv_bytes
         + len(conv_fields) * config.max_bs * draft_token_num * row_bytes

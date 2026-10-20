@@ -1135,10 +1135,12 @@ HBM bound: it reads the state once and writes it once per destination.
 ### KDA records verify and commit (gfx950 / gfx1250)
 
 Standard target decode is a one-token verify window. Both standard and
-speculative decode follow verify, acceptance, and commit. Verify consumes
-activation-dtype convolution outputs and projected gates, leaves committed
-FP32 state unchanged, and saves FP32 correction U plus unnormalized K and raw
-gate in the activation dtype. The current AMD registration supports BF16.
+speculative decode follow verify, acceptance, and commit. Verify retains
+the Gluon fused convolution, LDS vectors, 16-row state panels and batched
+value-split selection. It leaves committed FP32 state unchanged and saves
+FP32 correction U plus unnormalized K and raw gate in the activation dtype.
+Convolution values round to that dtype before recurrence so recovery uses
+the same K as verify. The current AMD registration supports BF16.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against
@@ -1149,9 +1151,11 @@ pages are padding. Groups select independent page-table rows for each layer.
 
 Batched descriptors use the shared ten-column table: original QKV (0), conv
 history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
-The remaining columns are reserved. A separate convolution-history commit
-reads all old taps before writes, including when source and destination alias.
-History retains its bound pool dtype; original QKV is converted on commit.
+The remaining columns are reserved. Recovery retains one program per head,
+request and layer with the eight-panel state pipeline. It also commits that
+head's convolution history after loading all old taps, including when source
+and destination alias. History retains its bound pool dtype; original QKV
+is converted on commit.
 
 ## Transform
 

@@ -363,21 +363,20 @@ class KdaAttnBackend(CapacityPrefillBackend):
             self._replay_commit_steps = torch.empty(
                 self.max_bs, dtype=torch.int32, device=self.device
             )
-            if self._verify_split_producers:
-                self._replay_record_metadata = torch.full(
-                    (self.max_bs, 3), -1, dtype=torch.int64, device=self.device
-                )
-                self._replay_record_stamps = torch.full(
-                    (
-                        len(layer_ids),
-                        self.max_bs,
-                        self.speculative_num_draft_tokens,
-                        2,
-                    ),
-                    -1,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+            self._replay_record_metadata = torch.full(
+                (self.max_bs, 3), -1, dtype=torch.int64, device=self.device
+            )
+            self._replay_record_stamps = torch.full(
+                (
+                    len(layer_ids),
+                    self.max_bs,
+                    self.speculative_num_draft_tokens,
+                    2,
+                ),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
     @override
     def _verify_state_blocks(
@@ -832,10 +831,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if self._replay_active:
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
-            replay_records = None
+            heads = value_dim // attn_tp_size // head_v_dim
             split_producers = {}
             if self._verify_split_producers:
-                heads = value_dim // attn_tp_size // head_v_dim
                 fork = self._verify_producer_forks[layer_id]
                 with fork.scope(enable=True) as producer_fork:
                     with producer_fork.branch():
@@ -859,27 +857,30 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     consumer_stream = torch.cuda.current_stream()
                     g_raw.record_stream(consumer_stream)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
-                # Records hold FP32 corrections and activation-dtype K/raw gates.
-                # Request rows, not pool block IDs, size the per-round cache.
-                assert self._replay_record_metadata is not None
-                assert self._replay_record_stamps is not None
-                replay_records = KdaReplayRecords(
-                    metadata=self._replay_record_metadata[:batch_size],
-                    stamps=self._replay_record_stamps[
-                        self._descriptor_row_by_layer[layer_id], :batch_size
-                    ],
-                    correction=f_a[:rows, : heads * head_v_dim]
-                    .view(batch_size, draft_token_num, heads, head_v_dim)
-                    .transpose(1, 2),
-                    key_gate=beta[:rows, : 2 * heads * head_v_dim]
-                    .view(batch_size, draft_token_num, heads, 2 * head_v_dim)
-                    .transpose(1, 2),
-                    query_start_loc=self.forward_metadata.query_start_loc[
-                        : batch_size + 1
-                    ],
-                )
             else:
-                raise RuntimeError("KDA replay requires record-producing verification")
+                if bias is not None:
+                    raise ValueError("fused KDA convolution does not support a bias")
+                qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
+                split_producers = {
+                    "g_raw": self._kda_gate(g_raw, f_a_out, f_b_weight)[:rows]
+                }
+            # Records hold FP32 corrections and activation-dtype K/raw gates.
+            # Request rows, not pool block IDs, size the per-round cache.
+            assert self._replay_record_metadata is not None
+            assert self._replay_record_stamps is not None
+            replay_records = KdaReplayRecords(
+                metadata=self._replay_record_metadata[:batch_size],
+                stamps=self._replay_record_stamps[
+                    self._descriptor_row_by_layer[layer_id], :batch_size
+                ],
+                correction=f_a[:rows, : heads * head_v_dim]
+                .view(batch_size, draft_token_num, heads, head_v_dim)
+                .transpose(1, 2),
+                key_gate=beta[:rows, : 2 * heads * head_v_dim]
+                .view(batch_size, draft_token_num, heads, 2 * head_v_dim)
+                .transpose(1, 2),
+                query_start_loc=self.forward_metadata.query_start_loc[: batch_size + 1],
+            )
             num_value_heads = value_dim // attn_tp_size // head_v_dim
             if layer_id not in self._replay_weights:
                 # Parameters are stable objects; model weight updates copy into
@@ -1058,40 +1059,38 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
             self._verify_commit_ctx = None
             return
-        if self._verify_split_producers:
-            # A layer subset uses the same record recovery kernel. Full model
-            # forwards bind all layers and use the single batched launch above.
-            for layer_id, weights in self._replay_weights.items():
-                conv_w, _, _, heads, dim, lower_bound = weights
-                row = self._descriptor_row_by_layer[layer_id]
-                conv, state = self._state_components(layer_id)
-                qkv, correction, key_gate, _ = self._replay_payload(layer_id)
-                self._batched_replay_kernel(
-                    descriptors=self._replay_descriptors[row : row + 1],
-                    group_indices=self._replay_group_indices[row : row + 1],
-                    read_indices=self._replay_commit_reads[: len(group_ids) * bs].view(
-                        len(group_ids), bs
-                    ),
-                    write_indices=write_stack,
-                    accepted_length=steps,
-                    draft_token_num=draft_token_num,
-                    num_heads=heads,
-                    head_dim=dim,
-                    qkv_stride=qkv.stride(0),
-                    conv_stride=conv.stride(0),
-                    correction_stride=correction.stride(0),
-                    key_gate_stride=key_gate.stride(0),
-                    state_stride=state.stride(0),
-                    conv_width=conv_w.shape[1],
-                    lower_bound=lower_bound,
-                    activation_dtype=key_gate.dtype,
-                    conv_state_dtype=conv.dtype,
-                    record_metadata=self._replay_record_metadata[:bs],
-                    record_stamps=self._replay_record_stamps[row : row + 1],
-                )
-            self._verify_commit_ctx = None
-            return
-        raise RuntimeError("batched KDA replay was not ready at commit")
+        # A layer subset uses the same record recovery kernel. Full model
+        # forwards bind all layers and use the single batched launch above.
+        for layer_id, weights in self._replay_weights.items():
+            conv_w, _, _, heads, dim, lower_bound = weights
+            row = self._descriptor_row_by_layer[layer_id]
+            conv, state = self._state_components(layer_id)
+            qkv, correction, key_gate, _ = self._replay_payload(layer_id)
+            self._batched_replay_kernel(
+                descriptors=self._replay_descriptors[row : row + 1],
+                group_indices=self._replay_group_indices[row : row + 1],
+                read_indices=self._replay_commit_reads[: len(group_ids) * bs].view(
+                    len(group_ids), bs
+                ),
+                write_indices=write_stack,
+                accepted_length=steps,
+                draft_token_num=draft_token_num,
+                num_heads=heads,
+                head_dim=dim,
+                qkv_stride=qkv.stride(0),
+                conv_stride=conv.stride(0),
+                correction_stride=correction.stride(0),
+                key_gate_stride=key_gate.stride(0),
+                state_stride=state.stride(0),
+                conv_width=conv_w.shape[1],
+                lower_bound=lower_bound,
+                activation_dtype=key_gate.dtype,
+                conv_state_dtype=conv.dtype,
+                record_metadata=self._replay_record_metadata[:bs],
+                record_stamps=self._replay_record_stamps[row : row + 1],
+            )
+        self._verify_commit_ctx = None
+        return
 
     @override
     def _prefill_scan(

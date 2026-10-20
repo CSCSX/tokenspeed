@@ -28,16 +28,6 @@ def kda_records_launch_metadata(grid, kernel, args):
 
 
 @gluon.jit
-def kda_record_decay(raw_gate, bias, a, lower_bound, BOUNDED: gl.constexpr):
-    gate = raw_gate + bias
-    if BOUNDED:
-        log_decay = lower_bound / (1.0 + gl.exp(-a * gate))
-    else:
-        log_decay = -a * gl.where(gate > 20.0, gate, gl.log(1.0 + gl.exp(gate)))
-    return gl.exp(log_decay)
-
-
-@gluon.jit
 def kda_record_interval(
     metadata,
     stamps,
@@ -72,7 +62,7 @@ def kda_record_interval(
         offsets = gl.arange(
             0,
             triton.next_power_of_2(CAPACITY),
-            layout=gl.BlockedLayout([1], [WAVE], [4], [0]),
+            layout=gl.BlockedLayout([1], [WAVE], [gl.num_warps()], [0]),
         )
         positions = start + offsets
         ptr = (
