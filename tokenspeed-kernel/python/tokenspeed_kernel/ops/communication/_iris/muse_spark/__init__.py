@@ -851,7 +851,8 @@ class MuseIrisState:
             and num_tokens * 4096 <= self.reduction.lamport_max_numel
         ):
             assert self.gather.output is not None
-            iris_fused_lamport_allreduce_routed_rmsnorm_sum[(num_tokens,)](
+            # One single-wave program per 512-feature tile and token.
+            iris_fused_lamport_allreduce_routed_rmsnorm_sum[(num_tokens * 8,)](
                 routes,
                 route_map,
                 route_weights,
@@ -866,7 +867,7 @@ class MuseIrisState:
                 EPS=eps,
                 MAX_ELEMENTS=self.reduction.lamport_max_numel,
                 PORTABLE_MATH=num_tokens > 16,
-                num_warps=8,
+                num_warps=1,
             )
             return self.gather.output[: num_tokens * 4096].view(num_tokens, 4096)
         assert self.all_reduce.producer.data is not None
