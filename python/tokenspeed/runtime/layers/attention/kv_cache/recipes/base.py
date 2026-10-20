@@ -31,9 +31,6 @@ from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
 )

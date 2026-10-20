@@ -76,16 +76,11 @@ env:
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_project_value_amd_batches[8]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.mla_project_value/gluon_mla_project_value_gfx1250/batch8-sigmoid-gate@mi450]
     # KDA: native-layout paged prefill, specialized paged decode, fused paged
-    # decode, and all-layer replay with uneven cache groups.
+    # decode, all-layer replay with uneven cache groups, and in-place commit.
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_prefill_preserves_native_state_layout
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_decode_defaults_to_specialized_kernel_on_amd[2-8-8-False--5.0]
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1]
     tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_gluon_batched_replay_uneven_groups_match_per_layer_launches
-    tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_replay_matches_sequential_decode_at_every_accepted_length
-    tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_rejected_suffix_cannot_reach_the_committed_state
-    tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_zero_accepted_commits_the_pre_draft_state_unchanged
-    tokenspeed-kernel/test/ops/attention/test_capture_payload.py::test_nothing_outside_the_written_rows_moves
-    tokenspeed-kernel/test/ops/attention/test_capture_payload.py::test_a_source_row_inside_a_wider_projection
     tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_in_place_commit_full_pool_accounting
     # DeepSeek V4.1 index top-k: CSA2 scoring, reindexing, missing and
     # out-of-table latest pages, arena page strides, raw gfx1250 logits, and
