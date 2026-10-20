@@ -81,9 +81,25 @@ class TestMinimalL3ExecutorTest:
     def test_roundtrip_without_site_packages(self):
         # Only the scheduler native package is needed; no inference dependencies.
         import tokenspeed_scheduler
+        import tokenspeed_scheduler.tokenspeed_scheduler_ext as scheduler_ext
 
         source = textwrap.dedent("""
+            import importlib.util
+            import os
+            import sys
             import time
+
+            # ``python -S`` skips the editable-install finder that maps the
+            # scheduler's compiled extension, so register it from the path the
+            # parent resolved before the package import looks for it.
+            spec = importlib.util.spec_from_file_location(
+                "tokenspeed_scheduler.tokenspeed_scheduler_ext",
+                os.environ["_L3_TEST_SCHEDULER_EXT"],
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+
             from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
             from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
             from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
@@ -127,6 +143,7 @@ class TestMinimalL3ExecutorTest:
             [sys.executable, "-S", "-c", source],
             env={
                 **os.environ,
+                "_L3_TEST_SCHEDULER_EXT": scheduler_ext.__file__,
                 "PYTHONPATH": os.pathsep.join(
                     [
                         os.path.abspath(

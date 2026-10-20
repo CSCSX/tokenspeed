@@ -44,6 +44,25 @@ from tokenspeed.runtime.utils.process import (  # noqa: E402
 _TIMEOUT_S = 60
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _spawn_start_method():
+    """Run this module's children on production's spawn start method.
+
+    Several children import the engine stack inside the child; a forked child
+    cannot re-initialize a parent's CUDA state on that import path, which is
+    why production sets spawn in ``_set_envs_and_config``. These tests bypass
+    that entry point, so set the same method here: every process, Event,
+    Barrier and nested worker created in this module then shares one context.
+    Restore the previous method so other modules are unaffected.
+    """
+    previous = mp.get_start_method(allow_none=True)
+    mp.set_start_method("spawn", force=True)
+    try:
+        yield
+    finally:
+        mp.set_start_method(previous, force=True)
+
+
 def _wait_for_termination(writer):
     writer.send({"status": "ready"})
     threading.Event().wait(_TIMEOUT_S * 10)
@@ -108,7 +127,7 @@ def _repeated_failure_cleanup(writer):
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     # A launcher installed after a failed instance must receive its own first
-    # failure, including when fork inherited a parent's latched state.
+    # failure, even after an earlier launcher latched the shutdown state.
     lifecycle_exitcodes = []
     for _ in range(2):
         register_child_failure_signals()

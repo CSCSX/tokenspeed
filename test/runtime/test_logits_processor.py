@@ -761,12 +761,14 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
 def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
     monkeypatch, nvidia_logits
 ):
-    """The uninitialised sentinel must not be mistaken for a built state.
+    """Forward never builds the distributed argmax; capture defers the gather gate.
 
-    The gate reduces across the group, so it is skipped inside a capture. The
-    sentinel is an ``object()`` and so passes ``is not None``: leaving it in
-    place would hand it to ``all_gather_inner`` as if it were a state. It must
-    also survive, or an eager call afterwards would never build the real one.
+    The uninitialized sentinel is an ``object()`` and so passes
+    ``is not None``: forward must refuse it instead of handing it to the
+    gather as if it were a state. Once ``prepare_communication`` has resolved
+    the argmax (None = prepared fallback), a capture takes the plain gather
+    and leaves the all-gather gate's sentinel for an eager call, since that
+    gate still rendezvouses lazily.
     """
     proc = LogitsProcessor(
         config=SimpleNamespace(
@@ -779,19 +781,28 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
         dp_lm_head_tp=False,
     )
     monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_inner",
+        lambda *a, **k: pytest.fail("the sentinel must never reach the gather"),
+    )
+    hidden = torch.randn(4, 2, dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.bfloat16))
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    with pytest.raises(RuntimeError, match="must be prepared before forwarding"):
+        proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
+
+    # A prepared fallback gathers plainly inside a capture; both gates stay off.
+    monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: None)
+    proc.prepare_communication(lm_head)
+    monkeypatch.setattr(
         proc,
         "_init_dist_argmax_state",
-        lambda lm_head: pytest.fail("the gate must not run inside a capture"),
+        lambda lm_head: pytest.fail("forward never re-runs the argmax gate"),
     )
     monkeypatch.setattr(
         proc,
         "_init_all_gather_state",
         lambda lm_head: pytest.fail("the gate must not run inside a capture"),
-    )
-    monkeypatch.setattr(
-        logits_processor_module,
-        "all_gather_inner",
-        lambda *a, **k: pytest.fail("the sentinel must never reach the gather"),
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
@@ -800,18 +811,14 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
         lambda out, inp, group: None,
     )
 
-    hidden = torch.randn(4, 2, dtype=torch.bfloat16)
-    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.bfloat16))
-    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
 
     assert out.shape == (4, 8)
     assert proc._all_gather_state is LogitsProcessor._LOGITS_AG_STATE_UNINITIALIZED
-    assert proc._dist_argmax_state is LogitsProcessor._LOGITS_DIST_ARGMAX_UNINITIALIZED
+    assert proc._dist_argmax_state is None
 
     # A subsequent eager forward must still be able to initialize the states.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: None)
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
     monkeypatch.setattr(
         logits_processor_module,
@@ -1481,6 +1488,7 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
     )
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     head = torch.nn.Linear(2, 4, bias=False).requires_grad_(False)
+    processor.prepare_communication(head)
     actual = processor._get_logits(
         hidden,
         head,
