@@ -215,15 +215,21 @@ def _select_direct_stage2_tiles(
     num_tokens: int,
     *,
     ep_deferred: bool,
-) -> tuple[int, int]:
-    """Return the rocprof-tuned gfx950 ``(BLOCK_N, BLOCK_K)`` pair."""
+    tp_deferred: bool,
+) -> tuple[int, int, bool]:
+    """Return the tuned gfx950 ``(BLOCK_N, BLOCK_K, PIPELINE_K)`` stage-2 tiles."""
+    assert not (ep_deferred and tp_deferred)
+    if tp_deferred:
+        # Expert TP's 512-wide W2 K is two 256-wide tiles. Wide, unpipelined
+        # tiles were fastest at every measured M <= 24 (2.8 us at M=16).
+        return 32, 256, False
     if not ep_deferred:
-        return _DIRECT_STAGE2_BLOCK_N, _DIRECT_STAGE2_BLOCK_K
+        return _DIRECT_STAGE2_BLOCK_N, _DIRECT_STAGE2_BLOCK_K, True
     # Wide output tiles amortize deferred expert stores at the largest captured
     # batch; deeper K tiles shorten the four-tile dependency chain at M <= 8.
     block_n = 32 if num_tokens >= 16 else _DIRECT_STAGE2_BLOCK_N
     block_k = 256 if num_tokens <= 8 else _DIRECT_STAGE2_BLOCK_K
-    return block_n, block_k
+    return block_n, block_k, False
 
 
 _SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
@@ -980,6 +986,14 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
             and top_k == 8
         )
     )
+    # Expert TP (TP8/EP1): every expert is local with a 512-wide W2 K shard.
+    is_tp_deferred = (
+        not do_finalize
+        and global_num_experts == local_experts == 256
+        and hidden_dim == out_dim == 4096
+        and inter_dim == 512
+        and top_k == 8
+    )
     use_route_tiles = (
         is_ep_deferred
         and int(w13_runtime.shape[0]) in (32, 64)
@@ -1174,11 +1188,11 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
             (n_tokens, out_dim) if do_finalize else (n_tokens * top_k, out_dim)
         )
         out = torch.empty(output_shape, dtype=out_dtype, device=device)
-    stage2_block_n, stage2_block_k = _select_direct_stage2_tiles(
+    stage2_block_n, stage2_block_k, stage2_pipeline_k = _select_direct_stage2_tiles(
         n_tokens,
         ep_deferred=is_ep_deferred,
+        tp_deferred=is_tp_deferred,
     )
-    stage2_pipeline_k = not is_ep_deferred
     expanded_idx = (
         None
         if do_finalize
