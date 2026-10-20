@@ -174,25 +174,6 @@ class XGrammarGrammar(BaseGrammarObject):
 
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
-    def fill_vocab_masks_along_drafts(
-        self,
-        vocab_masks: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        next_node: torch.Tensor,
-        next_sibling: torch.Tensor,
-    ) -> None:
-        """Fill ``vocab_masks[k]`` with the mask after ``draft_tokens[1..k]``,
-        in one matcher call; ``draft_tokens[0]`` is already accepted.
-
-        ``next_node`` / ``next_sibling`` give the draft tree (int64, one entry
-        per node, -1 for none). The walk stops at the first draft token the
-        grammar rejects or that ends it: that node's row is zeroed and the
-        rows below it are not written. The matcher state is unchanged.
-        """
-        self.matcher.traverse_draft_tree(
-            next_node, next_sibling, draft_tokens, vocab_masks
-        )
-
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
 

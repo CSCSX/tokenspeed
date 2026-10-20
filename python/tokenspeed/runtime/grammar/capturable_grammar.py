@@ -50,7 +50,6 @@ import torch
 
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.grammar.grammar_host import load_grammar_host_ext
-from tokenspeed.runtime.grammar.xgrammar_backend import matcher_method_handles
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -193,6 +192,9 @@ class CapturableGrammarExecutor:
         self.output_tokens = torch.zeros((n_rows,), dtype=torch.int32, pin_memory=True)
 
         self.accept_lengths = torch.zeros((max_bs,), dtype=torch.int32, pin_memory=True)
+
+        # Imported here, so only processes that build this executor load xgrammar.
+        from tokenspeed.runtime.grammar.xgrammar_backend import matcher_method_handles
 
         self.host = load_grammar_host_ext().Host(
             matcher_method_handles(),

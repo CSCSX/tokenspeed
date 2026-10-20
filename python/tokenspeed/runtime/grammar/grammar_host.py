@@ -389,8 +389,10 @@ class Host {
         auto batch = std::make_shared<Batch>(
             methods_, std::move(matchers), std::move(advance), has_candidates,
             num_extends, num_prefill_outputs, num_decodes, decode_width);
+        std::vector<std::shared_ptr<Batch>> retired;
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.push_back(batch);
+        retired.swap(retired_);
         return batch;
     }
 
@@ -399,6 +401,7 @@ class Host {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.clear();
         current_.reset();
+        retired_.clear();
     }
 
     size_t Queued() {
@@ -452,6 +455,9 @@ class Host {
             previous->Advance(output_tokens_, rows_, accept_lengths_);
         }
         Fill(*batch);
+        // It may hold a matcher's last reference: the next add releases it, on a Python thread.
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        retired_.push_back(std::move(previous));
     }
 
     bool FillRow(const Matcher& matcher, int64_t row) {
@@ -580,6 +586,7 @@ class Host {
     std::mutex queue_mutex_;
     std::deque<std::shared_ptr<Batch>> queue_;
     std::shared_ptr<Batch> current_;
+    std::vector<std::shared_ptr<Batch>> retired_;
 };
 
 }  // namespace

@@ -259,6 +259,32 @@ def test_host_advance_racing_the_host_node_advances_once(compile_grammar):
         previous = batch
 
 
+def test_the_host_node_fills_after_a_host_advance_it_waited_for(compile_grammar):
+    # Mid-group a matcher allows "b" or "c"; only a whole group allows "}".
+    width = 1024
+    compiled = compile_grammar(f'root ::= ("b"{{{width - 1}}} "c")* "}}"')
+    executor = _executor(max_bs=1, tokens_per_req=width)
+    layout = ForwardOutputLayout(0, 0, 1, width)
+    group = [B] * (width - 1) + [C]
+    executor.output_tokens[:] = torch.tensor(group)
+    executor.accept_lengths[0] = width
+    whole = _next_mask(_grammar(compiled, group))
+    # As in serving, consecutive forwards share the request's matcher.
+    grammar = _grammar(compiled)
+    previous = executor.add_batch(grammars=[grammar], bs=1, output_layout=layout)
+    _launch(executor)
+    for step in range(40):
+        torch.cuda.synchronize()
+        batch = executor.add_batch(grammars=[grammar], bs=1, output_layout=layout)
+        # The node comes at a later point of the host's advance each step.
+        torch.cuda._sleep(50_000 * step)
+        _launch(executor)
+        previous.advance_on_host(group, [width])
+        torch.cuda.synchronize()
+        assert torch.equal(executor.host_bitmask[0], whole)
+        previous = batch
+
+
 def test_a_queued_host_node_outlives_its_executor(compile_grammar):
     import gc
 
@@ -283,16 +309,20 @@ def test_a_queued_host_node_outlives_its_executor(compile_grammar):
 @pytest.mark.parametrize("on_host", [False, True])
 def test_advance_reads_tokens_at_the_output_layout_offsets(compile_grammar, on_host):
     compiled = compile_grammar('root ::= "a" "b" "c" "}"')
-    # Two completing prefills (the second one's token is not to advance), an
-    # incomplete one (no output) and a width-2 decode.
-    layout = ForwardOutputLayout(3, 2, 1, 2)
-    executor = _executor(max_bs=4, tokens_per_req=2)
-    grammars = [_grammar(compiled) for _ in range(4)]
-    tokens, lengths = [A, A, A, B], [1, 1, 0, 2]
+    # Three completing prefills (the second one's token is not to advance),
+    # an incomplete one (no output) and three width-3 decodes.
+    layout = ForwardOutputLayout(4, 3, 3, 3)
+    executor = _executor(max_bs=7, tokens_per_req=3)
+    accepted = ([], [], [A], [], [A], [A], [A, B, C])
+    grammars = [_grammar(compiled, tokens) for tokens in accepted]
+    # Reading another request's tokens, or reading on past a rejected token,
+    # changes what a matcher accepts.
+    tokens = [A, A, B, B, C, BRACE, C, B, C, BRACE, EOS, A]
+    lengths = [1, 1, 1, 0, 2, 3, 3]
     batch = executor.add_batch(
         grammars=grammars,
-        bs=4,
-        advance_mask=[True, False, True, True],
+        bs=7,
+        advance_mask=[True, False, True, True, True, True, True],
         output_layout=layout,
     )
     _launch(executor)
@@ -300,16 +330,16 @@ def test_advance_reads_tokens_at_the_output_layout_offsets(compile_grammar, on_h
     if on_host:
         batch.advance_on_host(tokens, lengths)
     else:
-        executor.output_tokens[:4] = torch.tensor(tokens)
-        executor.accept_lengths[:4] = torch.tensor(lengths)
-        executor.add_batch(grammars=[None] * 4, bs=4, output_layout=layout)
+        executor.output_tokens[: len(tokens)] = torch.tensor(tokens)
+        executor.accept_lengths[:7] = torch.tensor(lengths)
+        executor.add_batch(grammars=[None] * 7, bs=7, output_layout=layout)
         _launch(executor)
         torch.cuda.synchronize()
-    assert batch.terminated_at() == [-1, -1, -1, -1]
-    for grammar, accepted in zip(grammars, ([A], [], [], [A, B])):
-        assert torch.equal(
-            _next_mask(grammar), _next_mask(_grammar(compiled, accepted))
-        )
+    # The last decode ends at its second token and leaves the third.
+    assert batch.terminated_at() == [-1, -1, -1, -1, -1, -1, 1]
+    assert grammars[6].is_terminated()
+    for grammar, now in zip(grammars, ([A], [], [A, B], [], [A, B, C], [A])):
+        assert torch.equal(_next_mask(grammar), _next_mask(_grammar(compiled, now)))
 
 
 def test_batches_are_checked_against_their_layout(compile_grammar):
