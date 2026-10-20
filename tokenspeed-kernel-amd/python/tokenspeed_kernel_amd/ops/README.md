@@ -69,7 +69,7 @@ Qwen3.8-Flash-Next decode batches.
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
-  Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 shapes.
+  Kimi K3 TP8, Muse Spark TP4/TP8 and Qwen3.8-Flash-Next TP2 shapes.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets
@@ -126,6 +126,24 @@ independent weight streams in flight per CU, which suits cold weights.
   hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
   measured shapes route single rows to `mv` separately.
 
+### gfx950 FP32 router GEMV
+
+`gluon_fp32_router_gemv_gfx950` (`gemm/fp32/router_gemv.py`) computes
+`(x @ W) * multiplier` in FP32 for MoE routers at decode batch sizes.
+
+- `x` is contiguous FP32 `[M, K]`; the prepared weight is the router weight
+  transposed once to a contiguous `[N, K]`. `1 <= M <= 16` and `K <= 16384`
+  run the Gluon kernel; larger batches and rows take `torch.matmul`.
+- One program per output `n` stages weight row `n` into LDS with
+  asynchronous `.cg` copies, one commit group per 1024-wide K step, so the
+  whole row is in flight at once. Each lane keeps an FP32 FMA partial per
+  row of `x` for its 16-byte K slice, the activations of the next step load
+  during this step's FMAs, and one reduction across lanes and waves finishes
+  the output. Every weight element is read once for all rows.
+- The summation order depends only on `K`, so a row's logits are bitwise the
+  same at every batch size. `M` is a runtime argument; `BLOCK_M` is its next
+  power of two (five binaries per router shape).
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
@@ -162,8 +180,10 @@ constexprs alone.
   128 bytes per lane each) takes the rest: more rows per wave, where it
   measured 1-8% faster, and shares that leave fewer than four ring chunks.
 - M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
-  wave, so the four waves split every K iteration and reduce through LDS once;
-  weights load K-contiguous and reach the operand layout through LDS.
+  wave, so the waves split every K iteration and reduce through LDS once;
+  weights load K-contiguous and reach the operand layout through LDS. Rows of
+  at least 8192 use eight waves instead of four, doubling the weight bytes in
+  flight per CU.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
   register copy of a pending load waits for the load and serialized the chunks.
 

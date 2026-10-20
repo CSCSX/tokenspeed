@@ -256,13 +256,20 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply an unbiased projection, writing into ``out`` when supplied."""
-        if x.shape[0] == 1 and (
-            (
-                current_platform().is_cdna4
-                and x.dtype == weight.dtype
-                and not _gemm_dispatch_required()
+        if (
+            current_platform().is_cdna4
+            and x.dtype == weight.dtype
+            and not _gemm_dispatch_required()
+            # Where gemm.mm would hand these rows to gemm.mv anyway, write
+            # them straight into a contiguous ``out`` instead of copying mm's
+            # result; mv sends a strided ``out`` to Torch instead.
+            and (
+                x.shape[0] == 1
+                or ((out is None or out.is_contiguous()) and _use_mv(x, weight))
             )
-            or (
+        ) or (
+            x.shape[0] == 1
+            and (
                 not current_platform().is_cdna4
                 and resolve_kernel_override("gemm", "mm", None) is None
                 and _use_mv(x, weight)
