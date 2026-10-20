@@ -907,7 +907,11 @@ OUTPUT_GAIN_OFFSET = 0.0
 RESIDUAL_GATE_TEMPERATURE = 0.3
 RESIDUAL_GATE_EPS = 1e-3
 MUSE_OWNED_ROWS_MIN_TOKENS = 192
-MUSE_OWNED_QKVG_MIN_TOKENS = 2048
+# Owned QKVG plus all-to-all beats gathering the normalized input from 512 rows
+# in eager and graph execution through the KV-cache write (measured on gfx950
+# TP8; TP4 shares the boundary). Below that, captured prologues favor the
+# gather. Later layers need replicated BF16 QKVG weights for this layout.
+MUSE_OWNED_QKVG_MIN_TOKENS = 512
 
 
 class PreparedFP32RouterGEMV(nn.Module):

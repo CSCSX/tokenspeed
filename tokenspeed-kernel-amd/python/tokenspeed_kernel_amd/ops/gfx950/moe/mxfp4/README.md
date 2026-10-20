@@ -28,10 +28,12 @@ token/slot order for intermediates and outputs. Matrix dimensions, top-k and
 expert counts are explicit kernel parameters.
 
 Muse's deferred A4W4 path supports TP4/EP4 and TP8/EP8 with a 4096-wide
-local intermediate, and TP8/EP1 with all 256 experts and a 512-wide local
+local intermediate (decode route tiles from 4 tokens on EP4 and 5 on EP8,
+through 48), and TP8/EP1 with all 256 experts and a 512-wide local
 intermediate. TP8/EP1 returns one partial output per token/route before the
 model reduces the TP partitions and normalizes each expert output. It uses
-direct decode through 16 tokens and the package prefill above that. Package
+direct decode through 16 tokens, with 32-column, two-K-tile unpipelined
+stage-2 tiles for its 512-wide W2 shard, and the package prefill above that. Package
 row blocks follow the route density across all 256 experts. Startup warmup
 uses the processed local weight geometry and bounded row families for all
 three placements.

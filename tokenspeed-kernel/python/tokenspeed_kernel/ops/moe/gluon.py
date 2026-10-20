@@ -1122,10 +1122,12 @@ if platform.is_amd:
         )
         # Runtime M has two integer-alignment classes. Sort widths grow only
         # at these bounds; the direct/compact decode kernels have two row tiles.
+        # Five is EP8's first route-tiled row count (short stage-2 K tiles).
         representatives = (
             1,
             2,
             4,
+            5,
             16,
             17,
             32,
