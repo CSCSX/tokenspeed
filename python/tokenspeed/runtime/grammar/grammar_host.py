@@ -719,8 +719,10 @@ def load_grammar_host_ext() -> Any:
                     include_dirs.append(inc)
                 if os.path.isdir(lib):
                     library_dirs.append(lib)
-            # conda-forge keeps the toolkit under <prefix>/targets/<platform>, which CUDA_HOME misses.
-            for root in dict.fromkeys(r for r in (cuda_home, sys.prefix) if r):
+            # conda-forge keeps the toolkit under <prefix>/targets/<platform>; base_prefix covers a venv.
+            for root in dict.fromkeys(
+                r for r in (cuda_home, sys.prefix, sys.base_prefix) if r
+            ):
                 include_dirs += sorted(
                     glob.glob(os.path.join(root, "targets", "*", "include"))
                 )
