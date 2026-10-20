@@ -1148,6 +1148,9 @@ reusing a stale window. Recovery reads the accepted prefix, recomputes key
 normalization and decay, and applies U without recomputing the prediction.
 A zero accepted count copies the checkpoint. Nonpositive source/destination
 pages are padding. Groups select independent page-table rows for each layer.
+Device assertions remain enabled for interval and generation checks. These
+launches disable automatic integer-overflow instrumentation to keep repeated
+address checks out of the state-update loop.
 
 Batched descriptors use the shared ten-column table: original QKV (0), conv
 history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
