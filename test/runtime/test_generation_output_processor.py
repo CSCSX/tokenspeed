@@ -371,12 +371,13 @@ def test_nan_outranks_a_client_abort_on_the_prefill_node():
 
 
 class _DecodeEndsItsGrammar:
-    """A step's grammar completion: the decode request's second token ends
-    its grammar."""
+    """A step's grammar completion: the decode request's token at ``end``
+    ends its grammar."""
 
     host_node_wait = 0.25
 
-    def __init__(self):
+    def __init__(self, end):
+        self.end = end
         self.waited = []
 
     def wait(self, timeout):
@@ -387,7 +388,7 @@ class _DecodeEndsItsGrammar:
         raise AssertionError("the completion has advanced")
 
     def terminated_at(self):
-        return [-1, 1]
+        return [-1, self.end]
 
 
 class _VerifyResult(_ExecutionResult):
@@ -395,11 +396,11 @@ class _VerifyResult(_ExecutionResult):
     output_lengths = torch.tensor([1, 2], dtype=torch.int32)
 
 
-@pytest.mark.parametrize("aborted", [False, True])
-def test_a_grammar_ending_keeps_check_finisheds_order(aborted):
+@pytest.mark.parametrize("aborted,end", [(False, 1), (True, 0)])
+def test_a_grammar_ending_keeps_check_finisheds_order(aborted, end):
     """The token that ends the grammar finishes the request, not an earlier
-    one, unless an abort already pending outranks it as check_finished
-    orders them."""
+    one, unless an abort already pending on that token outranks it as
+    check_finished orders them."""
     from tokenspeed.runtime.engine.request_types import (
         FINISH_ABORT,
         FINISH_MATCHED_TOKEN,
@@ -414,7 +415,7 @@ def test_a_grammar_ending_keeps_check_finisheds_order(aborted):
     if aborted:
         processor.mark_abort("decode", notify_client=False)
 
-    completion = _DecodeEndsItsGrammar()
+    completion = _DecodeEndsItsGrammar(end)
     result = _VerifyResult()
     result.grammar_completion = completion
     processor.post_process_forward_op(_ForwardOp(), result, is_prefill_instance=False)
@@ -425,8 +426,8 @@ def test_a_grammar_ending_keeps_check_finisheds_order(aborted):
         assert isinstance(decode.finished_reason, FINISH_ABORT)
     else:
         assert isinstance(decode.finished_reason, FINISH_MATCHED_TOKEN)
-        assert decode.finished_reason.matched == 23
-        assert decode.output_ids == [22, 23]
+        assert decode.finished_reason.matched == [22, 23][end]
+        assert decode.output_ids == [22, 23][: end + 1]
 
 
 class _RecordingLogger:

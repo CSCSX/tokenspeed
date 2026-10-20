@@ -345,9 +345,9 @@ class EagerGrammarBuffers:
 
     ``cudaLaunchHostFunc`` is CUDA-only, so on HIP / CPU the forward runs
     the host node's C++ fill on the calling thread (for verify it first
-    syncs on the drafts) and copies the masks to the device. post_process advances the matchers;
-    the event loop drains in-flight forwards before a grammar batch, so the
-    fill reads matchers that have advanced.
+    syncs on the drafts) and copies the masks to the device. post_process
+    advances the matchers; the event loop drains in-flight forwards before
+    a grammar batch, so the fill reads matchers that have advanced.
     """
 
     def __init__(
