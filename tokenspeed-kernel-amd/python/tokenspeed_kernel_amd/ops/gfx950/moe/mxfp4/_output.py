@@ -47,7 +47,15 @@ def validate_deferred_output(
     start = output.data_ptr()
     end = start + output.numel() * output.element_size()
     for tensor in inputs:
-        if tensor is None or not tensor.numel() or tensor.device != device:
+        if tensor is None or not tensor.numel():
+            continue
+        # Cheap common case: the whole input allocation is disjoint. Eager
+        # small-M prefill is host bound, so avoid the span walk below.
+        storage = tensor.untyped_storage()
+        base = storage.data_ptr()
+        if base + storage.nbytes() <= start or end <= base:
+            continue
+        if tensor.device != device:
             continue
         # Disjoint views of one symmetric heap are valid. Include the full
         # addressed span of strided inputs, including gaps between rows.

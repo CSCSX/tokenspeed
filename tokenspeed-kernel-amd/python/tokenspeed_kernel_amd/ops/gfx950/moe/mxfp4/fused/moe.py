@@ -1590,33 +1590,6 @@ def _maybe_gluon_package_mxfp4_prefill(
     ):
         return None
 
-    if deferred_out is not None:
-        validate_deferred_output(
-            deferred_out,
-            tokens=n_tokens,
-            topk=top_k,
-            width=hidden_dim,
-            device=device,
-            do_finalize=do_finalize,
-            inputs=(
-                *(
-                    hidden_states
-                    if isinstance(hidden_states, tuple)
-                    else (hidden_states,)
-                ),
-                *(x_quantized if x_quantized is not None else ()),
-                package_w13,
-                package_w13_scale,
-                package_w2,
-                package_w2_scale,
-                router_logits,
-                correction_bias,
-                precomputed_topk_weights,
-                precomputed_topk_ids,
-                out,
-            ),
-        )
-
     topk_weights = precomputed_topk_weights
     topk_ids = precomputed_topk_ids
     if topk_weights is None or topk_ids is None:

@@ -1763,7 +1763,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
                        tensors retain physical CDNA4 panel pitches
         out          : (token_num, D) bf16 -- final per-token output
         deferred_out : optional contiguous (token_num * topk, D) bf16 raw
-                       destination, disjoint from inputs. None allocates it.
+                       destination, disjoint from inputs (the caller checks
+                       overlap). None allocates it.
                        Only valid with do_finalize=False; the same missing
                        route and initialize_unowned_routes contract applies.
         sorted_*     : generated with ``sort_block_m`` when it differs
@@ -1794,29 +1795,19 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         )
     assert w2.dtype == torch.uint8
     if deferred_out is not None:
-        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._output import (
-            validate_deferred_output,
-        )
-
-        validate_deferred_output(
-            deferred_out,
-            tokens=out.shape[0],
-            topk=topk,
-            width=w2.shape[1],
-            device=inter_states.device,
-            do_finalize=do_finalize,
-            inputs=(
-                inter_states,
-                w2,
-                sorted_token_ids,
-                sorted_expert_ids,
-                num_valid_ids if isinstance(num_valid_ids, torch.Tensor) else None,
-                out,
-                w2_scale,
-                a2_scale,
-                sorted_weights,
-            ),
-        )
+        # The public deferred-MoE entry already rejected overlap with every
+        # caller input; stage-2 intermediates are fresh allocations. Keep this
+        # per-launch check cheap: eager small-M prefill is host bound.
+        if (
+            do_finalize
+            or deferred_out.dtype != torch.bfloat16
+            or deferred_out.shape != (out.shape[0] * topk, w2.shape[1])
+            or not deferred_out.is_contiguous()
+        ):
+            raise ValueError(
+                "stage2 deferred_out must be contiguous BF16 routes with "
+                "do_finalize=False"
+            )
     # Step 2: shuffle w2 to MFMA-tile layout if the caller didn't.
     if not b_preshuffled:
         w2 = _b_preshuffle_3d(w2)
