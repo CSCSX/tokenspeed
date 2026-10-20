@@ -1048,6 +1048,17 @@ def gluon_kda_fused_replay_gfx950(
         k_values += (k_value,)
         decay_values += (decay,)
 
+    # These T1/T4 depths retain the current register occupancy.
+    # Other windows keep one panel in flight.
+    pipeline_depth: gl.constexpr = 2 if T == 1 else (4 if T == 4 else 1)
+    for prefetch_idx in gl.static_range(1, pipeline_depth):
+        prefetch_offsets = (
+            panel_value_offsets[:, None] + prefetch_idx * 16
+        ) * D + key_offsets[None, :]
+        prefetch_raw = gl.load(state_pool + read_base + prefetch_offsets).to(gl.float32)
+        off_pipe = off_pipe + (prefetch_offsets,)
+        raw_pipe = raw_pipe + (prefetch_raw,)
+
     for panel_idx in gl.static_range(8):
         panel_offsets = off_pipe[0]
         running = raw_pipe[0]
@@ -1064,7 +1075,7 @@ def gluon_kda_fused_replay_gfx950(
         write_base = write_idx * state_stride + head_idx * D * D
         gl.store(state_pool + write_base + panel_offsets, running)
 
-        next_idx = panel_idx + 1
+        next_idx = panel_idx + pipeline_depth
         if next_idx < 8:
             next_offsets = (
                 panel_value_offsets[:, None] + next_idx * 16
