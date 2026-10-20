@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import statistics
@@ -57,6 +58,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
     fused_kda_verify_conv_update,
 )
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 _CONCURRENCIES = (1, 2, 4, 8, 16, 32, 64, 128)
 _HEADS = 12
@@ -195,8 +197,12 @@ class ReplayCase:
             self.originals.append((conv.clone(), state.clone()))
             raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
             self.raw_gates.append(raw_gate)
-            self.retained_qkv.append(x["qkv_raw"].clone())
-            self.verifies.append(_prepare_records(x, t, raw_gate=raw_gate))
+            self.retained_qkv.append(torch.empty_like(x["qkv_raw"]))
+            self.verifies.append(
+                _prepare_records(
+                    x, t, raw_gate=raw_gate, original_qkv=self.retained_qkv[layer]
+                )
+            )
         self.descriptors = _batched_descriptor(self.layers)
         for layer, x in enumerate(self.layers):
             self.descriptors[layer, 0] = self.retained_qkv[layer].data_ptr()
@@ -230,7 +236,7 @@ class ReplayCase:
             draft_token_num=self.t,
             num_heads=_HEADS,
             head_dim=K,
-            qkv_stride=x["qkv_raw"].stride(0),
+            qkv_stride=self.retained_qkv[0].stride(0),
             conv_stride=x["conv_pool"].stride(0),
             correction_stride=x["correction"].stride(1),
             key_gate_stride=x["key_gate"].stride(1),
@@ -243,7 +249,6 @@ class ReplayCase:
 
     def verify_all(self):
         for layer, x in enumerate(self.layers):
-            self.retained_qkv[layer].copy_(x["qkv_raw"])
             torch.mm(x["f_a"], x["w_fb"].t(), out=self.raw_gates[layer])
             self.verifies[layer]()
 
@@ -335,6 +340,107 @@ def test_commit_ignores_rejected_records():
     for x, (state, history) in zip(case.layers, expected, strict=True):
         torch.testing.assert_close(x["h_pool"], state, atol=0, rtol=0)
         torch.testing.assert_close(x["conv_pool"], history, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not (current_platform().is_cdna4 or current_platform().is_cdna5),
+    reason="requires AMD gfx950 or gfx1250",
+)
+@pytest.mark.parametrize("graph", [False, True])
+def test_verify_retains_original_qkv(graph):
+    batch, t, heads = 3, 4, _HEADS
+    x = _window(batch, t, pages=2 * batch + 2, seed=8910, num_heads=heads)
+    rows, width = x["qkv_raw"].shape
+    source_storage = torch.empty(rows + 1, width, device="cuda", dtype=torch.bfloat16)
+    source_storage[:rows].copy_(x["qkv_raw"])
+    x["qkv_raw"] = source_storage[:rows]
+    raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    with pytest.raises(ValueError, match="must not overlap producers"):
+        _prepare_records(x, t, raw_gate=raw_gate, original_qkv=source_storage[1:])
+    _prepare_records(x, t, raw_gate=raw_gate, original_qkv=None)
+    expected_output = x["verify_output"].clone()
+    original = x["qkv_raw"].clone()
+    accepted = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
+    reference = _reference(x, t, accepted, rounded_conv=True)
+    writes = x["read_indices"] + batch
+    expected_state, expected_history = x["h_pool"].clone(), x["conv_pool"].clone()
+    expected_state[writes.long()], expected_history[writes.long()] = reference[-2:]
+    destinations = [
+        torch.full((rows, width + padding), -9, device="cuda", dtype=torch.bfloat16)
+        for padding in (7, 16)
+    ]
+    _prepare_records(x, t, raw_gate=raw_gate, original_qkv=destinations[0][:, :width])
+    arch = "gfx950" if current_platform().is_cdna4 else "gfx1250"
+    module = importlib.import_module(
+        f"tokenspeed_kernel_amd.ops.{arch}.attention.kda.decode"
+    )
+    verify_kernel = getattr(
+        module, f"gluon_kda_fused_paged_verify_nostore_vmajor_{arch}"
+    )
+    for destination in destinations:
+        retained = destination[:, :width]
+        retained.fill_(-9)
+        # Row strides remain runtime values across alignment classes.
+        with assert_no_triton_compile(verify_kernel):
+            verify = _prepare_records(x, t, raw_gate=raw_gate, original_qkv=retained)
+            if graph:
+                capture = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(capture):
+                    verify()
+                retained.fill_(-9)
+                capture.replay()
+        torch.testing.assert_close(retained, original, atol=0, rtol=0)
+        torch.testing.assert_close(
+            destination[:, width:],
+            torch.full_like(destination[:, width:], -9),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(x["verify_output"], expected_output, atol=0, rtol=0)
+
+    descriptors = _batched_descriptor([x])
+    descriptors[0, 0] = retained.data_ptr()
+    descriptors[0, 3] = x["correction"].data_ptr()
+    descriptors[0, 5] = x["key_gate"].data_ptr()
+    groups = torch.zeros(1, device="cuda", dtype=torch.int32)
+    kernel = resolve_kda_batched_replay_commit(
+        torch.bfloat16, num_heads=heads, head_dim=K
+    )
+    assert kernel is not None
+
+    def commit():
+        kernel(
+            descriptors=descriptors,
+            group_indices=groups,
+            read_indices=x["read_indices"][None],
+            write_indices=writes[None],
+            accepted_length=accepted,
+            activation_dtype=x["qkv_raw"].dtype,
+            conv_state_dtype=x["conv_pool"].dtype,
+            draft_token_num=t,
+            num_heads=heads,
+            head_dim=K,
+            qkv_stride=retained.stride(0),
+            conv_stride=x["conv_pool"].stride(0),
+            correction_stride=x["correction"].stride(1),
+            key_gate_stride=x["key_gate"].stride(1),
+            state_stride=x["h_pool"].stride(0),
+            conv_width=4,
+            lower_bound=LOWER_BOUND,
+            record_metadata=x["metadata"],
+            record_stamps=x["stamps"][None],
+        )
+
+    # Projection storage may be reused before acceptance reaches commit.
+    x["qkv_raw"].zero_()
+    commit()
+    if graph:
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            commit()
+        capture.replay()
+    torch.testing.assert_close(x["h_pool"], expected_state, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(x["conv_pool"], expected_history, atol=0, rtol=0)
 
 
 def _check_original(
@@ -558,10 +664,10 @@ def main():
         "cache": args.cache,
         "state_page_bytes": _STATE_PAGE_BYTES,
         "paired_rounds": args.paired_rounds,
-        "verify_scope": "one layer; excludes gate GEMM and candidate QKV retention copy",
+        "verify_scope": "one layer; includes retained payload writes and excludes gate GEMM",
         "commit_scope": "all layers; includes conv history; excludes verify",
         "lifecycle_scope": {
-            "candidate": "all layers: QKV retention copy, gate GEMM, records verify, then one batched commit",
+            "candidate": "all layers: gate GEMM, records verify with QKV retention, then one batched commit",
             "original_t1": "all layers: original fused decode; gfx1250 also includes gate GEMM",
             "original_t4": "all layers: gate GEMM, capture verify, then one batched raw-g replay",
         },

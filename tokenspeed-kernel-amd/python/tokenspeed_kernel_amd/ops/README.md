@@ -1140,7 +1140,11 @@ the Gluon fused convolution, LDS vectors, 16-row state panels and batched
 value-split selection. It leaves committed FP32 state unchanged and saves
 FP32 correction U plus unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
-the same K as verify. The current AMD registration supports BF16.
+the same K as verify. The current AMD registration supports BF16. Verify can
+also retain original QKV in a separate caller-owned buffer, which commit
+reads for conv history.
+A null destination leaves retention to the caller. Padding pages do not write
+retained rows.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against

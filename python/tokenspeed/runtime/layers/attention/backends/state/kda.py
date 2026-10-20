@@ -499,9 +499,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Return one layer's views in the shared descriptor order.
 
-        Split producers store raw QKV, FP32 U, BF16 K/raw gate and empty gate
-        scratch. Other backends retain raw QKV, f_a, beta and gate scratch.
-        The tuple order stays stable across backend-specific payload formats.
+        Records hold original QKV, FP32 U, activation-dtype K/raw gate and
+        an empty reserved buffer. All record consumers use this tuple order.
         """
         assert self._replay_payloads is not None
         row = self._descriptor_row_by_layer[layer_id]
@@ -860,7 +859,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             else:
                 if bias is not None:
                     raise ValueError("fused KDA convolution does not support a bias")
-                qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
                 split_producers = {
                     "g_raw": self._kda_gate(g_raw, f_a_out, f_b_weight)[:rows]
                 }
@@ -869,6 +867,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
             assert self._replay_record_metadata is not None
             assert self._replay_record_stamps is not None
             replay_records = KdaReplayRecords(
+                original_qkv=(
+                    None
+                    if self._verify_split_producers
+                    else qkv[:rows, : mixed_qkv.shape[-1]]
+                ),
                 metadata=self._replay_record_metadata[:batch_size],
                 stamps=self._replay_record_stamps[
                     self._descriptor_row_by_layer[layer_id], :batch_size

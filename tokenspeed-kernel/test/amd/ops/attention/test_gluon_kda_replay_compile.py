@@ -112,28 +112,34 @@ def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window):
         [[row, 7, 2**33 + 1] for row in range(batch)], dtype=torch.int64
     )
     stamps = torch.empty(layers, batch, capacity, 2, dtype=torch.int64)
-    output = getattr(module, f"gluon_kda_fused_verify_{arch}")(
-        mixed_qkv=x["qkv_raw"],
-        conv_weights=x["conv_w"],
-        conv_pool=x["conv_pool"],
-        raw_g=torch.empty(batch * window, heads * dim, dtype=torch.bfloat16),
-        beta_logits=x["beta"],
-        A_log=x["A_log"],
-        dt_bias=x["dt_bias"],
-        state_pool=x["h_pool"],
-        read_indices=x["read_indices"],
-        correction=correction.transpose(1, 2),
-        key_gate=key_gate.transpose(1, 2),
-        record_metadata=metadata,
-        record_stamps=stamps[0],
-        query_start_loc=torch.arange(batch + 1, dtype=torch.int32) * window,
-        num_heads=heads,
-        head_dim=dim,
-        draft_token_num=window,
-        lower_bound=-5.0,
+    width = x["qkv_raw"].shape[1]
+    retained = torch.empty_strided(
+        x["qkv_raw"].shape, (width + 7, 1), dtype=x["qkv_raw"].dtype
     )
-    assert output.shape == (1, batch * window, heads, dim)
-    assert output.dtype == x["qkv_raw"].dtype
+    for original_qkv in (None, retained):
+        output = getattr(module, f"gluon_kda_fused_verify_{arch}")(
+            mixed_qkv=x["qkv_raw"],
+            original_qkv=original_qkv,
+            conv_weights=x["conv_w"],
+            conv_pool=x["conv_pool"],
+            raw_g=torch.empty(batch * window, heads * dim, dtype=torch.bfloat16),
+            beta_logits=x["beta"],
+            A_log=x["A_log"],
+            dt_bias=x["dt_bias"],
+            state_pool=x["h_pool"],
+            read_indices=x["read_indices"],
+            correction=correction.transpose(1, 2),
+            key_gate=key_gate.transpose(1, 2),
+            record_metadata=metadata,
+            record_stamps=stamps[0],
+            query_start_loc=torch.arange(batch + 1, dtype=torch.int32) * window,
+            num_heads=heads,
+            head_dim=dim,
+            draft_token_num=window,
+            lower_bound=-5.0,
+        )
+        assert output.shape == (1, batch * window, heads, dim)
+        assert output.dtype == x["qkv_raw"].dtype
     getattr(module, f"launch_gluon_kda_fused_replay_{arch}")(
         torch.empty(layers, 10, dtype=torch.uint64),
         torch.zeros(layers, dtype=torch.int32),

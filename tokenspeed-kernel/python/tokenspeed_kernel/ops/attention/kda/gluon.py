@@ -228,6 +228,7 @@ if current_platform().is_amd:
             g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_verify_impl(
             mixed_qkv=mixed_qkv,
+            original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
             raw_g=g_raw,
@@ -450,6 +451,7 @@ if current_platform().is_amd:
             g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_verify_gfx1250_impl(
             mixed_qkv=mixed_qkv,
+            original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
             raw_g=g_raw,

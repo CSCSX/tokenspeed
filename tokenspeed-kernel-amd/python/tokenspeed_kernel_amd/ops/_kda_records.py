@@ -89,6 +89,7 @@ def kda_record_interval(
 
 def validate_kda_records_verify(
     conv_qkv,
+    original_qkv,
     raw_g,
     beta,
     state,
@@ -106,6 +107,28 @@ def validate_kda_records_verify(
 ):
     """Check the shared records layout before a pointer-based verify launch."""
     import torch
+
+    if original_qkv is not None:
+        if (
+            original_qkv.shape != conv_qkv.shape
+            or original_qkv.dtype != conv_qkv.dtype
+            or original_qkv.device != conv_qkv.device
+            or original_qkv.stride(-1) != 1
+            or original_qkv.stride(0) < original_qkv.shape[-1]
+        ):
+            raise ValueError("Original QKV destination must match the input rows")
+        destination = original_qkv.untyped_storage()
+        begin, end = (
+            destination.data_ptr(),
+            destination.data_ptr() + destination.nbytes(),
+        )
+        for source in (conv_qkv, raw_g, beta):
+            storage = source.untyped_storage()
+            if (
+                begin < storage.data_ptr() + storage.nbytes()
+                and storage.data_ptr() < end
+            ):
+                raise ValueError("Original QKV destination must not overlap producers")
 
     batch, tokens = reads.numel(), conv_qkv.shape[0]
     if dim != 128 or window <= 0 or tokens > batch * window:

@@ -492,6 +492,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     launch_metadata=kda_records_launch_metadata,
     do_not_specialize=[
         "MIXED_ROW_STRIDE",
+        "ORIGINAL_QKV_ROW_STRIDE",
         "CONV_POOL_PAGE_STRIDE",
         "GATE_ROW_STRIDE",
         "BETA_ROW_STRIDE",
@@ -511,6 +512,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
 )
 def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     mixed_qkv: tl.const,
+    original_qkv,
     conv_weights: tl.const,
     conv_pool: tl.const,
     raw_g: tl.const,
@@ -539,6 +541,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     TOKENS_PER_SEQUENCE: gl.constexpr,
     VALUE_SPLITS: gl.constexpr,
     MIXED_ROW_STRIDE,
+    ORIGINAL_QKV_ROW_STRIDE,
     CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_COL_STRIDE: gl.constexpr,
     CONV_POOL_PAGE_STRIDE,
@@ -653,11 +656,21 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
 
     for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
         token_idx = token_base + token_offset
-        qkv_input = gl.load(
+        qkv_input_raw = gl.load(
             mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel,
             mask=token_offset < token_count,
             other=0.0,
-        ).to(gl.float32)
+        )
+        if original_qkv is not None:
+            # One value split retains the pre-convolution bytes for commit.
+            gl.store(
+                original_qkv + token_idx * ORIGINAL_QKV_ROW_STRIDE + qkv_channel,
+                qkv_input_raw,
+                mask=(value_split_idx == 0)
+                & (slot_id != 3)
+                & (token_offset < token_count),
+            )
+        qkv_input = qkv_input_raw.to(gl.float32)
         qkv_value = _kda_conv_step(
             qkv_history0,
             qkv_history1,
@@ -1303,6 +1316,7 @@ def gluon_kda_fused_decode_gfx950(
 def gluon_kda_fused_verify_gfx950(
     *,
     mixed_qkv: torch.Tensor,
+    original_qkv: torch.Tensor | None,
     conv_weights: torch.Tensor,
     conv_pool: torch.Tensor,
     raw_g: torch.Tensor,
@@ -1323,6 +1337,9 @@ def gluon_kda_fused_verify_gfx950(
 ) -> torch.Tensor:
     """Produce attention output and records without changing committed state.
 
+    original_qkv is an optional separate destination for live pre-convolution
+    rows, in packed input order. None leaves retention to the caller. Commit
+    uses fixed-width windows, so serving supplies dense query boundaries.
     mixed_qkv contains activation-dtype pre-convolution Q/K/V rows; raw_g and
     beta_logits are projected gate inputs. state_pool is FP32 [page, head, V, K].
     read_indices selects checkpoint pages; nonpositive pages are padding.
@@ -1336,6 +1353,7 @@ def gluon_kda_fused_verify_gfx950(
     """
     validate_kda_records_verify(
         mixed_qkv,
+        original_qkv,
         raw_g,
         beta_logits,
         state_pool,
@@ -1375,6 +1393,7 @@ def gluon_kda_fused_verify_gfx950(
         (num_heads * value_splits, batch)
     ](
         mixed_qkv,
+        original_qkv,
         conv_weights,
         conv_pool,
         raw_g,
@@ -1403,6 +1422,7 @@ def gluon_kda_fused_verify_gfx950(
         TOKENS_PER_SEQUENCE=draft_token_num,
         VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
+        ORIGINAL_QKV_ROW_STRIDE=(0 if original_qkv is None else original_qkv.stride(0)),
         CONV_WEIGHT_ROW_STRIDE=conv_weights.stride(0),
         CONV_WEIGHT_COL_STRIDE=conv_weights.stride(1),
         CONV_POOL_PAGE_STRIDE=conv_pool.stride(0),
