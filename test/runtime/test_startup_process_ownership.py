@@ -367,7 +367,12 @@ def test_repeated_failure_signals_cannot_interrupt_owner_cleanup():
         _repeated_failure_cleanup, (), contextlib.nullcontext()
     )
     try:
-        assert reader.poll(_TIMEOUT_S), "owner did not finish repeated-signal cleanup"
+        # The child imports the engine stack and waits on two spawned workers
+        # with their own _TIMEOUT_S budgets, so its worst case exceeds a
+        # single _TIMEOUT_S on a busy runner.
+        assert reader.poll(
+            _TIMEOUT_S * 3
+        ), "owner did not finish repeated-signal cleanup"
         result = reader.recv()
         assert result["lifecycle_exitcodes"] == [1, 1]
         assert result["outcome"] == 1
