@@ -265,16 +265,57 @@ class Batch {
         return num_prefill_outputs_ + (request - num_extends_) * decode_width_;
     }
 
-    // Advances each matcher by its accepted tokens and completes the batch;
-    // if another thread took that on first, waits for it instead.
+    // From the host node: advances the batch, or waits for the thread that took that on first.
     void Advance(const int32_t* tokens, int64_t num_tokens, const int32_t* accept_lengths) {
+        if (!TryAdvance(tokens, num_tokens, accept_lengths)) {
+            WaitDone();
+        }
+    }
+
+    // From post_process, with the GIL: it keeps the GIL to advance (microseconds) and
+    // releases it only to wait for the host node.
+    void AdvanceOnHost(const std::vector<int32_t>& tokens, const std::vector<int32_t>& accept_lengths) {
+        if (static_cast<int64_t>(accept_lengths.size()) < bs()) {
+            throw py::value_error("accept_lengths is shorter than the batch");
+        }
+        if (TryAdvance(tokens.data(), static_cast<int64_t>(tokens.size()), accept_lengths.data())) {
+            return;
+        }
+        py::gil_scoped_release release;
+        WaitDone();
+    }
+
+    // Whether the batch has advanced within timeout_s; the GIL is released only to wait.
+    bool Wait(double timeout_s) {
+        if (Done() || timeout_s <= 0) {
+            return Done();
+        }
+        py::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock(mutex_);
+        return done_.wait_for(
+            lock, std::chrono::duration<double>(timeout_s), [this] { return state_ == kDone; });
+    }
+
+    std::vector<int32_t> TerminatedAt() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != kDone) {
+            throw std::runtime_error("the batch has not advanced yet");
+        }
+        return terminated_at_;
+    }
+
+  private:
+    enum State { kPending, kAdvancing, kDone };
+
+    // Advances each matcher by its accepted tokens and completes the batch, unless
+    // another thread took that on first.
+    bool TryAdvance(const int32_t* tokens, int64_t num_tokens, const int32_t* accept_lengths) {
         // Allocated before the claim: past it nothing throws, so the batch always completes.
         std::vector<int32_t> terminated_at(matchers_.size(), -1);
         {
-            std::unique_lock<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
             if (state_ != kPending) {
-                done_.wait(lock, [this] { return state_ == kDone; });
-                return;
+                return false;
             }
             state_ = kAdvancing;
         }
@@ -300,31 +341,18 @@ class Batch {
             state_ = kDone;
         }
         done_.notify_all();
+        return true;
     }
 
-    void AdvanceOnHost(const std::vector<int32_t>& tokens, const std::vector<int32_t>& accept_lengths) {
-        if (static_cast<int64_t>(accept_lengths.size()) < bs()) {
-            throw py::value_error("accept_lengths is shorter than the batch");
-        }
-        Advance(tokens.data(), static_cast<int64_t>(tokens.size()), accept_lengths.data());
-    }
-
-    bool Wait(double timeout_s) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        return done_.wait_for(
-            lock, std::chrono::duration<double>(timeout_s), [this] { return state_ == kDone; });
-    }
-
-    std::vector<int32_t> TerminatedAt() {
+    bool Done() {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != kDone) {
-            throw std::runtime_error("the batch has not advanced yet");
-        }
-        return terminated_at_;
+        return state_ == kDone;
     }
 
-  private:
-    enum State { kPending, kAdvancing, kDone };
+    void WaitDone() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [this] { return state_ == kDone; });
+    }
 
     const std::shared_ptr<const Methods> methods_;
     const std::vector<std::shared_ptr<Matcher>> matchers_;
@@ -595,8 +623,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<Matcher, std::shared_ptr<Matcher>>(m, "Matcher")
         .def(py::init<uintptr_t, const std::vector<int64_t>&>());
     py::class_<Batch, std::shared_ptr<Batch>>(m, "Batch")
-        .def("wait", &Batch::Wait, py::call_guard<py::gil_scoped_release>())
-        .def("advance_on_host", &Batch::AdvanceOnHost, py::call_guard<py::gil_scoped_release>())
+        .def("wait", &Batch::Wait)
+        .def("advance_on_host", &Batch::AdvanceOnHost)
         .def("terminated_at", &Batch::TerminatedAt);
     py::class_<Host, std::shared_ptr<Host>>(m, "Host")
         .def(py::init<
