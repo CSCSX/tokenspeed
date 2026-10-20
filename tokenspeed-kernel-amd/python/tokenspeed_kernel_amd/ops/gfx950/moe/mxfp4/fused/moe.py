@@ -994,6 +994,10 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         and inter_dim == 512
         and top_k == 8
     )
+    # EP8's 32 local experts see about M routes per rank: at M=4 the descriptor
+    # launch costs more than tiles save (direct is 3.4 us faster over six route
+    # draws), while EP4 keeps its measured four-row bound.
+    route_tile_min_m = 5 if local_experts == 32 else 4
     use_route_tiles = (
         is_ep_deferred
         and int(w13_runtime.shape[0]) in (32, 64)
@@ -1001,7 +1005,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         and hidden_dim == inter_dim == out_dim == 4096
         and int(w2_runtime.shape[2]) == 4096
         and top_k == 8
-        and 4 <= n_tokens <= min(route_tile_max_m, 48)
+        and route_tile_min_m <= n_tokens <= min(route_tile_max_m, 48)
         and swiglu_alpha == 1.0
         and swiglu_limit == 0.0
         and swiglu_beta == 0.0
