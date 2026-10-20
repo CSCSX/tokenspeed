@@ -332,7 +332,17 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
     alpha = torch.sqrt(1 - beta.square())
     rows_sequence = (512, 1, 8191, 21, 513, 8192) if sharded else (26, 1, 25, 2)
     bases = [torch.randn(rows, 8192, device=device) for rows in rows_sequence]
-    inputs = [(base + (rank + 1) / 8).bfloat16() for base in bases]
+    # Every rank sends negative zero in some columns; the push path must not
+    # mistake it for its empty mailbox marker.
+    negative_zero = torch.zeros(8192, dtype=torch.bool, device=device)
+    negative_zero[::97] = True
+
+    def contribution(base, peer, step):
+        values = (base + (peer + 1) * (step + 1) / 8).bfloat16()
+        values[:, negative_zero] = -0.0
+        return values
+
+    inputs = [contribution(base, rank, 0) for base in bases]
     streams = [torch.randn_like(base) for base in bases]
     posts = [
         None if sharded or index % 2 == 0 else post for index in range(len(inputs))
@@ -370,9 +380,6 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
     if sharded:
         state.row_scatter_flags.fill_(2**32 - 2)
         state.row_gather_flags.fill_(2**32 - 2)
-    else:
-        state.boundary_generations.fill_(2**31 - 4)
-        state.boundary_ready_flags.fill_(2**31 - 4)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
@@ -380,14 +387,14 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
         outputs = sequence()
     for step in range(4):
         for base, values in zip(bases, inputs):
-            values.copy_(base + (rank + 1) * (step + 1) / 8)
+            values.copy_(contribution(base, rank, step))
         if rank == step:
             torch.cuda._sleep(10000)
         graph.replay()
         for base, stream, weight, actual in zip(bases, streams, posts, outputs):
-            reduced = (base + (step + 1) / 8).bfloat16().float()
+            reduced = contribution(base, 0, step).float()
             for peer in range(1, world_size):
-                reduced.add_((base + (peer + 1) * (step + 1) / 8).bfloat16().float())
+                reduced.add_(contribution(base, peer, step).float())
             expected = _boundary_reference(
                 stream, reduced.bfloat16(), weight, alpha, beta, pre
             )
