@@ -92,12 +92,18 @@ def _inputs(window, device, *, batch):
 
 
 @pytest.mark.parametrize(
-    ("arch", "window", "batch"),
-    [(arch, window, 3) for arch in ("gfx950", "gfx1250") for window in (1, 4, 8)]
-    # Cover eight-way split T1, unsplit T1, and the GEMM producer above 64 rows.
-    + [("gfx950", 1, 1), ("gfx950", 1, 17), ("gfx950", 4, 17)],
+    ("arch", "window", "batch", "capacity"),
+    [
+        (arch, window, 3, window + 1)
+        for arch in ("gfx950", "gfx1250")
+        for window in (1, 4, 8)
+    ]
+    # Cover a wide ring, unsplit T1, and the GEMM producer above 64 rows.
+    + [("gfx950", 1, 1, 129), ("gfx950", 1, 17, 2), ("gfx950", 4, 17, 5)],
 )
-def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window, batch):
+def test_kda_records_wrapper_launches_compile(
+    monkeypatch, arch, window, batch, capacity
+):
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.kda.decode"
     )
@@ -109,7 +115,6 @@ def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window, batch):
     x = _inputs(window, "cpu", batch=batch)
     heads, dim, layers = 12, 128, 2
     # A capacity wider than the live window also exercises masked ring loads.
-    capacity = window + 1
     correction = torch.empty(batch, capacity, heads, dim)
     key_gate = torch.empty(batch, capacity, heads, 2 * dim, dtype=torch.bfloat16)
     metadata = torch.tensor(

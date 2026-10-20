@@ -19,6 +19,7 @@ perf:
     export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
     python3 -m pytest -q --confcutdir=tokenspeed-kernel/test/amd/ops/attention \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_ignores_rejected_records \
+      tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_wide_record_ring \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_verify_retains_original_qkv \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_inline_gate_matches_supplied_gate
     baseline_revision=3461560d467a76401ce3cb3d72742fccb05dd591

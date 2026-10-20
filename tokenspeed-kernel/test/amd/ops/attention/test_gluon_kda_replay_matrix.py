@@ -355,6 +355,53 @@ def test_commit_ignores_rejected_records():
     not (current_platform().is_cdna4 or current_platform().is_cdna5),
     reason="requires AMD gfx950 or gfx1250",
 )
+def test_commit_wide_record_ring():
+    capacity = 129
+    case = ReplayCase(3, 1, 2, in_place=True, seed=8901)
+    case.accepted.copy_(torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32))
+    case.verify_all()
+    case.commit()
+    expected = [(x["h_pool"].clone(), x["conv_pool"].clone()) for x in case.layers]
+
+    # Move the saved records into a wider ring; inactive entries stay poisoned.
+    stamps = case.stamps.new_full((len(case.layers), case.batch, capacity, 2), -1)
+    for layer, x in enumerate(case.layers):
+        slots = x["metadata"][:, 0]
+        positions = x["metadata"][:, 2] % capacity
+        correction, key_gate = x["correction"], x["key_gate"]
+        x["correction"] = correction.new_full(
+            (case.batch, capacity, *correction.shape[2:]), float("nan")
+        )
+        x["key_gate"] = key_gate.new_full(
+            (case.batch, capacity, *key_gate.shape[2:]), float("nan")
+        )
+        x["correction"][slots, positions] = correction[slots, 0]
+        x["key_gate"][slots, positions] = key_gate[slots, 0]
+        stamps[layer, slots, positions] = x["stamps"][slots, 0]
+        x["stamps"] = stamps[layer]
+        case.descriptors[layer, 3] = x["correction"].data_ptr()
+        case.descriptors[layer, 5] = x["key_gate"].data_ptr()
+    case.stamps = stamps
+
+    # Eager recovery warms the wide-ring specialization before graph capture.
+    for graph in (False, True):
+        case.reset()
+        if graph:
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture):
+                case.commit()
+            capture.replay()
+        else:
+            case.commit()
+        for x, (state, history) in zip(case.layers, expected, strict=True):
+            torch.testing.assert_close(x["h_pool"], state, atol=2e-6, rtol=2e-5)
+            torch.testing.assert_close(x["conv_pool"], history, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not (current_platform().is_cdna4 or current_platform().is_cdna5),
+    reason="requires AMD gfx950 or gfx1250",
+)
 @pytest.mark.parametrize("graph", [False, True])
 def test_verify_retains_original_qkv(graph):
     batch, t, heads = 3, 4, _HEADS

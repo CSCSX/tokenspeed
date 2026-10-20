@@ -1151,8 +1151,8 @@ A supplied raw gate is used directly. GFX1250 retains the separate gate producer
 Both save the gate used by verify. For one-token windows, each GFX950 value split
 starts its first checkpoint-panel load before preparing the token vectors.
 Without value splits, it keeps four panels in flight after preparation.
-Recovery keeps two panels in flight for one-token windows.
-Other recovery windows use one panel.
+GFX950 recovery uses two warps for one-token windows and four warps otherwise.
+It keeps two panels in flight for one-token windows and one panel otherwise.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against
