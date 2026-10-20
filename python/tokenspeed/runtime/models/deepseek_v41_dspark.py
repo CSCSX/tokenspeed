@@ -170,6 +170,7 @@ class _WindowAttention:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        out_rope_cache=None,
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
@@ -177,8 +178,12 @@ class _WindowAttention:
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
         if q.is_cuda and q.shape[-1] == 512:
-            return self._kernel_forward(q, kv, attn_sink, softmax_scale)
-        return self._reference_forward(q, kv, attn_sink, softmax_scale)
+            out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
+        else:
+            out = self._reference_forward(q, kv, attn_sink, softmax_scale)
+        if out_rope_cache is not None:
+            rope_inplace(out, positions, out_rope_cache, None)
+        return out
 
     def _kernel_forward(self, q, kv, attn_sink, softmax_scale):
         """The target's prefill workspace kernel over ``[history, block]`` rows.
@@ -246,8 +251,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def __init__(self, config, mapping, quant_config, prefix):
-        if mapping.attn.dp_size != 1 or mapping.pp_size != 1:
-            raise NotImplementedError("V4.1 DSpark requires attention DP=PP=1")
+        if mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 DSpark requires PP=1")
         stages = int(config.dspark_num_stages)
         block_size = int(config.dspark_block_size)
         taps = tuple(config.dspark_target_layer_ids)

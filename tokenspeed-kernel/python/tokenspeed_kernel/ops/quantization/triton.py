@@ -100,7 +100,7 @@ def _flatten_to_2d(x: torch.Tensor):
         if x.stride(d) != expected:
             raise ValueError(
                 f"cannot flatten dim {d}: stride={x.stride(d)} but expected "
-                f"shape[{d+1}]*stride[{d+1}]={expected}. Tensor shape={tuple(x.shape)}, "
+                f"shape[{d + 1}]*stride[{d + 1}]={expected}. Tensor shape={tuple(x.shape)}, "
                 f"stride={tuple(x.stride())}."
             )
     return M, N, row_stride
@@ -240,7 +240,7 @@ def fp8_token_multiplier(amax):
 def fp8_quantize_by_multiplier(x, multiplier):
     """FP8 E4M3 codes of FP32 ``x`` times its quantization ``multiplier``."""
     q = tl.clamp(x * multiplier, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    return q.to(tl.float8e4nv)
+    return q.to(tl.float8e4nv, fp_downcast_rounding="rtne")
 
 
 @triton.jit
@@ -652,6 +652,7 @@ _FP8_PER_TOKEN_MAX_M = 64
     "fp8_with_scale",
     name="triton_quantize_fp8_per_token",
     solution="triton",
+    features={"token_fp8_min_scaling"},
     # SM100 and newer, where the per-token FP8 GEMMs that take its output run.
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -694,6 +695,63 @@ def triton_quantize_fp8_per_token(
             f"scale_encoding={scale_encoding!r}"
         )
     return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token_portable",
+    solution="triton",
+    features={"token_fp8_min_scaling"},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PORTABLE + 1,
+)
+def triton_quantize_fp8_per_token_portable(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable per-token E4M3 quantization with a minimum scale, for any row count.
+
+    Args:
+        x: BF16 or FP16 activations; the last dimension is one token.
+        granularity: Must be ``"token"``.
+        group_size: Must be None.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Launch with Programmatic Dependent Launch on Hopper+.
+
+    Returns:
+        FP8 E4M3 codes with the input shape and FP32 scales with a singleton
+        last dimension. The scale
+        floor and independently rounded reciprocal match the shared token
+        quantizer, including zero and tiny rows.
+    """
+    if enable_pdl and not current_platform().is_hopper_plus:
+        raise ValueError("this platform does not support enable_pdl")
+    shape = x.shape
+    rows = x.reshape(-1, shape[-1])
+    if rows.stride(-1) != 1:
+        rows = rows.contiguous()
+    values, scales = triton_quantize_fp8_per_token(
+        rows,
+        granularity=granularity,
+        group_size=group_size,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )
+    return values.reshape(shape), scales.reshape(*shape[:-1], 1)
 
 
 # The widest SwiGLU half (intermediate size) one program holds: a row per
@@ -1515,7 +1573,7 @@ def triton_gated_fp8_quantize(
     "rmsnorm_fp8_group32_ue8m0",
     name="triton_rmsnorm_fp8_group32_ue8m0",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={},
     priority=Priority.PORTABLE,
@@ -1559,6 +1617,82 @@ def triton_rmsnorm_fp8_group32_ue8m0(
             enable_fp_fusion=False,
         )
     return normalized, quantized, scales
+
+
+@triton.jit(do_not_specialize=["X0"])
+def _silu_and_mul_fp8_group32_ue8m0(
+    X,
+    Q,
+    S,
+    X0,
+    I: tl.constexpr,
+    LIMIT: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # silu(gate) * up rounded to BF16 exactly as _silu_and_mul_kernel, then
+    # quantized like _fp8_group32_ue8m0_quantize.
+    row = tl.program_id(0).to(tl.int64)
+    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = column < I
+    gate = tl.load(X + row * X0 + column, mask, 0.0).to(tl.float32)
+    up = tl.load(X + row * X0 + I + column, mask, 0.0).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, LIMIT)
+        up = tl.clamp(up, -LIMIT, LIMIT)
+    values = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
+    groups = tl.reshape(values, (BLOCK // 32, 32))
+    amax = tl.maximum(tl.max(tl.abs(groups), 1), 1.0e-4)
+    bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    inverse_scale = 1.0 / (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.reshape(groups * inverse_scale[:, None], (BLOCK,))
+    tl.store(Q + row * I + column, quantized.to(tl.float8e4nv), mask)
+    group = tl.program_id(1) * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
+    tl.store(S + row * (I // 32) + group, exponent.to(tl.uint8), group < I // 32)
+
+
+@register_kernel(
+    "quantization",
+    "silu_and_mul_fp8_group32_ue8m0",
+    name="triton_silu_and_mul_fp8_group32_ue8m0",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_silu_and_mul_fp8_group32_ue8m0(
+    x: torch.Tensor, limit: float | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return E4M3 codes and UE8M0 group-32 scales of BF16 silu(gate) * up."""
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or x.shape[1] % 64
+        or x.stride(1) != 1
+        or (limit is not None and limit <= 0)
+    ):
+        raise ValueError(
+            "Expected BF16 [M, 2I] gate/up rows with contiguous columns, I % 32 == 0"
+        )
+    m, inner = x.shape[0], x.shape[1] // 2
+    quantized = torch.empty((m, inner), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, inner // 32), dtype=torch.uint8, device=x.device)
+    block = min(1024, triton.next_power_of_2(inner))
+    if m:
+        _silu_and_mul_fp8_group32_ue8m0[(m, triton.cdiv(inner, block))](
+            x,
+            quantized,
+            scales,
+            x.stride(0),
+            inner,
+            0.0 if limit is None else limit,
+            limit is not None,
+            block,
+            num_warps=4,
+        )
+    return quantized, scales
 
 
 @triton.jit

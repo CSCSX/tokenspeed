@@ -382,11 +382,11 @@ class AutoBackend(CommBackend):
         if route is Route.NCCL:
             return self._nccl.all_reduce(tensor, group, op=op)
         # Tiered dispatch -- first match wins. This is Tier 1 (which backend);
-        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by payload bytes)
-        # inside _ar_fusion_workspace.
+        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
+        # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
         #   2. group spans nodes ................... NCCL
-        #   3. Iris can run ........................ Iris
+        #   3. producer-owned memory or Iris can run Iris
         #   4. otherwise ........................... NCCL
         spans_nodes = self._group_spans_nodes(group)
         # trtllm_ar carries an mnnvl workspace that spans nodes; it is only
@@ -398,9 +398,35 @@ class AutoBackend(CommBackend):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
         if spans_nodes:
             return self._nccl.all_reduce(tensor, group, op=op)
+        if self._iris.can_reduce_outputs((tensor,), group, op=op):
+            # The producer wrote into acquired Iris symmetric memory, so the
+            # reduction skips the staging copy.
+            return self._iris.all_reduce((tensor,), group, op=op)[0]
         if self._iris.can_run(tensor, group, op=op):
             return self._iris.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
+
+    def all_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        group: Group,
+    ) -> torch.Tensor | None:
+        """Delegate fused all-reduce and mHC post to Iris when routing permits.
+
+        Return None unless AMD uses a node-local tiered route without trtllm.
+        """
+        # Same eligibility as the producer-direct all-reduce in _all_reduce_one.
+        if (
+            not current_platform().is_amd
+            or self.route(Collective.ALL_REDUCE, tensor, group) is not Route.TIERED
+            or self._trtllm_ar.has_trtllm_ar(group)
+            or self._group_spans_nodes(group)
+        ):
+            return None
+        return self._iris.all_reduce_mhc_post(tensor, residual, post, comb, group)
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
@@ -549,7 +575,6 @@ class AutoBackend(CommBackend):
         Projection collectives have an explicit pre-capture lifetime. Their
         large-message and unsupported-topology paths return to this backend;
         batch-invariant reductions retain the rank-ordered fold at every size.
-        Batch-invariant fusion diagnostics apply only to column projections.
         """
         use_lamport = (
             current_platform().is_nvidia
@@ -579,6 +604,20 @@ class AutoBackend(CommBackend):
             tensor, weight, weight_scales, owner_rows, out, workspace
         )
 
+    def try_fused_dp_row_linear(
+        self,
+        tensor: torch.Tensor,
+        input_scales: torch.Tensor | None,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        return self._projection.try_fused_dp_row_linear(
+            tensor, input_scales, weight, weight_scales, owner_rows, out, workspace
+        )
+
     def projection_all_gather(
         self,
         tensor: torch.Tensor,
@@ -596,9 +635,11 @@ class AutoBackend(CommBackend):
         quantize: bool,
         out: torch.Tensor | None,
         workspace: ProjectionWorkspace,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self._projection.all_to_all(
-            tensor, rows, inverse, quantize, out, workspace
+            tensor, rows, inverse, quantize, out, workspace, input_scales=input_scales
         )
 
     def acquire_projection_output(
