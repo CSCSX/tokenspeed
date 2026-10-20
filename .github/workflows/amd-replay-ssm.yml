@@ -1,0 +1,24 @@
+name: AMD Replay SSM
+
+on:
+  push:
+    branches: [amd_replay_ssm_opt]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amd-replay-ssm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-commit:
+    if: github.ref_name == 'amd_replay_ssm_opt'
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    with:
+      matrix: >-
+        {"include":[{"name":"kda-replay-matrix-amd-gfx950","type":"perf","config":"test/ci/perf/kda-replay-matrix-amd-gfx950.yaml","runner":"amd-mi355-1gpu","priority":"normal","optional":false,"workflow_stage":"kernel-benchmark"}]}
+      install_tokenspeed_mla_from_source: ${{ 'false' }}
+      checkout_ref: ${{ github.sha }}
+      timeout_minutes: 120

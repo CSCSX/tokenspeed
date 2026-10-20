@@ -20,7 +20,10 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.repository == 'lightseekorg/tokenspeed'
+      )
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -85,7 +88,10 @@ jobs:
           retention-days: 1
 
   merge:
-    if: github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.repository == 'lightseekorg/tokenspeed'
+      )
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30

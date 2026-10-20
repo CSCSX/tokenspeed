@@ -41,6 +41,8 @@ env:
 
 jobs:
   metadata:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Resolve release metadata
     runs-on: ubuntu-24.04-32core-x64
     outputs:
@@ -120,6 +122,8 @@ jobs:
           echo "Release tag: ${tag_name}-${ROCM_VARIANT}"
 
   build-wheel:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build ROCm 7.2 x64 wheel for Python ${{ matrix.python.version }}
     needs: metadata
     runs-on: ubuntu-24.04-32core-x64
@@ -254,6 +258,8 @@ jobs:
           path: dist/*.whl
 
   build-sdist:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build source distribution
     needs: metadata
     runs-on: ubuntu-24.04-32core-x64
@@ -294,7 +300,10 @@ jobs:
 
   release:
     name: Create ROCm 7.2 wheelhouse release
-    if: github.event_name == 'schedule' || inputs.publish_github
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.event_name == 'schedule' || inputs.publish_github
+      )
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false

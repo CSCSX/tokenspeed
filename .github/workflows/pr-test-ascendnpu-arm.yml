@@ -38,11 +38,13 @@ concurrency:
 jobs:
   select:
     name: Check Ascend NPU ARM changes
-    if: |
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
       (github.repository == 'lightseekorg/tokenspeed' ||
        github.repository == vars.TOKENSPEED_NPU_CI_REPOSITORY) &&
       github.event.deleted != true &&
       (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -74,10 +76,12 @@ jobs:
   npu:
     name: Ascend NPU ARM operator tests
     needs: select
-    if: |
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
       vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
       needs.select.outputs.should_run == 'true' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      )
     runs-on: tokenspeed-npu-arm64
     env:
       TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}

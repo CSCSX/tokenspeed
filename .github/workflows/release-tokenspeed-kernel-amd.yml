@@ -34,7 +34,10 @@ concurrency:
 jobs:
   cut-release-branch:
     name: Create release branch
-    if: ${{ inputs.create_release_branch }}
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      inputs.create_release_branch
+      )
     runs-on: ubuntu-latest
     outputs:
       branch: ${{ steps.metadata.outputs.branch }}
@@ -196,7 +199,10 @@ jobs:
 
   metadata:
     name: Validate release branch
-    if: ${{ !inputs.create_release_branch }}
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      !inputs.create_release_branch
+      )
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.metadata.outputs.version }}
@@ -282,6 +288,8 @@ jobs:
           esac
 
   build:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build distributions
     needs: metadata
     runs-on: ubuntu-latest
@@ -308,7 +316,10 @@ jobs:
 
   release:
     name: Create wheelhouse release
-    if: ${{ inputs.publish_github }}
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      inputs.publish_github
+      )
     needs: [metadata, build]
     runs-on: ubuntu-latest
     steps:
@@ -400,7 +411,10 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    if: ${{ !cancelled() && inputs.publish_pypi && needs.metadata.result == 'success' && needs.build.result == 'success' && (needs.release.result == 'success' || needs.release.result == 'skipped') }}
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      !cancelled() && inputs.publish_pypi && needs.metadata.result == 'success' && needs.build.result == 'success' && (needs.release.result == 'success' || needs.release.result == 'skipped')
+      )
     needs: [metadata, build, release]
     runs-on: ubuntu-latest
     environment: pypi

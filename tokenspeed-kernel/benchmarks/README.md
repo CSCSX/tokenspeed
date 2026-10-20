@@ -62,8 +62,13 @@ timing for that case.
 
 The MI355 unit-test job discovers the pytest matrix automatically.
 The manual CI task `kda-replay-matrix-amd-gfx950` runs the 69-layer timing command
-and publishes its JSON artifact. Simulator timings are not GPU performance
-measurements.
+and publishes its JSON artifact. On `amd_replay_ssm_opt`, the `AMD Replay SSM`
+workflow invokes only this task on pushes or manual dispatch. Other jobs in the
+branch's workflow definitions skip this branch. K8s Dispatch permits only this
+exact task YAML, and the reusable matrix runner permits only a single entry for
+this task. Other branches retain their existing conditions. Repository automation
+that GitHub loads from the default branch follows that branch's configuration.
+Simulator timings are not GPU performance measurements.
 
 ## Benchmark requests
 

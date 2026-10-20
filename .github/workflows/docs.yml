@@ -26,6 +26,8 @@ concurrency:
 
 jobs:
   build:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -51,7 +53,10 @@ jobs:
           path: docs/.vitepress/dist
 
   deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'lightseekorg/tokenspeed'
+      )
     needs: build
     runs-on: ubuntu-latest
     environment:

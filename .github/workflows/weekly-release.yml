@@ -23,6 +23,8 @@ concurrency:
 
 jobs:
   prepare:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     runs-on: ubuntu-latest
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
@@ -69,6 +71,8 @@ jobs:
     secrets: inherit
 
   amd:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: plan
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -77,6 +81,8 @@ jobs:
     secrets: inherit
 
   kernel:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: amd
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -85,6 +91,8 @@ jobs:
     secrets: inherit
 
   tokenspeed:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: kernel
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -93,6 +101,8 @@ jobs:
     secrets: inherit
 
   index:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: tokenspeed
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -101,6 +111,8 @@ jobs:
     secrets: inherit
 
   docker:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: index
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -109,6 +121,8 @@ jobs:
     secrets: inherit
 
   release:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: docker
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -127,7 +141,10 @@ jobs:
     secrets: inherit
 
   result:
-    if: always()
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      always()
+      )
     needs: [prepare, plan, amd, kernel, tokenspeed, index, docker, release, resume]
     runs-on: ubuntu-latest
     steps:

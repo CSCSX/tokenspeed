@@ -23,10 +23,9 @@ jobs:
   review:
     name: Claude PR Review
     if: >-
-      github.event_name == 'pull_request'
-      && github.repository == 'lightseekorg/tokenspeed'
-      && github.actor != 'dependabot[bot]'
-      && !github.event.pull_request.head.repo.fork
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.event_name == 'pull_request' && github.repository == 'lightseekorg/tokenspeed' && github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork
+      )
     runs-on: org-k8s-runner-cpu
     timeout-minutes: 30
     concurrency:
@@ -297,9 +296,9 @@ jobs:
   respond:
     name: Claude Respond
     if: >-
-      (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment')
-      && contains(github.event.comment.body, '@claude')
-      && github.repository == 'lightseekorg/tokenspeed'
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') && contains(github.event.comment.body, '@claude') && github.repository == 'lightseekorg/tokenspeed'
+      )
     runs-on: org-k8s-runner-cpu
     timeout-minutes: 30
     concurrency:

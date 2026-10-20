@@ -34,7 +34,10 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.repository == 'lightseekorg/tokenspeed'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
@@ -151,7 +154,10 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.repository == 'lightseekorg/tokenspeed' && needs.build.outputs.nightly != 'true'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.repository == 'lightseekorg/tokenspeed' && needs.build.outputs.nightly != 'true'
+      )
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
@@ -170,7 +176,10 @@ jobs:
           packages-dir: dist
 
   publish-nightly:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+      )
     needs: build
     runs-on: ubuntu-latest
     concurrency:
@@ -271,7 +280,10 @@ jobs:
           exit 1
 
   check-nightly-rocm:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+      )
     needs: [build, publish-nightly]
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -327,7 +339,10 @@ jobs:
           fi
 
   publish-nightly-rocm:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+      )
     needs: [build, check-nightly-rocm]
     runs-on: ubuntu-latest
     concurrency:

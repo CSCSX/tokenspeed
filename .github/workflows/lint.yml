@@ -15,6 +15,8 @@ concurrency:
 
 jobs:
   lint:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2

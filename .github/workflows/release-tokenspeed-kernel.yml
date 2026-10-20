@@ -65,6 +65,8 @@ concurrency:
 
 jobs:
   metadata:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Resolve release metadata
     runs-on: ubuntu-24.04-32core-x64
     outputs:
@@ -175,6 +177,8 @@ jobs:
           echo "Release tag: ${tag_name}"
 
   build-wheel:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build ${{ matrix.cuda.variant }} ${{ matrix.arch.name }} wheel for Python ${{ matrix.python.version }}
     needs: metadata
     runs-on: ${{ matrix.arch.runner }}
@@ -316,6 +320,8 @@ jobs:
           path: dist/*.whl
 
   build-sdist:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build source distribution
     needs: metadata
     runs-on: ubuntu-24.04-32core-x64
@@ -349,7 +355,10 @@ jobs:
 
   release:
     name: Create wheelhouse release
-    if: github.event_name == 'schedule' || inputs.publish_github
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.event_name == 'schedule' || inputs.publish_github
+      )
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false
@@ -508,7 +517,10 @@ jobs:
 
   publish-pypi:
     name: Publish ${{ inputs.pypi_cuda_variant }} to PyPI
-    if: inputs.publish_pypi
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      inputs.publish_pypi
+      )
     needs: [metadata, build-wheel, build-sdist]
     runs-on: ubuntu-24.04-32core-x64
     environment: pypi

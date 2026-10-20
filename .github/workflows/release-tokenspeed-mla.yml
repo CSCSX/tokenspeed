@@ -12,6 +12,8 @@ concurrency:
 
 jobs:
   build:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build universal wheel
     runs-on: ubuntu-latest
     steps:
@@ -88,6 +90,8 @@ jobs:
           if-no-files-found: error
 
   publish-pypi:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest

@@ -118,6 +118,8 @@ concurrency:
 
 jobs:
   dispatch:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     runs-on: ${{ inputs.cluster == 'gb300' && 'slurm-dispatch-gb300' || 'slurm-dispatch' }}
     timeout-minutes: 720
     permissions:

@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   version:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Bump MLA version
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
@@ -26,6 +28,8 @@ jobs:
     secrets: inherit
 
   publish:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Publish MLA
     needs: version
     uses: ./.github/workflows/weekly-release-stage.yml
@@ -35,6 +39,8 @@ jobs:
     secrets: inherit
 
   dependency:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Update kernel dependency
     needs: publish
     uses: ./.github/workflows/weekly-release-stage.yml

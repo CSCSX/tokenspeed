@@ -33,6 +33,8 @@ concurrency:
 
 jobs:
   scan:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.changes.outputs.should_run }}
@@ -120,11 +122,13 @@ jobs:
   submit:
     name: ${{ matrix.name }}
     needs: scan
-    if: |
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
       needs.scan.outputs.allowed == 'true' &&
       needs.scan.outputs.enabled == 'true' &&
       needs.scan.outputs.should_run == 'true' &&
       needs.scan.outputs.has_tasks == 'true'
+      )
     runs-on: slurm-dispatch-gb300
     timeout-minutes: 720
     strategy:

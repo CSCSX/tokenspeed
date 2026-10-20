@@ -24,6 +24,8 @@ concurrency:
 
 jobs:
   metadata:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Resolve nightly version
     runs-on: ubuntu-latest
     outputs:
@@ -57,6 +59,8 @@ jobs:
           echo "tag_name=tokenspeed-kernel-amd-nightly-v${version}" >> "$GITHUB_OUTPUT"
 
   build:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Build AMD nightly distributions
     needs: metadata
     runs-on: ubuntu-latest
@@ -101,7 +105,10 @@ jobs:
 
   release:
     name: Publish AMD nightly release and pip index
-    if: (github.event_name == 'schedule' || inputs.publish_github) && github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      (github.event_name == 'schedule' || inputs.publish_github) && github.repository == 'lightseekorg/tokenspeed'
+      )
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false

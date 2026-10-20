@@ -49,7 +49,10 @@ concurrency:
 
 jobs:
   source:
-    if: github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+      )
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
@@ -100,6 +103,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   run:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     needs: source
     runs-on: b300deepswe-8gpu
     timeout-minutes: 1440

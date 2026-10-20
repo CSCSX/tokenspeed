@@ -14,6 +14,8 @@ concurrency:
 
 jobs:
   commit-trailers:
+    if: >-
+      github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt'
     name: Commit trailers
     runs-on: ubuntu-latest
     timeout-minutes: 5

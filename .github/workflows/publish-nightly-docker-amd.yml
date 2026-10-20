@@ -20,7 +20,10 @@ env:
 
 jobs:
   build-and-push:
-    if: github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') && (
+      github.repository == 'lightseekorg/tokenspeed'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
