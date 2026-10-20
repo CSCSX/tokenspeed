@@ -215,13 +215,22 @@ def test_bf16_rounding_intervals_include_both_signs_and_binade_edges():
     torch.testing.assert_close(high, expected_high, atol=0, rtol=0)
 
 
-def test_gate_reference_allows_boundary_straddles_but_rejects_wrong_values():
+def test_gate_reference_allows_midpoint_rounding_but_rejects_wrong_values():
     projected = torch.tensor([1.0, -1.0], dtype=torch.bfloat16)
-    gemm = torch.tensor([1 + 2**-7, -1 - 2**-7], dtype=torch.bfloat16)
     exact = torch.tensor([1 + 2**-8, -1 - 2**-8], dtype=torch.float64)
     error = torch.full_like(exact, 2**-24)
-    _check_gate_rounding(projected, exact, error, gemm)
+    _check_gate_rounding(projected, exact, error)
     with pytest.raises(AssertionError, match="rounding interval"):
-        _check_gate_rounding(projected + 0.25, exact, error, gemm)
-    with pytest.raises(AssertionError, match="rounding boundary"):
-        _check_gate_rounding(projected, projected.double(), error, gemm)
+        _check_gate_rounding(projected + 0.25, exact, error)
+
+
+def test_gate_reference_accepts_valid_fp32_cancellation_orders():
+    # The FP32 accumulation error can span many BF16 ULPs near zero.
+    terms = torch.tensor([1.0, 2**-26, -1.0], dtype=torch.float32)
+    left = (terms[0] + terms[1]) + terms[2]
+    cancelled = (terms[0] + terms[2]) + terms[1]
+    alternatives = torch.stack((left, cancelled)).to(torch.bfloat16)
+    exact = torch.full((2,), 2**-26, dtype=torch.float64)
+    gamma = 128 * 2**-24 / (1 - 128 * 2**-24)
+    error = torch.full_like(exact, gamma * (2 + 2**-26))
+    _check_gate_rounding(alternatives, exact, error)

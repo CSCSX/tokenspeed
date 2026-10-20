@@ -86,7 +86,7 @@ def _bf16_neighbors(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def _check_gate_rounding(projected, exact, error, gemm):
+def _check_gate_rounding(projected, exact, error):
     if not bool((projected.abs() < torch.finfo(torch.bfloat16).max).all()):
         raise AssertionError("Gate reference must have finite BF16 neighbors")
     lower, upper = _bf16_neighbors(projected)
@@ -94,12 +94,6 @@ def _check_gate_rounding(projected, exact, error, gemm):
     high = (upper.double() + projected.double()) * 0.5
     if not bool(((low - error <= exact) & (exact <= high + error)).all()):
         raise AssertionError("Gate reference is outside its BF16 rounding interval")
-    different = projected != gemm
-    adjacent = (lower == gemm) | (upper == gemm)
-    midpoint = (projected.double() + gemm.double()) * 0.5
-    straddles = (exact - midpoint).abs() <= error
-    if not bool((~different | (adjacent & straddles)).all()):
-        raise AssertionError("Gate producers differ away from a BF16 rounding boundary")
 
 
 def check_original_gate_projection(projected, f_a, f_b):
@@ -107,10 +101,11 @@ def check_original_gate_projection(projected, f_a, f_b):
     activation, weight = f_a.double(), f_b.double()
     exact = torch.mm(activation, weight.t())
     # BF16 products are exact in FP32; bound the sum's accumulated rounding.
+    # FP64 reference error is negligible within this FP32 accumulation bound.
     unit_roundoff = 2**-24
     gamma = 128 * unit_roundoff / (1 - 128 * unit_roundoff)
     error = gamma * torch.mm(activation.abs(), weight.abs().t())
-    _check_gate_rounding(projected, exact, error, torch.mm(f_a, f_b.t()))
+    _check_gate_rounding(projected, exact, error)
 
 
 @cache
