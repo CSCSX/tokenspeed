@@ -21,9 +21,9 @@
 """Both grammar runtimes write the masks of a position-by-position walk.
 
 Real xgrammar matchers on a small vocabulary. The reference walks the draft
-chain position by position; the C++ fill, which calls the matchers without
-the GIL, fills it with one matcher call and resets only the rows it wrote
-before. It runs as the CUDA host node or, without one, before the forward.
+chain position by position; the C++ fill, which calls the matchers through
+tvm-ffi's C ABI, fills it with one matcher call and resets only the rows it
+wrote before. It runs as the CUDA host node or, without one, before the forward.
 Both must give the reference's bits on every bound row, over steps whose
 batches change.
 """
@@ -193,7 +193,7 @@ def _fill(runtime, grammars, layout, *, drafts=None):
     )
 
 
-def _setup(runtime, grammars, layout, *, drafts=None):
+def _setup(runtime, grammars, layout, *, drafts=None, advance_mask=None):
     """The eager runtime's setup of one forward: the sampling info it binds
     and the step's completion."""
     # The forward's input: prefill tokens, then the decode rows' drafts.
@@ -208,7 +208,9 @@ def _setup(runtime, grammars, layout, *, drafts=None):
         sampling_info=info,
         bs=len(grammars),
         is_spec_decode=drafts is not None,
-        grammar_inputs=GrammarStepInputs(grammars) if any(grammars) else None,
+        grammar_inputs=(
+            GrammarStepInputs(grammars, advance_mask) if any(grammars) else None
+        ),
         grammar_runtime=runtime,
         input_ids_buf=input_ids,
         grammar_backend="xgrammar",
@@ -293,12 +295,35 @@ def test_one_runtime_serves_verify_plain_and_grammar_free_steps(compiled, kind):
         assert (_fill(runtime, none[:2], plain_layout) == -1).all()
 
 
-def test_without_a_host_node_post_process_advances_at_once(compiled):
-    runtime = _runtime("eager", max_bs=1, tokens_per_req=1)
-    grammar = _grammar(compiled, ())
-    _, completion = _setup(runtime, [grammar], ForwardOutputLayout(0, 0, 1, 1))
+def test_without_a_host_node_post_process_advances_at_once():
+    compiled = xgr.GrammarCompiler(
+        xgr.TokenizerInfo(VOCAB, stop_token_ids=[EOS])
+    ).compile_grammar('root ::= "a" "b" "c" "}"')
+    runtime = _runtime("eager", max_bs=7, tokens_per_req=3)
+    # Three completing prefills (the second one's token is not to advance), an
+    # incomplete one without a grammar and three width-3 decodes.
+    layout = ForwardOutputLayout(4, 3, 3, 3)
+    accepted = ([], [], [A], None, [A], [A], [A, B, C])
+    grammars = [None if a is None else _grammar(compiled, a) for a in accepted]
+    _, completion = _setup(
+        runtime,
+        grammars,
+        layout,
+        drafts=torch.zeros((7, 3), dtype=torch.int32),
+        advance_mask=[True, False, True, True, True, True, True],
+    )
     assert completion.host_node_wait == 0
     assert not completion.wait(completion.host_node_wait)
-    completion.advance_on_host([A], [1])
-    assert completion.terminated_at() == [-1]
-    assert torch.equal(_next_masks([grammar]), _next_masks([_grammar(compiled, (A,))]))
+    # Reading another request's tokens, or reading on past a rejected token,
+    # changes what a matcher accepts.
+    completion.advance_on_host(
+        [A, A, B, B, C, BRACE, C, B, C, BRACE, EOS, A], [1, 1, 1, 0, 2, 3, 3]
+    )
+    # The last decode ends at its second token and leaves the third.
+    assert completion.terminated_at() == [-1, -1, -1, -1, -1, -1, 1]
+    assert grammars[6].is_terminated()
+    for grammar, now in zip(grammars, ([A], [], [A, B], None, [A, B, C], [A])):
+        if grammar is not None:
+            assert torch.equal(
+                _next_masks([grammar]), _next_masks([_grammar(compiled, now)])
+            )
