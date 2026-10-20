@@ -73,6 +73,12 @@ _MUSE_BOUNDARY_WIDTH = 8192
 _MUSE_BOUNDARY_SENDERS = 8
 # From this many rows, staggering each sender's peer order spreads link load.
 _MUSE_BOUNDARY_ROTATE_MIN_ROWS = 5
+# The fused routed Lamport reduction runs up to the one-shot mailbox capacity
+# (43 rows). With TP8's Lamport two-shot, the separate routed norm plus that
+# generic reduction is as fast at 32 rows and faster above (8-rank graph replay,
+# bitwise-identical results: 10.59 vs 10.60 us at 32, 11.19 vs 10.96 at 34,
+# 12.78 vs 11.45 at 43), so the fused path stops there.
+_MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS = 32
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
@@ -132,6 +138,11 @@ class MuseIrisState:
             all_reduce.producer_pull, enable_lamport=enable_lamport
         )
         self.gather = IrisAllGather(all_reduce.producer)
+        self.routed_lamport_max_rows = (
+            _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS
+            if self.reduction.lamport_two_shot_max_numel
+            else self.reduction.lamport_max_numel // 4096
+        )
         peers = all_reduce.peers
         capacity = all_reduce.producer_direct_max_numel
         self.broadcast = IrisBroadcast(peers, capacity) if enable_lamport else None
@@ -788,7 +799,7 @@ class MuseIrisState:
             and (
                 num_tokens <= 16
                 or (
-                    num_tokens <= 43
+                    num_tokens <= self.routed_lamport_max_rows
                     and topk == 8
                     and width == 4096
                     and weight_offset == 1.0
