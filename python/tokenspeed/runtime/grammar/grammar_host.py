@@ -278,7 +278,8 @@ class Batch {
         if (static_cast<int64_t>(accept_lengths.size()) < bs()) {
             throw py::value_error("accept_lengths is shorter than the batch");
         }
-        if (TryAdvance(tokens.data(), static_cast<int64_t>(tokens.size()), accept_lengths.data())) {
+        if (TryAdvance(tokens.data(), static_cast<int64_t>(tokens.size()), accept_lengths.data()) ||
+            Done()) {
             return;
         }
         py::gil_scoped_release release;
@@ -419,8 +420,10 @@ class Host {
             num_extends, num_prefill_outputs, num_decodes, decode_width);
         std::vector<std::shared_ptr<Batch>> retired;
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.push_back(batch);
         retired.swap(retired_);
+        // Room for every batch the queued executions retire, so retiring never allocates.
+        retired_.reserve(queue_.size() + 1);
+        queue_.push_back(batch);
         return batch;
     }
 
@@ -479,13 +482,22 @@ class Host {
             queue_.pop_front();
             previous = std::exchange(current_, batch);
         }
-        if (previous != nullptr) {
-            previous->Advance(output_tokens_, rows_, accept_lengths_);
+        try {
+            if (previous != nullptr) {
+                previous->Advance(output_tokens_, rows_, accept_lengths_);
+            }
+            Fill(*batch);
+        } catch (...) {
+            Retire(std::move(previous));
+            throw;
         }
-        Fill(*batch);
-        // It may hold a matcher's last reference: the next add releases it, on a Python thread.
+        Retire(std::move(previous));
+    }
+
+    // It may hold a matcher's last reference: the next add releases it, on a Python thread.
+    void Retire(std::shared_ptr<Batch> batch) {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        retired_.push_back(std::move(previous));
+        retired_.push_back(std::move(batch));
     }
 
     bool FillRow(const Matcher& matcher, int64_t row) {
