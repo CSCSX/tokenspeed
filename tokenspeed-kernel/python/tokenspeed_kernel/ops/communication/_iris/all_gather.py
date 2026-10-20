@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_heap_base,
     _iris_peer_pointers,
     _iris_rendezvous,
+    _iris_subgroup_any,
     _iris_sync_peers,
     _iris_sync_rank_epoch,
 )
@@ -596,20 +597,17 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     # Every lane's address lies in this row's shard; only own columns use it.
     own = _iris_lamport_payload_bf16(gl.load(local_words + shard_words))
     mailbox = tl.cast(region, gl.pointer_type(gl.uint32))
-    # Issue all packs' system-scope reads before checking any; reload only
-    # packs that still hold the marker. Payload halves are never negative
-    # zero, so an unwritten word is one whose high half is.
+    # Issue all packs' system-scope reads before checking any. Arrived packs
+    # stay unchanged until this rank clears them, so retries reread them all.
+    # Payload halves are never negative zero, so an unwritten word is one
+    # whose high half is.
     incoming = gl.amd.cdna4.buffer_load(
         mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
     )
     missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
-    while gl.max(gl.max(missing.to(gl.int32), 1), 0) != 0:
+    while _iris_subgroup_any(gl.max(missing.to(gl.int32), 0)):
         incoming = gl.amd.cdna4.buffer_load(
-            mailbox,
-            mailbox_offsets,
-            mask=missing[:, :, None],
-            other=incoming,
-            cache=".cv",
+            mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
         )
         missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
     gl.amd.cdna4.buffer_store(
