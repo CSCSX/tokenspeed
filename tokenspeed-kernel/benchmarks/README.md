@@ -14,6 +14,57 @@ Each operation family and mode owns one generator under
 generators, and `set_benchmark_generator` registers additional ones.
 Every generator reuses the same harness, timer, and validators.
 
+## AMD KDA verify and commit matrix
+
+`test/amd/ops/attention/test_gluon_kda_replay_matrix.py` adds a focused BF16
+matrix for gfx950 and gfx1250. It reuses the existing replay input/record
+helpers and the graph timer. Concurrency is the number of requests in one
+kernel batch. The pytest matrix covers concurrency 1, 2, 4, 8, 16,
+32, 64 and 128, with T=1 and T=4 (MTP3), all integer accepted lengths from
+zero through T, and mixed lengths within a batch. Both distinct-page and
+in-place commit run eagerly and through graph replay.
+
+Correctness checks compare verify outputs, FP32 U, K/raw-g records and
+accepted state with an independent torch recurrence over the existing
+BF16 convolution producer's outputs. They also check record stamps, exact
+convolution history, verify's read-only checkpoint, and untouched pool pages.
+The unit tests use three independent layers and cache groups; the timing
+command checks every requested layer before measuring.
+
+Run the matrix from the repository root in a prepared AMD kernel environment:
+
+```bash
+export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
+python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
+  --concurrency 1 2 4 8 16 32 64 128 \
+  --window-lengths 1 4 \
+  --layers 69 \
+  --page-relation distinct \
+  --cache cold \
+  --measurement-blocks 30 \
+  --output /tmp/kda-replay-matrix.json
+```
+
+The command validates each case eagerly and with graph replay before reporting
+its timing. Verify measures one fused convolution/recurrence kernel, with the
+gate projection already prepared. Commit measures all requested layers,
+including convolution-history updates, and excludes verify. Verify does not
+consume accepted lengths, so its measurement is reused across the acceptance
+rows for each concurrency/window pair. These scopes differ from the existing
+`kda_fused_paged_verify` suite, which includes producer work.
+
+Use `--page-relation in-place` to measure aliasing; the timer restores the
+checkpoint outside the timed interval. `--cache hot` selects hot-cache timing.
+JSON includes all samples, median/p90, accepted counts, layer count, device,
+revision and dirty-worktree status. Keep these settings identical when comparing
+revisions. A failed correctness check stops the command without publishing a
+timing for that case.
+
+The MI355 unit-test job discovers the pytest matrix automatically.
+The manual CI task `kda-replay-matrix-amd-gfx950` runs the 69-layer timing command
+and publishes its JSON artifact. Simulator timings are not GPU performance
+measurements.
+
 ## Benchmark requests
 
 Each request identifies an operation family and mode, supplies parameters for
