@@ -94,8 +94,8 @@ def _inputs(window, device, *, batch):
 @pytest.mark.parametrize(
     ("arch", "window", "batch"),
     [(arch, window, 3) for arch in ("gfx950", "gfx1250") for window in (1, 4, 8)]
-    # Exercise the launcher GEMM fallback above 64 total input rows.
-    + [("gfx950", 4, 17)],
+    # Cover unsplit T1 prefetch and the GEMM producer above 64 input rows.
+    + [("gfx950", 1, 17), ("gfx950", 4, 17)],
 )
 def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window, batch):
     module = importlib.import_module(

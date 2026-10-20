@@ -1148,7 +1148,8 @@ retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
 inside verify for up to 64 total input rows and uses a separate GEMM above that.
 MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
 A supplied raw gate is used directly. GFX1250 retains the separate gate producer.
-Both save the gate used by verify.
+Both save the gate used by verify. For one-token windows without value splits,
+GFX950 keeps four checkpoint panels in flight after it prepares the token vectors.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against

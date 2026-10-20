@@ -637,8 +637,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
     panel_value_offsets = gl.arange(0, 16, layout=value_layout)
 
-    # Keep PIPELINE_DEPTH state panels in flight to balance latency and VGPR use.
-    # static_range permits the unrolled tuple window to change length.
+    # Start the first state load before preparing the token vectors.
     off_pipe = ()
     raw_pipe = ()
     if VALUE_SPLITS == 1:
@@ -808,6 +807,20 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     # Assign each panel to one value split. With one split, the same equation
     # owns every panel and the pipeline window carries loads between iterations.
     panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
+    pipeline_depth: gl.constexpr = (
+        4 if VALUE_SPLITS == 1 and TOKENS_PER_SEQUENCE == 1 else 1
+    )
+    # Issue more state loads after gate preparation releases the weight registers.
+    if VALUE_SPLITS == 1:
+        for prefetch_idx in gl.static_range(1, pipeline_depth):
+            prefetch_offsets = (
+                panel_value_offsets[:, None] + prefetch_idx * 16
+            ) * D + key_offsets[None, :]
+            prefetch_raw = gl.load(state_pool + read_base + prefetch_offsets).to(
+                gl.float32
+            )
+            off_pipe = off_pipe + (prefetch_offsets,)
+            raw_pipe = raw_pipe + (prefetch_raw,)
     for panel_idx in gl.static_range(8):
         if value_split_idx == panel_idx // panels_per_split:
             if VALUE_SPLITS == 1:
@@ -856,7 +869,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
                 )
 
             if VALUE_SPLITS == 1:
-                next_idx = panel_idx + 1
+                next_idx = panel_idx + pipeline_depth
                 if next_idx < 8:
                     next_offsets = (
                         panel_value_offsets[:, None] + next_idx * 16
