@@ -1144,7 +1144,9 @@ the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
 reads for conv history.
 A null destination leaves retention to the caller. Padding pages do not write
-retained rows.
+retained rows. GFX950 also projects the raw gate inside verify when the caller
+supplies its low-rank activation and weight instead of a projected gate.
+GFX1250 retains the separate gate producer. Both save the gate used by verify.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against

@@ -859,9 +859,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
             else:
                 if bias is not None:
                     raise ValueError("fused KDA convolution does not support a bias")
-                split_producers = {
-                    "g_raw": self._kda_gate(g_raw, f_a_out, f_b_weight)[:rows]
-                }
+                # The registered kernel owns an absent gate's projection.
+                split_producers = {"g_raw": None if g_raw is None else g_raw[:rows]}
             # Records hold FP32 corrections and activation-dtype K/raw gates.
             # Request rows, not pool block IDs, size the per-round cache.
             assert self._replay_record_metadata is not None

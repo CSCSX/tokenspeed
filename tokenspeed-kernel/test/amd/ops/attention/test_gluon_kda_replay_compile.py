@@ -116,30 +116,48 @@ def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window):
     retained = torch.empty_strided(
         x["qkv_raw"].shape, (width + 7, 1), dtype=x["qkv_raw"].dtype
     )
-    for original_qkv in (None, retained):
-        output = getattr(module, f"gluon_kda_fused_verify_{arch}")(
-            mixed_qkv=x["qkv_raw"],
-            original_qkv=original_qkv,
-            conv_weights=x["conv_w"],
-            conv_pool=x["conv_pool"],
-            raw_g=torch.empty(batch * window, heads * dim, dtype=torch.bfloat16),
-            beta_logits=x["beta"],
-            A_log=x["A_log"],
-            dt_bias=x["dt_bias"],
-            state_pool=x["h_pool"],
-            read_indices=x["read_indices"],
-            correction=correction.transpose(1, 2),
-            key_gate=key_gate.transpose(1, 2),
-            record_metadata=metadata,
-            record_stamps=stamps[0],
-            query_start_loc=torch.arange(batch + 1, dtype=torch.int32) * window,
-            num_heads=heads,
-            head_dim=dim,
-            draft_token_num=window,
-            lower_bound=-5.0,
-        )
-        assert output.shape == (1, batch * window, heads, dim)
-        assert output.dtype == x["qkv_raw"].dtype
+    for inline in ((False, True) if arch == "gfx950" else (False,)):
+        projection = {}
+        if arch == "gfx950":
+            projection = {
+                "f_a_out": (
+                    torch.empty_strided(
+                        x["f_a"].shape, (dim + 7, 1), dtype=x["f_a"].dtype
+                    )
+                    if inline
+                    else None
+                ),
+                "f_b_weight": x["w_fb"] if inline else None,
+            }
+        for original_qkv in (None, retained):
+            output = getattr(module, f"gluon_kda_fused_verify_{arch}")(
+                mixed_qkv=x["qkv_raw"],
+                original_qkv=original_qkv,
+                conv_weights=x["conv_w"],
+                conv_pool=x["conv_pool"],
+                raw_g=(
+                    None
+                    if inline
+                    else torch.empty(batch * window, heads * dim, dtype=torch.bfloat16)
+                ),
+                **projection,
+                beta_logits=x["beta"],
+                A_log=x["A_log"],
+                dt_bias=x["dt_bias"],
+                state_pool=x["h_pool"],
+                read_indices=x["read_indices"],
+                correction=correction.transpose(1, 2),
+                key_gate=key_gate.transpose(1, 2),
+                record_metadata=metadata,
+                record_stamps=stamps[0],
+                query_start_loc=torch.arange(batch + 1, dtype=torch.int32) * window,
+                num_heads=heads,
+                head_dim=dim,
+                draft_token_num=window,
+                lower_bound=-5.0,
+            )
+            assert output.shape == (1, batch * window, heads, dim)
+            assert output.dtype == x["qkv_raw"].dtype
     getattr(module, f"launch_gluon_kda_fused_replay_{arch}")(
         torch.empty(layers, 10, dtype=torch.uint64),
         torch.zeros(layers, dtype=torch.int32),
@@ -161,6 +179,43 @@ def test_kda_records_wrapper_launches_compile(monkeypatch, arch, window):
         record_stamps=stamps,
         lower_bound=-5.0,
     )
+
+
+@pytest.mark.parametrize("both", [False, True])
+def test_gate_launcher_requires_one_producer(both):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_verify_gfx950,
+    )
+
+    x = _inputs(1, "cpu")
+    batch, heads, dim = 3, 12, 128
+    message = "excludes projection inputs" if both else "requires either a raw gate"
+    with pytest.raises(ValueError, match=message):
+        gluon_kda_fused_verify_gfx950(
+            mixed_qkv=x["qkv_raw"],
+            original_qkv=None,
+            conv_weights=x["conv_w"],
+            conv_pool=x["conv_pool"],
+            raw_g=(
+                torch.empty(batch, heads * dim, dtype=torch.bfloat16) if both else None
+            ),
+            f_a_out=x["f_a"] if both else None,
+            f_b_weight=x["w_fb"] if both else None,
+            beta_logits=x["beta"],
+            A_log=x["A_log"],
+            dt_bias=x["dt_bias"],
+            state_pool=x["h_pool"],
+            read_indices=x["read_indices"],
+            correction=torch.empty(batch, heads, 1, dim),
+            key_gate=torch.empty(batch, heads, 1, 2 * dim, dtype=torch.bfloat16),
+            record_metadata=torch.zeros(batch, 3, dtype=torch.int64),
+            record_stamps=torch.zeros(batch, 1, 2, dtype=torch.int64),
+            query_start_loc=torch.arange(batch + 1, dtype=torch.int32),
+            num_heads=heads,
+            head_dim=dim,
+            draft_token_num=1,
+            lower_bound=-5.0,
+        )
 
 
 @pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])

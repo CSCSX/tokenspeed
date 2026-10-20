@@ -1322,6 +1322,8 @@ def gluon_kda_fused_verify_gfx1250(
         num_heads,
         head_dim,
         draft_token_num,
+        f_a_out=None,
+        f_b_weight=None,
     )
     batch = read_indices.numel()
     output = torch.empty(

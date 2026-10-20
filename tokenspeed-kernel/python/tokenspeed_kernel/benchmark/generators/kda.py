@@ -995,8 +995,10 @@ def prepare_kda_fused_paged_verify(
         producers = {}
         if records:
             producers = {
-                "g_raw": torch.nn.functional.linear(
-                    projection.f_a_out, weights.f_b_weight
+                "g_raw": (
+                    torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
+                    if split_producers
+                    else None
                 ),
                 "conv_qkv": (
                     kda_ops.kda_verify_conv_update(
@@ -1139,6 +1141,13 @@ def prepare_kda_replay_commit(
             query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
             * draft_token_num,
         )
+        split_producers = kda_ops.kda_fused_paged_verify_uses_split_producers(
+            dtype,
+            store_states=False,
+            recurrent_layout=common["recurrent_layout"],
+            num_heads=profile.heads,
+            head_dim=profile.head_dim,
+        )
         output = kda_ops.try_kda_fused_paged_verify(
             projection.mixed_qkv,
             weights.conv_weights,
@@ -1160,7 +1169,11 @@ def prepare_kda_replay_commit(
             recurrent_layout=common["recurrent_layout"],
             store_states=False,
             replay_records=record_payload,
-            g_raw=torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight),
+            g_raw=(
+                torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
+                if split_producers
+                else None
+            ),
             conv_qkv=(
                 kda_ops.kda_verify_conv_update(
                     projection.mixed_qkv,
@@ -1173,13 +1186,7 @@ def prepare_kda_replay_commit(
                     recurrent_layout=common["recurrent_layout"],
                     bias=None,
                 )
-                if kda_ops.kda_fused_paged_verify_uses_split_producers(
-                    dtype,
-                    store_states=False,
-                    recurrent_layout=common["recurrent_layout"],
-                    num_heads=profile.heads,
-                    head_dim=profile.head_dim,
-                )
+                if split_producers
                 else None
             ),
         )

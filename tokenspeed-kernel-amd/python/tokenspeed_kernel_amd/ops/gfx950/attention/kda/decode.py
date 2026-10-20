@@ -495,6 +495,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
         "ORIGINAL_QKV_ROW_STRIDE",
         "CONV_POOL_PAGE_STRIDE",
         "GATE_ROW_STRIDE",
+        "F_A_ROW_STRIDE",
         "BETA_ROW_STRIDE",
         "STATE_POOL_PAGE_STRIDE",
         "NUM_POOL_SLOTS",
@@ -516,6 +517,8 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     conv_weights: tl.const,
     conv_pool: tl.const,
     raw_g: tl.const,
+    f_a_out: tl.const,
+    f_b_weight: tl.const,
     beta_logits: tl.const,
     state_pool: tl.const,
     read_indices: tl.const,
@@ -538,6 +541,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     dt_bias: tl.const,
     H: gl.constexpr,
     D: gl.constexpr,
+    F_A: gl.constexpr,
     TOKENS_PER_SEQUENCE: gl.constexpr,
     VALUE_SPLITS: gl.constexpr,
     MIXED_ROW_STRIDE,
@@ -548,6 +552,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     CONV_POOL_CHANNEL_STRIDE: gl.constexpr,
     CONV_POOL_HISTORY_STRIDE: gl.constexpr,
     GATE_ROW_STRIDE,
+    F_A_ROW_STRIDE,
     BETA_ROW_STRIDE,
     CAPACITY: gl.constexpr,
     STATE_POOL_PAGE_STRIDE,
@@ -577,6 +582,21 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     shared_vectors = gl.allocate_shared_memory(
         gl.float32, [TOKENS_PER_SEQUENCE, 4 * D], shared_layout
     )
+    if raw_g is None:
+        projection_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 8], [16, 4], [4, 1], [1, 0]
+        )
+        gate_rows = gl.arange(0, D, layout=gl.SliceLayout(1, projection_layout))
+        f_a_offsets = gl.arange(0, F_A, layout=gl.SliceLayout(0, projection_layout))
+        f_b_tile = gl.load(
+            f_b_weight
+            + (head_idx * D + gate_rows)[:, None] * F_A
+            + f_a_offsets[None, :]
+        )
+        gate_bias = gl.load(dt_bias + head_idx * D + gate_rows).to(gl.float32)
+        projected_decay = gl.allocate_shared_memory(
+            gl.float32, [TOKENS_PER_SEQUENCE, D], shared_layout
+        )
     token_base = gl.load(query_start_loc + sequence_idx * query_stride).to(gl.int64)
     token_count = (
         gl.load(query_start_loc + (sequence_idx + 1) * query_stride).to(gl.int64)
@@ -685,11 +705,25 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         # Verify and recovery must normalize the same activation-dtype K.
         qkv_value = qkv_value.to(mixed_qkv.dtype.element_ty).to(gl.float32)
 
-        raw_gate_value = gl.load(
-            raw_g + token_idx * GATE_ROW_STRIDE + decay_channel,
-            mask=token_offset < token_count,
-            other=0.0,
-        ).to(gl.float32)
+        if raw_g is None:
+            f_a_value = gl.load(
+                f_a_out + token_idx * F_A_ROW_STRIDE + f_a_offsets,
+                mask=token_offset < token_count,
+                other=0.0,
+            )
+            projected_gate = (
+                gl.sum(
+                    f_b_tile.to(gl.float32) * f_a_value.to(gl.float32)[None, :], axis=1
+                )
+                .to(mixed_qkv.dtype.element_ty)
+                .to(gl.float32)
+            )
+        else:
+            raw_gate_value = gl.load(
+                raw_g + token_idx * GATE_ROW_STRIDE + decay_channel,
+                mask=token_offset < token_count,
+                other=0.0,
+            ).to(gl.float32)
         position = start + token_offset
         ring = position % CAPACITY
         record_base = (
@@ -701,20 +735,38 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         )
         owner = (value_split_idx == 0) & (token_offset < token_count)
         gl.store(record_base, qkv_value, mask=owner & (slot_id == 1))
-        gl.store(record_base + D, raw_gate_value, mask=owner & is_decay)
+        if raw_g is None:
+            projected_record = (
+                key_gate
+                + slot * kg_slot_stride
+                + head_idx * kg_head_stride
+                + ring * kg_pos_stride
+                + D
+                + gate_rows
+            )
+            gl.store(projected_record, projected_gate, mask=owner)
+        else:
+            gl.store(record_base + D, raw_gate_value, mask=owner & is_decay)
         if head_idx == 0 and value_split_idx == 0:
             stamp = stamps + (slot * CAPACITY + ring) * 2
             gl.store(stamp, position, mask=token_offset < token_count)
             gl.store(stamp + 1, generation, mask=token_offset < token_count)
-        decay_value = _kda_decay(
-            raw_gate_value,
-            gl.load(dt_bias + decay_channel).to(gl.float32),
-            a_value,
-            HAS_LOWER_BOUND,
-            LOWER_BOUND,
-        )
-        combined = gl.where(is_decay, decay_value, qkv_value)
-        shared_vectors.index(token_offset).store(combined)
+        if raw_g is None:
+            decay_value = _kda_decay(
+                projected_gate, gate_bias, a_value, HAS_LOWER_BOUND, LOWER_BOUND
+            )
+            projected_decay.index(token_offset).store(decay_value)
+            shared_vectors.index(token_offset).store(qkv_value)
+        else:
+            decay_value = _kda_decay(
+                raw_gate_value,
+                gl.load(dt_bias + decay_channel).to(gl.float32),
+                a_value,
+                HAS_LOWER_BOUND,
+                LOWER_BOUND,
+            )
+            combined = gl.where(is_decay, decay_value, qkv_value)
+            shared_vectors.index(token_offset).store(combined)
 
         qkv_history0 = qkv_history1
         qkv_history1 = qkv_history2
@@ -733,7 +785,10 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         k_value = vectors.slice(D, D, dim=0).load(key_layout)
         q_value *= gl.rsqrt(gl.sum(q_value * q_value, axis=0) + 1e-6) * (D**-0.5)
         k_value *= gl.rsqrt(gl.sum(k_value * k_value, axis=0) + 1e-6)
-        decay = vectors.slice(3 * D, D, dim=0).load(key_layout)
+        if raw_g is None:
+            decay = projected_decay.index(token_offset).load(key_layout)
+        else:
+            decay = vectors.slice(3 * D, D, dim=0).load(key_layout)
         beta_value = gl.load(
             beta_logits + token_idx * BETA_ROW_STRIDE + head_idx,
             mask=token_offset < token_count,
@@ -1319,7 +1374,9 @@ def gluon_kda_fused_verify_gfx950(
     original_qkv: torch.Tensor | None,
     conv_weights: torch.Tensor,
     conv_pool: torch.Tensor,
-    raw_g: torch.Tensor,
+    raw_g: torch.Tensor | None,
+    f_a_out: torch.Tensor | None,
+    f_b_weight: torch.Tensor | None,
     beta_logits: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -1341,7 +1398,9 @@ def gluon_kda_fused_verify_gfx950(
     rows, in packed input order. None leaves retention to the caller. Commit
     uses fixed-width windows, so serving supplies dense query boundaries.
     mixed_qkv contains activation-dtype pre-convolution Q/K/V rows; raw_g and
-    beta_logits are projected gate inputs. state_pool is FP32 [page, head, V, K].
+    beta_logits are projected gate inputs. A supplied raw_g requires both
+    projection inputs to be None. Otherwise f_a_out and f_b_weight produce the
+    gate in this kernel. state_pool is FP32 [page, head, V, K].
     read_indices selects checkpoint pages; nonpositive pages are padding.
     correction is FP32 [slot, head, capacity, V]. key_gate has the same layout
     with activation-dtype unnormalized K followed by raw gate in its last axis.
@@ -1368,6 +1427,8 @@ def gluon_kda_fused_verify_gfx950(
         num_heads,
         head_dim,
         draft_token_num,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
     )
     batch = read_indices.numel()
     output = torch.empty(
@@ -1397,6 +1458,8 @@ def gluon_kda_fused_verify_gfx950(
         conv_weights,
         conv_pool,
         raw_g,
+        f_a_out,
+        f_b_weight,
         beta_logits,
         state_pool,
         read_indices,
@@ -1419,6 +1482,7 @@ def gluon_kda_fused_verify_gfx950(
         dt_bias,
         H=num_heads,
         D=head_dim,
+        F_A=head_dim,
         TOKENS_PER_SEQUENCE=draft_token_num,
         VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
@@ -1428,7 +1492,8 @@ def gluon_kda_fused_verify_gfx950(
         CONV_POOL_PAGE_STRIDE=conv_pool.stride(0),
         CONV_POOL_CHANNEL_STRIDE=conv_pool.stride(1),
         CONV_POOL_HISTORY_STRIDE=conv_pool.stride(2),
-        GATE_ROW_STRIDE=raw_g.stride(0),
+        GATE_ROW_STRIDE=0 if raw_g is None else raw_g.stride(0),
+        F_A_ROW_STRIDE=0 if f_a_out is None else f_a_out.stride(0),
         BETA_ROW_STRIDE=beta_logits.stride(0),
         CAPACITY=correction.shape[2],
         STATE_POOL_PAGE_STRIDE=state_pool.stride(0),

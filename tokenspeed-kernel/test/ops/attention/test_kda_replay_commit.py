@@ -80,7 +80,7 @@ def _window(n, t, pages=32, seed=0, num_heads=HV):
     )
 
 
-def _prepare_records(x, t, *, raw_gate=None, original_qkv=None):
+def _prepare_records(x, t, *, raw_gate, original_qkv=None):
     """Produce BF16 K/raw-gate and FP32 U through the registered serving path."""
     from tokenspeed_kernel.ops.attention.kda import (
         KdaReplayRecords,
@@ -109,7 +109,7 @@ def _prepare_records(x, t, *, raw_gate=None, original_qkv=None):
             bias=None,
             recurrent_layout="v_major",
         )
-    if raw_gate is None:
+    if raw_gate is None and "conv_qkv" in producers:
         raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
     x["correction"] = torch.empty(n, t, heads, V, device=DEV, dtype=torch.float32)
     x["key_gate"] = torch.empty(n, t, heads, 2 * K, device=DEV, dtype=torch.bfloat16)
@@ -167,7 +167,9 @@ def _records_commit(xs, groups, reads, writes, accepted, t, *, corrupt=False):
     verifies = []
     for x, group in zip(xs, groups, strict=True):
         x["read_indices"] = reads[group]
-        verifies.append(_prepare_records(x, t))
+        verifies.append(
+            _prepare_records(x, t, raw_gate=torch.mm(x["f_a"], x["w_fb"].t()))
+        )
     addresses = _batched_descriptor(xs)
     for layer, x in enumerate(xs):
         addresses[layer, 3] = x["correction"].data_ptr()

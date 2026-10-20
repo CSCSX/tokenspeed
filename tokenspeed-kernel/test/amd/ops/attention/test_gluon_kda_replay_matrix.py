@@ -173,7 +173,7 @@ class ReplayCase:
         self.accepted = torch.full((batch,), t, device="cuda", dtype=torch.int32)
         self.originals = []
         self.verifies = []
-        self.raw_gates = []
+        self.gate_reference_mismatches = 0
         self.retained_qkv = []
         for layer, x in enumerate(self.layers):
             # Use the serving arena's page stride for both pool components.
@@ -195,12 +195,10 @@ class ReplayCase:
             x["read_indices"] = self.reads[layer % group_count]
             x["write_indices"] = self.writes[layer % group_count]
             self.originals.append((conv.clone(), state.clone()))
-            raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
-            self.raw_gates.append(raw_gate)
             self.retained_qkv.append(torch.empty_like(x["qkv_raw"]))
             self.verifies.append(
                 _prepare_records(
-                    x, t, raw_gate=raw_gate, original_qkv=self.retained_qkv[layer]
+                    x, t, raw_gate=None, original_qkv=self.retained_qkv[layer]
                 )
             )
         self.descriptors = _batched_descriptor(self.layers)
@@ -248,9 +246,8 @@ class ReplayCase:
         )
 
     def verify_all(self):
-        for layer, x in enumerate(self.layers):
-            torch.mm(x["f_a"], x["w_fb"].t(), out=self.raw_gates[layer])
-            self.verifies[layer]()
+        for verify in self.verifies:
+            verify()
 
     def lifecycle(self):
         self.verify_all()
@@ -266,18 +263,30 @@ class ReplayCase:
                 self.verify_all()
             capture.replay()
         references = []
+        self.gate_reference_mismatches = 0
         for x, (conv, state) in zip(self.layers, self.originals, strict=True):
             torch.testing.assert_close(x["conv_pool"], conv, atol=0, rtol=0)
             torch.testing.assert_close(x["h_pool"], state, atol=0, rtol=0)
+            positions = x["metadata"][:, 2, None] + torch.arange(self.t, device="cuda")
+            ring = positions % self.t
+            rows = torch.arange(self.batch, device="cuda")[:, None]
+            raw_gate = (
+                x["key_gate"][rows, ring][..., K:]
+                .reshape(self.batch * self.t, _HEADS * K)
+                .contiguous()
+            )
+            # Validate the producer independently before using its rounded gate.
+            check_original_gate_projection(raw_gate, x["f_a"], x["w_fb"])
+            if current_platform().is_cdna4:
+                helper_gate = original_gate_projection(x["f_a"], x["w_fb"])
+                check_original_gate_projection(helper_gate, x["f_a"], x["w_fb"])
+                self.gate_reference_mismatches += int((raw_gate != helper_gate).sum())
             output, correction, kg, final_state, final_conv = _reference(
-                x, self.t, self.accepted, rounded_conv=True
+                x, self.t, self.accepted, rounded_conv=True, raw_gate=raw_gate
             )
             torch.testing.assert_close(
                 x["verify_output"].view_as(output), output, atol=1.6e-2, rtol=1e-2
             )
-            positions = x["metadata"][:, 2, None] + torch.arange(self.t, device="cuda")
-            ring = positions % self.t
-            rows = torch.arange(self.batch, device="cuda")[:, None]
             torch.testing.assert_close(
                 x["correction"][rows, ring], correction, atol=2e-6, rtol=2e-5
             )
@@ -441,6 +450,60 @@ def test_verify_retains_original_qkv(graph):
         capture.replay()
     torch.testing.assert_close(x["h_pool"], expected_state, atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(x["conv_pool"], expected_history, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="requires the gfx950 inline gate producer",
+)
+@pytest.mark.parametrize("graph", [False, True])
+def test_inline_gate_matches_supplied_gate(graph):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_paged_verify_nostore_vmajor_gfx950,
+    )
+
+    batch, t, heads = 3, 8, _HEADS
+    x = _window(batch, t, pages=2 * batch + 2, seed=8920, num_heads=heads)
+    activation = x["f_a"].clone()
+    inputs = [
+        torch.empty(batch * t, K + padding, device="cuda", dtype=torch.bfloat16)
+        for padding in (7, 16)
+    ]
+    for values in inputs:
+        values[:, :K].copy_(activation)
+    x["f_a"] = inputs[0][:, :K]
+    _prepare_records(x, t, raw_gate=None)
+    for values in inputs:
+        x["f_a"] = values[:, :K]
+        with assert_no_triton_compile(
+            gluon_kda_fused_paged_verify_nostore_vmajor_gfx950
+        ):
+            verify = _prepare_records(x, t, raw_gate=None)
+            if graph:
+                capture = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(capture):
+                    verify()
+                capture.replay()
+        output = x["verify_output"].clone()
+        correction = x["correction"].clone()
+        key_gate = x["key_gate"].clone()
+        positions = x["metadata"][:, 2, None] + torch.arange(t, device="cuda")
+        rows = torch.arange(batch, device="cuda")[:, None]
+        raw_gate = (
+            key_gate[rows, positions % t][..., K:]
+            .reshape(batch * t, heads * K)
+            .contiguous()
+        )
+        check_original_gate_projection(raw_gate, x["f_a"], x["w_fb"])
+        verify = _prepare_records(x, t, raw_gate=raw_gate)
+        if graph:
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture):
+                verify()
+            capture.replay()
+        torch.testing.assert_close(x["verify_output"], output, atol=1.6e-2, rtol=1e-2)
+        torch.testing.assert_close(x["correction"], correction, atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(x["key_gate"], key_gate, atol=0, rtol=0)
 
 
 def _check_original(
@@ -664,10 +727,10 @@ def main():
         "cache": args.cache,
         "state_page_bytes": _STATE_PAGE_BYTES,
         "paired_rounds": args.paired_rounds,
-        "verify_scope": "one layer; includes retained payload writes and excludes gate GEMM",
+        "verify_scope": "one layer; both retain payloads; candidate includes gate projection, original excludes gate GEMM; unequal work",
         "commit_scope": "all layers; includes conv history; excludes verify",
         "lifecycle_scope": {
-            "candidate": "all layers: gate GEMM, records verify with QKV retention, then one batched commit",
+            "candidate": "all layers: records verify with gate production and QKV retention, then one batched commit",
             "original_t1": "all layers: original fused decode; gfx1250 also includes gate GEMM",
             "original_t4": "all layers: gate GEMM, capture verify, then one batched raw-g replay",
         },
@@ -757,7 +820,7 @@ def main():
                             timer,
                             case.verifies[0],
                             (lambda: original.verify(0)) if baseline_valid else None,
-                            equivalent=baseline_valid,
+                            equivalent=False,
                             **measure_options,
                         )
                     verify_measurement = verify_measurements[baseline_valid]
@@ -804,6 +867,8 @@ def main():
                                 if decode and reference_gates
                                 else "torch_mm"
                             ),
+                            "candidate_gate_reference": "record gate checked against FP64 before recurrence",
+                            "candidate_gate_helper_mismatches": case.gate_reference_mismatches,
                             "elapsed_seconds": time.monotonic() - started,
                             "verify": verify_measurement,
                             "commit": commit_measurement,
