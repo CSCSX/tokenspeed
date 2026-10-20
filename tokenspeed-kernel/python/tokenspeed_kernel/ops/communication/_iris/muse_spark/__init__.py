@@ -961,6 +961,7 @@ class MuseIrisState:
             and self.reduction.lamport_epochs is not None
             and local_width % 512 == 0
             and block_k == total_width
+            and total_width % 1024 == 0
             and rows * local_width <= self.reduction.lamport_max_numel
         ):
             # Sentinel mailboxes replace both peer rendezvous of the pull path.
@@ -980,8 +981,7 @@ class MuseIrisState:
                 scale_stride_linear=scales.stride(0),
                 scale_stride_mblock=scales.stride(1),
                 max_elements=self.reduction.lamport_max_numel,
-                block_k=block_k,
-                num_warps=8,
+                num_warps=1,
             )
             return packed, scales
         iris_fused_pull_allgather_rmsnorm_mxfp4[(rows,)](
