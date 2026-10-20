@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     IrisAllGather,
     all_gather_columns_can_run,
+    iris_fused_lamport_allgather_rmsnorm_mxfp4,
     iris_fused_pull_allgather_rmsnorm_mxfp4,
     iris_pull_allgather_rows,
 )
@@ -955,6 +956,34 @@ class MuseIrisState:
             device=self.all_reduce.producer.data.device,
         )
         block_k = triton.next_power_of_2(total_width)
+        if (
+            self.reduction.lamport_region is not None
+            and self.reduction.lamport_epochs is not None
+            and local_width % 512 == 0
+            and block_k == total_width
+            and rows * local_width <= self.reduction.lamport_max_numel
+        ):
+            # Sentinel mailboxes replace both peer rendezvous of the pull path.
+            iris_fused_lamport_allgather_rmsnorm_mxfp4[(rows,)](
+                local,
+                weight,
+                packed,
+                scales,
+                self.reduction.lamport_region,
+                self.reduction.lamport_epochs,
+                self.reduction.lamport_peer_addresses[: self.world_size],
+                rank=self.all_reduce.rank_in_group,
+                local_width=local_width,
+                total_width=total_width,
+                eps=eps,
+                weight_offset=weight_offset,
+                scale_stride_linear=scales.stride(0),
+                scale_stride_mblock=scales.stride(1),
+                max_elements=self.reduction.lamport_max_numel,
+                block_k=block_k,
+                num_warps=8,
+            )
+            return packed, scales
         iris_fused_pull_allgather_rmsnorm_mxfp4[(rows,)](
             local,
             self.all_reduce.producer.data,

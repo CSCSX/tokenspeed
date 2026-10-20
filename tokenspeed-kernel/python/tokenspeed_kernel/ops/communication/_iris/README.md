@@ -32,7 +32,10 @@ IDs cover different element ranges. Triton RSAG remains independent.
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
-also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
+also owns the width-parameterized RMSNorm/MXFP4 fusion. When Lamport mailboxes are
+prepared, that fusion pushes each shard into them and polls for the data itself,
+sharing the BF16 reductions' per-tile stage counters; otherwise it pulls producer
+storage between two peer rendezvous. Exchanges with
 model-specific head layouts, route packets, or normalization semantics stay in
 the model package, along with dispatch and capacities.
 

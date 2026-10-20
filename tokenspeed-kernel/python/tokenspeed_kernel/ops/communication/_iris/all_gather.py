@@ -481,3 +481,167 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
 
     done_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_peers(ready_flags, row, done_epoch, heaps, rank, num_warps)
+
+
+@gluon.jit
+def iris_fused_lamport_allgather_rmsnorm_mxfp4(
+    local_input,
+    weight,
+    packed_output,
+    scale_output,
+    region,
+    epochs,
+    regions,
+    rank: gl.constexpr,
+    local_width: gl.constexpr,
+    total_width: gl.constexpr,
+    eps: gl.constexpr,
+    weight_offset: gl.constexpr,
+    scale_stride_linear,
+    scale_stride_mblock,
+    max_elements: gl.constexpr,
+    block_k: gl.constexpr,
+    num_warps: gl.constexpr,
+):
+    """Gather BF16 feature shards through sentinel mailboxes, then RMSNorm + MXFP4.
+
+    Each rank pushes its row shard into every peer's rotating mailbox slot and
+    waits until its own slots no longer hold the empty marker, so the data is
+    the ready signal and no rank waits for peers to finish reading. Mailboxes
+    follow the packed BF16 Lamport contract of ``ProducerAllReduce``: shard
+    elements occupy ``row * local_width`` onward in the sender's slot, epochs
+    select one of three stages per 512-element tile, and consumed slots are
+    cleared before the epochs advance. Negative zero is exchanged as zero.
+    Normalization and quantization match ``iris_fused_pull_allgather_rmsnorm_mxfp4``.
+    """
+    WORLD_SIZE: gl.constexpr = len(regions)
+    gl.static_assert(local_width % 512 == 0)
+    gl.static_assert(total_width == local_width * WORLD_SIZE)
+    gl.static_assert(block_k == total_width)
+    row = gl.program_id(0)
+    # Lane p holds row elements [8p, 8p + 8) as four 32-bit words. Its shard
+    # owner sends them; every other rank exchanges them through one mailbox pack.
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [num_warps, 1], [1, 0])
+    pack = gl.arange(0, total_width // 8, layout=gl.SliceLayout(1, layout))
+    word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
+    owner = pack * 8 // local_width
+    element = row * local_width + pack * 8 % local_width
+    tile = element // 512
+    stage = gl.load(epochs + tile).to(gl.uint32) % 3
+    words = (element // 2)[:, None] + word[None, :]
+
+    norm_layout: gl.constexpr = scaled_downcast_layout(1, block_k, num_warps)
+    offsets = gl.arange(0, block_k, layout=gl.SliceLayout(0, norm_layout))
+    norm_weight = gl.load(weight + offsets).to(gl.float32)
+
+    local = gl.load(tl.cast(local_input, gl.pointer_type(gl.uint32)) + words)
+    # Replace BF16 negative zero halves so no payload word matches the marker.
+    local = gl.where((local & 0xFFFF) == 0x8000, local & 0xFFFF0000, local)
+    local = gl.where((local >> 16) == 0x8000, local & 0xFFFF, local)
+    remote = (owner != rank)[:, None]
+    slot_words = (stage * (WORLD_SIZE * max_elements // 2))[:, None] + words
+    # Owner lanes of every peer send this rank's shard to that peer. Buffer
+    # stores carry the write-through bits without a volatile completion wait,
+    # so the polls below start while the pushes are still in flight.
+    for peer in gl.static_range(WORLD_SIZE):
+        if peer != rank:
+            destination = _iris_group_heap_base(peer, regions)
+            gl.amd.cdna4.buffer_store(
+                local,
+                gl.multiple_of(destination.to(gl.pointer_type(gl.uint32)), 16),
+                (slot_words + rank * (max_elements // 2)).to(gl.int32),
+                mask=(owner == peer)[:, None],
+                cache=".wt",
+            )
+
+    mailbox = (
+        tl.cast(region, gl.pointer_type(gl.uint32))
+        + slot_words
+        + (owner * (max_elements // 2))[:, None]
+    )
+    # System-scope polls read each peer's write-through payload from memory.
+    # Payload halves are never negative zero; an unwritten word's high half is.
+    incoming = gl.load(
+        mailbox, mask=remote, other=0, cache_modifier=".cv", volatile=True
+    )
+    missing = (owner != rank) & (
+        gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 1) != 0
+    )
+    while gl.max(missing.to(gl.int32), 0) != 0:
+        incoming = gl.load(
+            mailbox,
+            mask=missing[:, None],
+            other=incoming,
+            cache_modifier=".cv",
+            volatile=True,
+        )
+        missing = (owner != rank) & (
+            gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 1) != 0
+        )
+    gl.amd.cdna4.buffer_store(
+        gl.full_like(incoming, 0x80000000),
+        tl.cast(region, gl.pointer_type(gl.uint32)),
+        (slot_words + (owner * (max_elements // 2))[:, None]).to(gl.int32),
+        mask=remote,
+        cache=".wt",
+    )
+
+    gathered = gl.where(remote, incoming, local)
+    low = (gathered & 0xFFFF).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    high = (gathered >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    values = gl.join(low, high).reshape([total_width]).to(gl.float32)
+    values = gl.convert_layout(values, offsets.type.layout)
+
+    variance = gl.sum(values * values, axis=0) / total_width
+    values *= gl.rsqrt(variance + eps)
+    values *= (norm_weight + weight_offset).to(gl.bfloat16).to(gl.float32)
+
+    values = values.reshape((1, block_k))
+    packed, scale_byte = _mxfp4_quantize_tile_in_layout(values)
+    packed_offsets = gl.arange(
+        0,
+        block_k // 2,
+        layout=gl.SliceLayout(0, packed.type.layout),
+    )
+    packed_rows = gl.arange(
+        0,
+        1,
+        layout=gl.SliceLayout(1, packed.type.layout),
+    )
+    gl.store(
+        packed_output
+        + (row + packed_rows[:, None]) * (total_width // 2)
+        + packed_offsets[None, :],
+        packed,
+    )
+    scale_groups = gl.arange(
+        0,
+        block_k // 32,
+        layout=gl.SliceLayout(0, scale_byte.type.layout),
+    )
+    _mxfp4_store_cdna4_scale(
+        scale_output,
+        scale_byte,
+        row
+        + gl.arange(
+            0,
+            1,
+            layout=gl.SliceLayout(1, scale_byte.type.layout),
+        )[:, None],
+        scale_groups[None, :],
+        scale_stride_linear,
+        scale_stride_mblock,
+        scale_groups[None, :] < total_width // 32,
+        M_SWIZZLE=32,
+        K_SWIZZLE=8,
+    )
+
+    # Every subgroup finishes clearing its mailbox packs before the tile's
+    # stage advances; the next use of a stage is two exchanges later.
+    _iris_drain_subgroup_vmem()
+    gl.barrier()
+    gl.store(
+        epochs + tile,
+        ((stage + 1) % 3).to(gl.int32),
+        mask=(owner == 0) & (pack * 8 % 512 == 0),
+    )
