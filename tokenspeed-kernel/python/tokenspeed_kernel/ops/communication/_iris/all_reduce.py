@@ -529,6 +529,90 @@ def _iris_sanitize_lamport_bf16(values):
 
 
 @gluon.jit
+def _iris_lamport_push(
+    values,
+    regions,
+    offset,
+    offsets,
+    mask,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+):
+    """Store values[delta - 1] at offset in peer (RANK + delta)'s region.
+
+    Each program starts at a different peer so that concurrent stores spread
+    across all links instead of all targeting RANK + 1 first. One uniform
+    branch selects the order, so peer bases stay scalar constants.
+    """
+    rotation = gl.program_id(0) % (WORLD_SIZE - 1)
+    for first in gl.static_range(WORLD_SIZE - 1):
+        if rotation == first:
+            for step in gl.static_range(WORLD_SIZE - 1):
+                # Preserve 16-byte stores after casting integer addresses.
+                destination = gl.multiple_of(
+                    regions[
+                        (RANK + 1 + (first + step) % (WORLD_SIZE - 1)) % WORLD_SIZE
+                    ].to(gl.pointer_type(gl.bfloat16)),
+                    16,
+                )
+                gl.amd.cdna4.buffer_store(
+                    values[(first + step) % (WORLD_SIZE - 1)],
+                    destination + offset,
+                    offsets,
+                    mask=mask,
+                    cache=".wt",
+                )
+
+
+@gluon.jit
+def _iris_wait_lamport_slots(
+    slots,
+    offsets,
+    valid,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SLOT_ELEMENTS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Wait for each peer's BF16 packs in its slot to replace the empty markers.
+
+    Peer p's packs start at slots + p * SLOT_ELEMENTS; offsets index packs.
+    """
+    values = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        values += (gl.full(offsets.shape, 0, gl.bfloat16, LAYOUT),)
+    active = valid
+    while gl.any(active, 0):
+        loaded = ()
+        # A lane reloads every peer until all seven packs are ready. Issue the
+        # independent reads before checking them; retired lanes keep their data.
+        # .cv controls hardware caches, not compiler volatility. The compiler
+        # regression test checks that these reads remain in the polling cycle.
+        for delta in gl.static_range(1, WORLD_SIZE):
+            peer = (RANK + delta) % WORLD_SIZE
+            loaded += (
+                gl.amd.cdna4.buffer_load(
+                    slots + peer * SLOT_ELEMENTS,
+                    offsets,
+                    mask=active[:, None],
+                    other=values[delta - 1],
+                    cache=".cv",
+                ),
+            )
+        active = gl.full(valid.shape, False, gl.int1, gl.SliceLayout(1, LAYOUT))
+        for delta in gl.static_range(0, WORLD_SIZE - 1):
+            active |= valid & (
+                gl.max(
+                    (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000).to(gl.int32),
+                    1,
+                )
+                != 0
+            )
+        values = loaded
+    return values
+
+
+@gluon.jit
 def _iris_wait_lamport_peers(
     region,
     generation,
@@ -540,41 +624,15 @@ def _iris_wait_lamport_peers(
     LAYOUT: gl.constexpr,
 ):
     """Wait for peer BF16 tiles to replace the empty mailbox markers."""
-    values = ()
-    for _ in gl.static_range(1, WORLD_SIZE):
-        values += (gl.full([64, 8], 0, gl.bfloat16, LAYOUT),)
-    active = valid
-    while gl.any(active, 0):
-        loaded = ()
-        # A lane reloads every peer until all seven packs are ready. Issue the
-        # independent reads before checking them; retired lanes keep their data.
-        # .cv controls hardware caches, not compiler volatility. The compiler
-        # regression test checks that these reads remain in the polling cycle.
-        for delta in gl.static_range(1, WORLD_SIZE):
-            peer = (RANK + delta) % WORLD_SIZE
-            pointer = (
-                region + generation * WORLD_SIZE * MAX_ELEMENTS + peer * MAX_ELEMENTS
-            )
-            loaded += (
-                gl.amd.cdna4.buffer_load(
-                    pointer,
-                    offsets,
-                    mask=active[:, None],
-                    other=values[delta - 1],
-                    cache=".cv",
-                ),
-            )
-        active = gl.full([64], False, gl.int1, gl.SliceLayout(1, LAYOUT))
-        for delta in gl.static_range(0, WORLD_SIZE - 1):
-            active |= valid & (
-                gl.max(
-                    (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000).to(gl.int32),
-                    1,
-                )
-                != 0
-            )
-        values = loaded
-    return values
+    return _iris_wait_lamport_slots(
+        region + generation * WORLD_SIZE * MAX_ELEMENTS,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_ELEMENTS,
+        LAYOUT,
+    )
 
 
 @gluon.jit
@@ -619,23 +677,28 @@ def iris_lamport_allreduce(
     stride: gl.constexpr = WORLD_SIZE * MAX_ELEMENTS
     local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
     local = _iris_sanitize_lamport_bf16(local)
-    for delta in gl.static_range(1, WORLD_SIZE):
-        peer = (RANK + delta) % WORLD_SIZE
-        destination = _iris_heap_base(
-            peer,
-            region_0,
-            region_1,
-            region_2,
-            region_3,
-            region_4,
-            region_5,
-            region_6,
-            region_7,
-        )
-        # Preserve 16-byte publication stores after casting integer addresses.
-        destination = gl.multiple_of(destination.to(gl.pointer_type(gl.bfloat16)), 16)
-        destination += generation * stride + RANK * MAX_ELEMENTS
-        gl.amd.cdna4.buffer_store(local, destination, offsets, mask=mask, cache=".wt")
+    regions = (
+        region_0,
+        region_1,
+        region_2,
+        region_3,
+        region_4,
+        region_5,
+        region_6,
+        region_7,
+    )
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (local,)
+    _iris_lamport_push(
+        published,
+        regions,
+        generation * stride + RANK * MAX_ELEMENTS,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+    )
 
     peers = _iris_wait_lamport_peers(
         region_sym_ptr,
@@ -1437,13 +1500,41 @@ def iris_pull_oneshot_rmsnorm_persistent(
 class ProducerAllReduce:
     """Prepared BF16 TP4/TP8 Lamport, push and pull variants over producer storage.
 
-    The owner selects this measured payload policy. Pull scratch is shared with
-    the generic producer reduction; all uses and consumers must be stream ordered.
-    ``run`` can return the push state's borrowed output instead of ``output``.
+    The owner selects this measured payload policy. TP8 Lamport two-shot serves
+    whole two-shot tiles from 48K to 1M elements with its own mailboxes and
+    stage counters; the one-shot mailbox is shared with Muse's fused routed
+    reduction. Pull scratch is shared with the generic producer reduction; all
+    uses and consumers must be stream ordered. ``run`` can return the push
+    state's borrowed output instead of ``output``.
     """
 
     LAMPORT_MAX_ELEMENTS = 43 * 4096
+    # The one-shot sends every peer the whole payload; above this size the
+    # two-shot's 2/WORLD_SIZE share per peer outweighs its second exchange.
+    LAMPORT_TWO_SHOT_MIN_ELEMENTS = 48 * 1024
+    LAMPORT_TWO_SHOT_MAX_ELEMENTS = 128 * 8192
+    # iris_lamport_twoshot_bf16_allreduce reduces one 128-element tile of every
+    # shard per program.
+    LAMPORT_TWO_SHOT_TILE = 128
     PUSH_MAX_ELEMENTS = 128 * 8192
+
+    @staticmethod
+    def lamport_two_shot_capacity(
+        max_numel: int, *, world_size: int, enable_lamport: bool
+    ) -> int:
+        """Return the measured TP8 Lamport two-shot capacity in elements."""
+        alignment = world_size * ProducerAllReduce.LAMPORT_TWO_SHOT_TILE
+        capacity = min(
+            max_numel // alignment * alignment,
+            ProducerAllReduce.LAMPORT_TWO_SHOT_MAX_ELEMENTS,
+        )
+        return (
+            capacity
+            if enable_lamport
+            and world_size == 8
+            and capacity >= ProducerAllReduce.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            else 0
+        )
 
     @staticmethod
     def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
@@ -1451,6 +1542,9 @@ class ProducerAllReduce:
             min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_MAX_ELEMENTS)
             if enable_lamport
             else 0
+        )
+        two_shot = ProducerAllReduce.lamport_two_shot_capacity(
+            max_numel, world_size=world_size, enable_lamport=enable_lamport
         )
         alignment = world_size * 8
         push = min(
@@ -1462,6 +1556,13 @@ class ProducerAllReduce:
             + (
                 allocation_bytes((3, world_size, lamport), torch.bfloat16)
                 if lamport
+                else 0
+            )
+            + (
+                allocation_bytes(
+                    (3, 2, world_size, two_shot // world_size), torch.bfloat16
+                )
+                if two_shot
                 else 0
             )
         )
@@ -1518,13 +1619,65 @@ class ProducerAllReduce:
             self.lamport_peer_addresses = tuple(
                 base + offset for base in peers.addresses
             )
+        self.lamport_two_shot_max_numel = self.lamport_two_shot_capacity(
+            max_numel, world_size=self.world_size, enable_lamport=enable_lamport
+        )
+        two_shot_shard = self.lamport_two_shot_max_numel // self.world_size
+        # [stage][reduce-scatter, all-gather][source rank][shard] mailboxes and
+        # one stage counter per two-shot program.
+        self.lamport_two_shot_region = (
+            peers.ctx.empty(
+                (3, 2, self.world_size, two_shot_shard), dtype=torch.bfloat16
+            )
+            if two_shot_shard
+            else None
+        )
+        self.lamport_two_shot_epochs = (
+            torch.zeros(
+                two_shot_shard // self.LAMPORT_TWO_SHOT_TILE,
+                dtype=torch.int32,
+                device=peers.device,
+            )
+            if two_shot_shard
+            else None
+        )
+        self.lamport_two_shot_peer_addresses = None
+        if self.lamport_two_shot_region is not None:
+            self.lamport_two_shot_region.view(torch.int32).fill_(-2147483648)
+            offset = (
+                self.lamport_two_shot_region.data_ptr() - peers.addresses[peers.rank]
+            )
+            self.lamport_two_shot_peer_addresses = tuple(
+                base + offset for base in peers.addresses
+            )
 
     def run(
         self, input: torch.Tensor, output: torch.Tensor, numel: int
     ) -> torch.Tensor:
-        """Select packed Lamport, bounded push, or the large pull protocol."""
+        """Select Lamport one-shot or two-shot, bounded push, or large pull."""
         assert 0 < numel <= self.pull.producer.data.numel()
         assert numel % (self.world_size * 8) == 0
+        two_shot_tile = self.world_size * self.LAMPORT_TWO_SHOT_TILE
+        if (
+            self.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            <= numel
+            <= self.lamport_two_shot_max_numel
+            and numel % two_shot_tile == 0
+        ):
+            iris_lamport_twoshot_bf16_allreduce[(numel // two_shot_tile,)](
+                input,
+                self.lamport_two_shot_region,
+                output,
+                self.lamport_two_shot_epochs,
+                self.lamport_two_shot_peer_addresses[: self.world_size],
+                RANK=self.pull.producer.peers.rank,
+                WORLD_SIZE=self.world_size,
+                total_elements=numel,
+                MAX_SHARD_ELEMENTS=self.lamport_two_shot_max_numel // self.world_size,
+                NUM_STAGES=3,
+                num_warps=1,
+            )
+            return output
         if numel <= self.lamport_max_numel and numel % 512 == 0:
             iris_lamport_bf16_allreduce[(numel // 512,)](
                 input,
@@ -1678,13 +1831,18 @@ def iris_lamport_bf16_allreduce(
     stride: gl.constexpr = WORLD_SIZE * MAX_ELEMENTS
     local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
     local = _iris_sanitize_lamport_bf16(local)
-    for delta in gl.static_range(1, WORLD_SIZE):
-        peer = (RANK + delta) % WORLD_SIZE
-        destination = _iris_group_heap_base(peer, regions)
-        # Preserve 16-byte publication stores after casting integer addresses.
-        destination = gl.multiple_of(destination.to(gl.pointer_type(gl.bfloat16)), 16)
-        destination += generation * stride + RANK * MAX_ELEMENTS
-        gl.amd.cdna4.buffer_store(local, destination, offsets, mask=mask, cache=".wt")
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (local,)
+    _iris_lamport_push(
+        published,
+        regions,
+        generation * stride + RANK * MAX_ELEMENTS,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+    )
 
     peers = _iris_wait_lamport_peers(
         region_sym_ptr,
@@ -1725,6 +1883,133 @@ def iris_lamport_bf16_allreduce(
         )
     gl.barrier()
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit(do_not_specialize=["total_elements"])
+def iris_lamport_twoshot_bf16_allreduce(
+    input_ptr,
+    region_sym_ptr,
+    output_ptr,
+    epochs,
+    regions,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    total_elements,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+):
+    """Reduce-scatter then all-gather BF16 through sentinel mailboxes.
+
+    Each rank owns one contiguous 1/WORLD_SIZE shard of input_ptr. Program t
+    pushes tile t of every peer's shard to that peer, sums its own shard tile in
+    FP32 rank order, rounds once to BF16, and pushes the result to every peer.
+    Each rank thus sends 2/WORLD_SIZE of the payload per peer instead of all
+    of it. regions are the peers' region_sym_ptr addresses. A region holds
+    [stage][reduce-scatter, all-gather][source rank][MAX_SHARD_ELEMENTS]
+    mailboxes, indexed by program, so epochs[t] belongs to program t for every
+    payload size. Negative zero becomes zero in inputs and in reduced values,
+    which every rank receives from the shard owner.
+    """
+    gl.static_assert(WORLD_SIZE == 8)
+    # One wave of 4-byte packs per program: more, smaller programs spread the
+    # pushes over more compute units and measured faster than 8 or 16 bytes.
+    VECTOR: gl.constexpr = 2
+    TILE: gl.constexpr = 64 * VECTOR
+    gl.static_assert(MAX_SHARD_ELEMENTS % TILE == 0)
+    gl.static_assert(NUM_STAGES >= 3)
+    layout: gl.constexpr = gl.BlockedLayout([1, VECTOR], [64, 1], [1, 1], [0, 1])
+    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    element = gl.arange(0, VECTOR, layout=gl.SliceLayout(0, layout))
+    offsets = pack[:, None] * VECTOR + element[None, :]
+    total_elements = gl.multiple_of(total_elements, WORLD_SIZE * TILE)
+    shard = gl.multiple_of(total_elements // WORLD_SIZE, TILE)
+    stage = gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    slots = stage * (2 * PHASE)
+    # chunks[delta] is this rank's tile of shard (RANK + delta) % WORLD_SIZE.
+    chunks = ()
+    for delta in gl.static_range(WORLD_SIZE):
+        owner = (RANK + delta) % WORLD_SIZE
+        chunks += (
+            _iris_sanitize_lamport_bf16(
+                gl.amd.cdna4.buffer_load(input_ptr + owner * shard, offsets)
+            ),
+        )
+    _iris_lamport_push(
+        chunks[1:],
+        regions,
+        slots + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        None,
+        RANK,
+        WORLD_SIZE,
+    )
+    valid = gl.full([64], True, gl.int1, gl.SliceLayout(1, layout))
+    scattered = _iris_wait_lamport_slots(
+        region_sym_ptr + slots,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        layout,
+    )
+    # Match the one-shot result: FP32 sum in rank order, one BF16 rounding.
+    for source in gl.static_range(0, WORLD_SIZE):
+        if source == RANK:
+            term = chunks[0]
+        else:
+            term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+        if source == 0:
+            accumulator = term.to(gl.float32)
+        else:
+            accumulator += term.to(gl.float32)
+    reduced = _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16))
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (reduced,)
+    _iris_lamport_push(
+        published,
+        regions,
+        slots + PHASE + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        None,
+        RANK,
+        WORLD_SIZE,
+    )
+    gl.amd.cdna4.buffer_store(reduced, output_ptr + RANK * shard, offsets)
+    gathered = _iris_wait_lamport_slots(
+        region_sym_ptr + slots + PHASE,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        layout,
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        owner = (RANK + delta) % WORLD_SIZE
+        gl.amd.cdna4.buffer_store(
+            gathered[delta - 1], output_ptr + owner * shard, offsets
+        )
+
+    # Clear this program's consumed mailboxes before advancing its stage.
+    sentinel = (
+        gl.where(offsets % 2 == 0, 0, 0x8000)
+        .to(gl.uint16)
+        .to(gl.bfloat16, bitcast=True)
+    )
+    for phase in gl.static_range(2):
+        for delta in gl.static_range(1, WORLD_SIZE):
+            source = (RANK + delta) % WORLD_SIZE
+            gl.amd.cdna4.buffer_store(
+                sentinel,
+                region_sym_ptr + slots + phase * PHASE + source * MAX_SHARD_ELEMENTS,
+                offsets,
+                cache=".wt",
+            )
+    gl.barrier()
+    gl.store(epochs + gl.program_id(0), ((stage + 1) % NUM_STAGES).to(gl.int32))
 
 
 @gluon.jit(do_not_specialize=["numel"])
