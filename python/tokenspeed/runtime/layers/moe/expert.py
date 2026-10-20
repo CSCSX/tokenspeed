@@ -630,6 +630,11 @@ class MoELayer(torch.nn.Module):
         return self.plan["deferred_output_is_token_order"]
 
     @property
+    def supports_deferred_output_buffer(self) -> bool:
+        """Whether the kernel accepts a caller-owned deferred destination."""
+        return self.plan["supports_deferred_output_buffer"]
+
+    @property
     def supports_deferred_cuda_finalize(self) -> bool:
         """Whether callers can defer to ``moe_finalize_fuse_shared``.
 
@@ -663,6 +668,7 @@ class MoELayer(torch.nn.Module):
         shared_out: torch.Tensor | None = None,
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
         routing_prepared: object | None = None,
+        deferred_out: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -689,6 +695,10 @@ class MoELayer(torch.nn.Module):
             routing_prepared: Routing metadata already populated from the
                 precomputed top-k, so the kernel skips its routing launch.
                 Only kernels advertising prepared routing accept it.
+            deferred_out: Optional caller-owned raw route destination for a
+                supporting kernel with ``do_finalize=False``. None lets the
+                kernel allocate its output. The returned route map still
+                identifies which rows are defined.
 
         Returns:
             Finalized ``[tokens, hidden]`` hidden states, or with
@@ -739,6 +749,7 @@ class MoELayer(torch.nn.Module):
                 **shared_kwargs,
                 x_quantized=x_quantized,
                 routing_prepared=routing_prepared,
+                deferred_out=deferred_out,
             )
             output_scale = topk_output.output_scale
             if isinstance(output_scale, torch.Tensor):
@@ -765,6 +776,7 @@ class MoELayer(torch.nn.Module):
             **shared_kwargs,
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
+            deferred_out=deferred_out,
         )
         if not do_finalize and output[1] is None:
             # Some precomputed-route kernels (Triton MXFP4) return no route

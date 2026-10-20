@@ -1461,6 +1461,23 @@ output through LDS so each scattered route row is stored as one contiguous
 run; at 8K tokens that BF16 per-route write and its combine read dominate the
 second GEMM.
 
+### gfx950 deferred dynamic-MXFP4 routes
+
+`gluon_mxfp_precomputed_mxfp4_fused_moe` can return unweighted BF16 routes
+with `do_finalize=False`. Row `token * top_k + slot` is canonical; the
+returned route map marks nonlocal experts with `-1`, and those rows need
+not be initialized. Consumers must finish tensor-parallel reduction before
+per-route normalization, then apply route weights and combine.
+
+Its optional `out` supplies contiguous BF16 `[M * top_k, H]` storage for
+deferred routes. None allocates it. The destination must not overlap any
+activation, weight, scale, or routing input; disjoint slices of one allocation
+are valid. Direct, route-tiled, and package producers honor the same contract.
+The package retains its separate `[M, H]` sorting output and passes the raw
+destination as `deferred_out` to stage 2, replacing only the partials allocation.
+Store policy and missing-route initialization remain unchanged. The caller
+owns the destination and must order consumption before the next producer.
+
 ### gfx1250 MXFP4 experts
 
 On gfx1250, the MoE API selects Gluon kernels with FP8 or MXFP4 activations

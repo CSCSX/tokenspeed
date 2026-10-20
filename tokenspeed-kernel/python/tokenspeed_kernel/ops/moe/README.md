@@ -26,6 +26,14 @@ only a caller that owns every route may omit it. Muse TP8/EP1 consumes
 unpadded canonical rows directly and borrows its collective result until the
 per-route norm finishes, avoiding a gather and a reduction copy-back.
 
+A kernel declaring `supports_deferred_output_buffer` also accepts
+`deferred_out` with `do_finalize=False`. None retains allocation. The gfx950
+dynamic-A4W4 implementation accepts contiguous BF16 `[tokens * topk, hidden]`
+storage, disjoint from its inputs, and returns routes backed by that storage.
+The route map still determines which rows are defined. Callers own the buffer
+and must finish consuming its output before reusing it; disjoint views of one
+allocation are allowed. Unsupported plans reject a supplied destination.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.
