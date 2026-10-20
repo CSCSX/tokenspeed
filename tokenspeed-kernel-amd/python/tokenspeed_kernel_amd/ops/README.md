@@ -1155,8 +1155,8 @@ address checks out of the state-update loop.
 Batched descriptors use the shared ten-column table: original QKV (0), conv
 history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
 The remaining columns are reserved. Recovery retains one program per head,
-request and layer with the eight-panel state pipeline. It stages each accepted
-FP32 correction once in LDS, then applies the same updates per value panel.
+request and layer with the eight-panel state pipeline. It stages accepted
+U, K and raw gate once in LDS, then applies the same updates per value panel.
 It commits each head's convolution history after loading all old taps,
 including when source and destination alias. History retains its bound pool
 dtype; original QKV is converted on commit.

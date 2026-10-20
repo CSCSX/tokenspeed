@@ -926,14 +926,18 @@ def gluon_kda_fused_replay_gfx950(
 
     a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
     bias = gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
-    # Stage accepted corrections once, then read value panels from LDS.
-    correction_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    correction_offsets = gl.arange(0, D, layout=correction_layout)
+    # Stage accepted records once for key normalization and state updates.
+    record_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    correction_offsets = gl.arange(0, D, layout=record_layout)
+    key_gate_offsets = gl.arange(0, 2 * D, layout=record_layout)
     correction_shared = gl.allocate_shared_memory(
         gl.float32, [T, D], gl.SwizzledSharedLayout(1, 1, 1, order=[0])
     )
-    k_values = ()
-    decay_values = ()
+    key_gate_shared = gl.allocate_shared_memory(
+        activation_ref.dtype.element_ty,
+        [T, 2 * D],
+        gl.SwizzledSharedLayout(1, 1, 1, order=[0]),
+    )
     for token_offset in gl.static_range(T):
         record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
         correction_value = gl.load(
@@ -943,12 +947,19 @@ def gluon_kda_fused_replay_gfx950(
         )
         correction_shared.index(token_offset).store(correction_value)
         record_base = key_gate + record_row * kg_stride + head_idx * 2 * D
-        k_value = gl.load(
-            record_base + key_offsets, mask=token_offset < replay_steps, other=0.0
-        ).to(gl.float32)
-        raw_gate = gl.load(
-            record_base + D + key_offsets, mask=token_offset < replay_steps, other=0.0
-        ).to(gl.float32)
+        key_gate_value = gl.load(
+            record_base + key_gate_offsets,
+            mask=token_offset < replay_steps,
+            other=0.0,
+        )
+        key_gate_shared.index(token_offset).store(key_gate_value)
+
+    k_values = ()
+    decay_values = ()
+    for token_offset in gl.static_range(T):
+        vectors = key_gate_shared.index(token_offset)
+        k_value = vectors.slice(0, D, dim=0).load(key_layout).to(gl.float32)
+        raw_gate = vectors.slice(D, D, dim=0).load(key_layout).to(gl.float32)
         k_value *= gl.rsqrt(gl.sum(k_value * k_value, axis=0) + 1e-6)
         decay = _kda_decay(raw_gate, bias, a_value, BOUNDED, lower_bound)
         k_values += (k_value,)
