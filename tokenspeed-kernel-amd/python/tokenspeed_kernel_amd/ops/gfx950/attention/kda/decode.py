@@ -78,7 +78,7 @@ def _kda_recurrent_step(running, key, query, value, beta, key_query):
 @gluon.jit
 def _kda_qkvd_indices(head_idx, H: gl.constexpr, D: gl.constexpr):
     """Map Q/K/V/decay lanes to their input channels."""
-    layout: gl.constexpr = gl.BlockedLayout([2], [64], [gl.num_warps()], [0])
+    layout: gl.constexpr = gl.BlockedLayout([2], [64], [4], [0])
     offsets = gl.arange(0, 4 * D, layout=layout)
     slot_id = offsets // D
     local_offset = offsets - slot_id * D
@@ -978,7 +978,7 @@ def gluon_kda_fused_replay_gfx950(
     state_layout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
         [4, 16],
-        [gl.num_warps(), 1],
+        [4, 1],
         [1, 0],
     )
     key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
@@ -1019,7 +1019,7 @@ def gluon_kda_fused_replay_gfx950(
     a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
     bias = gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
     # Stage accepted records once for key normalization and state updates.
-    record_layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    record_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
     correction_offsets = gl.arange(0, D, layout=record_layout)
     key_gate_offsets = gl.arange(0, 2 * D, layout=record_layout)
     correction_shared = gl.allocate_shared_memory(
@@ -1649,7 +1649,7 @@ def launch_gluon_kda_fused_replay_gfx950(
         T=draft_token_num,
         CAPACITY=capacity,
         BOUNDED=lower_bound is not None,
-        num_warps=2 if draft_token_num == 1 else 4,
+        num_warps=4,
         num_stages=2,
         # Keep record assertions without instrumenting every integer operation.
         debug=True,
