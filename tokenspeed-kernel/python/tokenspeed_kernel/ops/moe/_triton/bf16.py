@@ -311,6 +311,35 @@ def _deep_pipeline(device: torch.device, block_m: int) -> bool:
     return properties.shared_memory_per_block_optin >= smem_bytes
 
 
+def _check_route_destination(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    """Reject a caller-owned route destination the route stages cannot fill."""
+    num_tokens, hidden_size = x.shape
+    top_k = topk_ids.shape[1]
+    if out.shape not in (
+        (num_tokens * top_k, hidden_size),
+        (num_tokens, top_k, hidden_size),
+    ):
+        raise ValueError("out must have shape [tokens * top_k, hidden]")
+    if out.dtype != x.dtype or out.device != x.device or not out.is_contiguous():
+        raise ValueError("out must be contiguous on x's device with x's dtype")
+    if not out.numel():
+        return
+    start = out.data_ptr()
+    end = start + out.numel() * out.element_size()
+    for tensor in (x, w13, w2, topk_ids):
+        # Inputs are contiguous, so their storage span is exact.
+        first = tensor.data_ptr()
+        last = first + tensor.numel() * tensor.element_size()
+        if tensor.numel() and first < end and start < last:
+            raise ValueError("out must not overlap the route inputs")
+
+
 def _route_outputs(
     x: torch.Tensor,
     w13: torch.Tensor,
@@ -321,12 +350,17 @@ def _route_outputs(
     situ_linear_beta: float | None,
     expert_start: int,
     round_intermediates: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
+    if out is not None:
+        _check_route_destination(out, x, w13, w2, topk_ids)
     if num_tokens == 0:
+        if out is not None:
+            return out.view(0, top_k, hidden_size)
         return torch.empty((0, top_k, hidden_size), dtype=x.dtype, device=x.device)
 
     expert_route_ids, expert_counts = _routing(topk_ids, num_experts, expert_start)
@@ -335,9 +369,13 @@ def _route_outputs(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
     # Invalid expert ids are absent from routing; zero their canonical rows.
-    route_output = torch.zeros(
-        (route_count, hidden_size), device=x.device, dtype=x.dtype
-    )
+    if out is None:
+        route_output = torch.zeros(
+            (route_count, hidden_size), device=x.device, dtype=x.dtype
+        )
+    else:
+        route_output = out.view(route_count, hidden_size)
+        route_output.zero_()
     if intermediate_size % 128 == 0 and _deep_pipeline(x.device, 16):
         # Cold B300: deep 16-row tiles win up to 32 routes (counted over every rank) per local expert.
         block_m = 16 if route_count <= 32 * num_experts else 64

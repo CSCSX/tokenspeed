@@ -1184,6 +1184,7 @@ class MuseSparkMoE(nn.Module):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                None,
             )
         if owned_rows:
             assert iris is not None and iris.can_use_owned_rows(num_tokens)
@@ -1201,6 +1202,8 @@ class MuseSparkMoE(nn.Module):
                 if reduced is not None:
                     return reduced
         if route_map is None:
+            # Write the sum straight into the prepared all-reduce input that
+            # the collective below acquires again, instead of copying it there.
             combined = routed_input_scale_rmsnorm_sum(
                 routes,
                 route_weights,
@@ -1208,6 +1211,13 @@ class MuseSparkMoE(nn.Module):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                (
+                    _acquire_all_reduce_output(
+                        (num_tokens, routes.shape[-1]), routes, self.ep_group
+                    )
+                    if current_platform().is_cdna4 and (owned_rows or self.ep_size > 1)
+                    else None
+                ),
             )
         else:
             if norm.weight is None:
@@ -1510,12 +1520,19 @@ class MuseSparkMoE(nn.Module):
                 owned_global_rows is not None,
             )
         else:
+            # Owned TP rows write routes straight into the Iris route input,
+            # so the route reduce-scatter skips its staging copy.
             routes = bf16_moe_routes(
                 compressed.contiguous(),
                 self.experts.w13_weight,
                 self.experts.w2_weight,
                 topk_ids.contiguous(),
                 self.expert_start,
+                out=(
+                    iris.tp_routes.acquire_input(compressed.shape[0])
+                    if owned_global_rows is not None and self.tp_size > 1
+                    else None
+                ),
             )
             combined = self._reduce_expert_routes(
                 routes=routes,
