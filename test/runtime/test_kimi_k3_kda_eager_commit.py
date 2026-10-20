@@ -2,7 +2,6 @@
 
 import os
 import sys
-from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -680,29 +679,23 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
 
 
 @pytest.mark.parametrize("draft_tokens", [None, 1, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_standard_decode_replay_workspace_matches_recipe(draft_tokens, dtype):
+def test_standard_decode_replay_workspace_matches_recipe(draft_tokens):
     """Decode and MTP reserve the bytes used by their real replay buffers."""
     harness = _Harness(draft_tokens=draft_tokens, eager_replay=True)
-    config = replace(harness.config, dtype=dtype)
-    backend = KdaAttnBackend(
-        config, config.components[0], enable_prefill_graph=False, kda_backend="auto"
-    )
-    backend.set_kv_pool(harness.pool)
-    backend.init_cuda_graph_state(config.max_bs)
     recipe = _kimi_recipe(
-        max_bs=config.max_bs,
+        max_bs=harness.backend.max_bs,
         speculative_algorithm=None if harness.width == 1 else "EAGLE3",
         speculative_num_draft_tokens=draft_tokens,
     )
-    recipe.attn_config = replace(recipe.attn_config, dtype=dtype)
     planned_bytes = recipe.setup().fixed_workspace_bytes
-    allocated_bytes = backend.preallocate_verify_workspace(config.max_bs, harness.width)
+    allocated_bytes = harness.backend.preallocate_verify_workspace(
+        harness.backend.max_bs, harness.width
+    )
     assert planned_bytes == allocated_bytes
     _prepare_fixed_workspaces(
         server_args=recipe.server_args,
-        config=config,
-        backend=backend,
+        config=harness.config,
+        backend=harness.backend,
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,

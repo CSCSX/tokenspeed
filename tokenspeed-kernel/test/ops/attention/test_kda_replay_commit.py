@@ -180,6 +180,8 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             (layers, n, (conv_dim + block_size - 1) // block_size)
         ](
             _batched_descriptor(xs),
+            xs[0]["qkv_raw"],
+            xs[0]["conv_pool"],
             torch.arange(layers, device=DEV, dtype=torch.int32),
             reads,
             writes,

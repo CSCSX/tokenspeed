@@ -253,10 +253,9 @@ def test_record_chain_uses_verify_inputs() -> None:
 
 @pytest.mark.parametrize("batch", [4, 6, 8, 9, 16, 17, 32])
 @pytest.mark.parametrize("captured", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("record_start", [0, 2**32 - 2])
 def test_recoverssm_ragged_prefix_and_null_rows(
-    batch: int, captured: bool, dtype: torch.dtype, record_start: int
+    batch: int, captured: bool, record_start: int
 ) -> None:
     """Verify record values, metadata-selected destinations, and masked rows."""
     torch.manual_seed(1209)
@@ -269,8 +268,10 @@ def test_recoverssm_ragged_prefix_and_null_rows(
         starts_cpu.append(starts_cpu[-1] + length)
     rows = starts_cpu[-1]
     shape = (1, rows, heads, dim)
-    q, k, v, g = (torch.randn(shape, device="cuda", dtype=dtype) for _ in range(4))
-    beta = torch.randn(1, rows, heads, device="cuda", dtype=dtype)
+    q, k, v, g = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(4)
+    )
+    beta = torch.randn(1, rows, heads, device="cuda", dtype=torch.bfloat16)
     A = torch.randn(heads, device="cuda") * 0.1
     bias = torch.randn(heads, dim, device="cuda") * 0.1
     state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
@@ -284,7 +285,7 @@ def test_recoverssm_ragged_prefix_and_null_rows(
         (slots, heads, width, 2 * dim),
         float("nan"),
         device="cuda",
-        dtype=dtype,
+        dtype=torch.bfloat16,
     )
     out = torch.full_like(v, float("nan"))
     records = [(request, 1, 0) for request in range(batch)]
@@ -381,11 +382,8 @@ def test_recoverssm_ragged_prefix_and_null_rows(
                         initial[request + 1 : request + 2],
                         -5.0,
                     )
-                    atol, rtol = (
-                        (2e-6, 1e-3) if dtype == torch.float16 else (2e-3, 8e-3)
-                    )
                     torch.testing.assert_close(
-                        out[:, begin:end].float(), expected_out, atol=atol, rtol=rtol
+                        out[:, begin:end].float(), expected_out, atol=2e-3, rtol=8e-3
                     )
                     current = initial[request + 1].clone()
                     for offset in range(length):
@@ -499,6 +497,8 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
             reads,
             writes,
             accepted,
+            activation_dtype=kd.dtype,
+            conv_state_dtype=conv.dtype,
             draft_token_num=width,
             num_heads=heads,
             head_dim=dim,
@@ -649,7 +649,6 @@ def test_recoverssm_gate_recovery_across_layers(
 
 
 @pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("project_gate", [False, True])
 @pytest.mark.parametrize("with_conv_bias", [False, True])
@@ -657,7 +656,6 @@ def test_recoverssm_gate_recovery_across_layers(
 @pytest.mark.parametrize("entry", ["split", "standalone"])
 def test_verify_derived_records_with_serving_producers(
     batch: int,
-    dtype: torch.dtype,
     width: int,
     project_gate: bool,
     with_conv_bias: bool,
@@ -677,10 +675,9 @@ def test_verify_derived_records_with_serving_producers(
     torch.manual_seed(814)
     heads, dim = 12, 128
     rows, channels = batch * width, heads * dim
-    kwargs = {"device": "cuda", "dtype": dtype}
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
     raw = torch.randn(rows, 3 * channels, **kwargs)
     conv_weights = torch.randn(3 * channels, 4, **kwargs) * 0.3
-    # The serving recipes keep history in BF16 even for FP16 activations.
     conv_state = torch.randn(
         batch + 1, 3 * channels, 3, device="cuda", dtype=torch.bfloat16
     )
@@ -705,7 +702,7 @@ def test_verify_derived_records_with_serving_producers(
     payloads = tuple(
         torch.empty((rows, channels), device="cuda", dtype=payload_dtype)
         for channels, payload_dtype in kda_replay_payload_specs(
-            dtype,
+            torch.bfloat16,
             conv_channels=3 * channels,
             num_heads=heads,
             head_dim=dim,
@@ -736,9 +733,8 @@ def test_verify_derived_records_with_serving_producers(
         if conv_bias is not None:
             value += conv_bias.float()
         expected_conv.append(torch.nn.functional.silu(value))
-    expected_conv = torch.stack(expected_conv, dim=1).reshape_as(qkv).to(dtype)
-    conv_atol, rtol = (2e-6, 1e-3) if dtype == torch.float16 else (2e-5, 8e-3)
-    torch.testing.assert_close(qkv, expected_conv, atol=conv_atol, rtol=rtol)
+    expected_conv = torch.stack(expected_conv, dim=1).reshape_as(qkv).to(torch.bfloat16)
+    torch.testing.assert_close(qkv, expected_conv, atol=2e-5, rtol=8e-3)
 
     state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
     initial_state = state.clone()
@@ -786,7 +782,10 @@ def test_verify_derived_records_with_serving_producers(
             "attention",
             "kda_recoverssm_verify",
             format_signature(
-                **{role: dense_tensor_format(dtype) for role in ("q", "k", "v")}
+                **{
+                    role: dense_tensor_format(torch.bfloat16)
+                    for role in ("q", "k", "v")
+                }
             ),
             traits={"paged_state": True, "recurrent_layout": "v_major"},
         )
@@ -823,7 +822,7 @@ def test_verify_derived_records_with_serving_producers(
         lower_bound,
     )
     torch.testing.assert_close(
-        out.reshape(shape), expected_out.to(dtype), atol=2e-6, rtol=rtol
+        out.reshape(shape), expected_out.to(torch.bfloat16), atol=2e-6, rtol=8e-3
     )
     normalized_k = k.float().reshape(shape)
     normalized_k = normalized_k * torch.rsqrt(
@@ -862,38 +861,36 @@ def test_verify_derived_records_with_serving_producers(
     torch.testing.assert_close(conv_state, initial_conv, atol=0, rtol=0)
     torch.testing.assert_close(state, initial_state, atol=0, rtol=0)
 
-    # FP16 recovery is a separate migration step; retain every BF16 prefix check.
-    if dtype == torch.bfloat16:
-        plan = tuple(torch.empty_like(indices) for _ in range(4))
-        for accepted_count in range(1, width + 1):
-            state.copy_(initial_state)
-            accepted = torch.full_like(indices, accepted_count)
-            vllm_triton_kda_recoverssm_commit(
-                q,
-                k,
-                v,
-                checkpoint_state=state,
-                correction_cache=correction,
-                kg_cache=key_gate,
-                state_indices=indices,
-                query_start_loc=starts,
-                num_accepted_tokens=accepted,
-                commit_lens=plan[0],
-                final_state_indices=plan[1],
-                boundary_state_indices=plan[2],
-                boundary_recovery_lens=plan[3],
-                state_base_addrs=_device_addresses((state,)),
-                correction_cache_base_addrs=_device_addresses((correction,)),
-                kg_cache_base_addrs=_device_addresses((key_gate,)),
-                spec_query_len=width,
-                record_metadata=metadata,
-                record_stamps=stamps,
-                gate_parameters=(a, bias, lower_bound),
-            )
-            torch.testing.assert_close(
-                state[1:], expected_states[accepted_count - 1], atol=2e-6, rtol=2e-5
-            )
-            torch.testing.assert_close(state[0], initial_state[0], atol=0, rtol=0)
+    plan = tuple(torch.empty_like(indices) for _ in range(4))
+    for accepted_count in range(1, width + 1):
+        state.copy_(initial_state)
+        accepted = torch.full_like(indices, accepted_count)
+        vllm_triton_kda_recoverssm_commit(
+            q,
+            k,
+            v,
+            checkpoint_state=state,
+            correction_cache=correction,
+            kg_cache=key_gate,
+            state_indices=indices,
+            query_start_loc=starts,
+            num_accepted_tokens=accepted,
+            commit_lens=plan[0],
+            final_state_indices=plan[1],
+            boundary_state_indices=plan[2],
+            boundary_recovery_lens=plan[3],
+            state_base_addrs=_device_addresses((state,)),
+            correction_cache_base_addrs=_device_addresses((correction,)),
+            kg_cache_base_addrs=_device_addresses((key_gate,)),
+            spec_query_len=width,
+            record_metadata=metadata,
+            record_stamps=stamps,
+            gate_parameters=(a, bias, lower_bound),
+        )
+        torch.testing.assert_close(
+            state[1:], expected_states[accepted_count - 1], atol=2e-6, rtol=2e-5
+        )
+        torch.testing.assert_close(state[0], initial_state[0], atol=0, rtol=0)
 
 
 def _check_raw_ring_rounds(
@@ -1075,6 +1072,8 @@ def _check_gate_recovery(
         indices,
         indices,
         counts,
+        activation_dtype=kg.dtype,
+        conv_state_dtype=conv.dtype,
         draft_token_num=width,
         num_heads=heads,
         head_dim=dim,

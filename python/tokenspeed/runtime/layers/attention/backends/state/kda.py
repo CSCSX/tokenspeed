@@ -609,6 +609,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         assert self._replay_record_metadata is not None
                         assert self._replay_record_stamps is not None
                         record_args = {
+                            "activation_dtype": first_beta.dtype,
+                            "conv_state_dtype": first_conv.dtype,
                             "record_metadata": self._replay_record_metadata[
                                 : accepted_length.shape[0]
                             ],
@@ -1139,6 +1141,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     gate_stride=gate.stride(0),
                     conv_width=conv_w.shape[1],
                     lower_bound=lower_bound,
+                    activation_dtype=key_gate.dtype,
+                    conv_state_dtype=conv.dtype,
                     record_metadata=self._replay_record_metadata[:bs],
                     record_stamps=self._replay_record_stamps[row : row + 1],
                 )

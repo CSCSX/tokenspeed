@@ -750,15 +750,15 @@ def resolve_kda_batched_replay_commit(
 ):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
-    Batched kernels dereference descriptor addresses as BF16, so other dtypes
-    use the per-layer commit.
+    NVIDIA records recovery accepts BF16 and FP16 activations, with history
+    stored in the bound pool dtype. Other vendors use their registered dtypes.
 
     Args:
         dtype: Activation dtype used by the replay payload.
         num_heads: Local KDA head count, when known.
         head_dim: KDA head dimension, when known.
     """
-    if dtype is not torch.bfloat16:
+    if dtype not in (torch.bfloat16, torch.float16):
         return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)

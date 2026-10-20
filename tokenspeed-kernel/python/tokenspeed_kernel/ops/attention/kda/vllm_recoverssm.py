@@ -34,7 +34,6 @@ from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
     kda_recoverssm_verify,
 )
 
-_DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
@@ -133,7 +132,7 @@ def vllm_triton_kda_recoverssm_verify(
     name="vllm_triton_kda_recoverssm_commit",
     solution="vllm_triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
+    signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.REFERENCE,
     traits={
         "attention_only": frozenset({True}),
@@ -170,7 +169,9 @@ def vllm_triton_kda_recoverssm_commit(
     them. checkpoint_state uses [page, head, value, key]. correction_cache
     and kg_cache use [request, head, token, channel], with K then raw gate in
     the latter. The three base-address tables each contain this layer's
-    pool pointer. Tensor strides describe those pools.
+    pool pointer. Tensor strides describe those pools. K/raw-gate records
+    may be FP16 or BF16; their tensor dtype determines the pointer type.
+    Both recovery paths convert these loads to FP32 and consume FP32 U.
 
     state_indices selects live source/destination pages (> 0); non-positive
     pages are padding. query_start_loc gives each request's token boundaries.
@@ -309,6 +310,8 @@ def batched_recoverssm_commit(
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
     *,
+    activation_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
     draft_token_num: int,
     num_heads: int,
     head_dim: int,
@@ -337,11 +340,13 @@ def batched_recoverssm_commit(
     The shared state-page planner must clamp accepted_length to [0, draft_token_num] before this
     call. A zero count copies the source endpoint without reading records.
 
-    State pages use contiguous [head, value, key] FP32 values; conv pages
-    use contiguous [channel, conv_width - 1] BF16 values. U is FP32 and
-    K/raw_g is BF16. lower_bound selects the gate transform. Source and
-    destination pages may alias within a request, but
-    requests must not share writable pages.
+    State pages use contiguous [head, value, key] FP32 values. U is FP32;
+    activation_dtype gives the storage type of raw QKV and K/raw_g records.
+    conv_state_dtype gives the history storage type, independently of the
+    activation dtype, with conv layout [channel, conv_width - 1]. Accepted
+    raw values are converted to this type when updating the history.
+    lower_bound selects the gate transform. Source and destination pages may
+    alias within a request, but requests must not share writable pages.
 
     record_metadata is INT64 [batch, 3] (slot, generation, checkpoint position).
     record_stamps is INT64 [layers, slots, capacity, 2] (position, generation).
@@ -414,7 +419,7 @@ def batched_recoverssm_commit(
             )
     grid = lambda meta: (triton.cdiv(head_dim, meta["BV"]), batch, layers * num_heads)
     typed = torch.empty(0, dtype=torch.float32, device=descriptors.device)
-    key_typed = torch.empty(0, dtype=torch.bfloat16, device=descriptors.device)
+    activation_typed = torch.empty(0, dtype=activation_dtype, device=descriptors.device)
     _commit_kda_state_kernel[grid](
         typed,
         descriptors[:, 8],
@@ -422,7 +427,7 @@ def batched_recoverssm_commit(
         typed,
         descriptors[:, 3],
         capacity * correction_stride,
-        key_typed,
+        activation_typed,
         descriptors[:, 5],
         capacity * key_gate_stride,
         read_indices,
@@ -469,10 +474,13 @@ def batched_recoverssm_commit(
         sanitize_overflow=False,
         num_stages=2,
     )
+    conv_typed = torch.empty(0, dtype=conv_state_dtype, device=descriptors.device)
     batched_kda_commit_conv_window_kernel[
         layers, batch, triton.cdiv(3 * num_heads * head_dim, 128)
     ](
         descriptors,
+        activation_typed,
+        conv_typed,
         group_indices,
         read_indices,
         write_indices,

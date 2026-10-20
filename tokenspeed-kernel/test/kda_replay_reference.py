@@ -377,10 +377,13 @@ def batched_recurrent_kda_replay_commit(
     # stopped narrowing while the wins were still there.
     conv_dim = 3 * num_heads * head_dim
     conv_block = 128
+    typed = torch.empty(0, dtype=torch.bfloat16, device=addresses.device)
     batched_kda_commit_conv_window_kernel[
         (layers, batch, triton.cdiv(conv_dim, conv_block))
     ](
         addresses,
+        typed,
+        typed,
         group_indices,
         read_indices,
         write_indices,

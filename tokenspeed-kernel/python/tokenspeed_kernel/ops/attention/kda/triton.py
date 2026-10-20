@@ -22,8 +22,6 @@ from tokenspeed_kernel.signature import format_signatures
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
-# Batched recovery still dereferences descriptor addresses as BF16.
-_DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
 
 def kda_recurrent_decode_mtp(
@@ -596,7 +594,7 @@ def triton_nvidia_kda_replay_commit(
     name="triton_nvidia_kda_batched_replay_commit",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
+    signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
         "batched_layers": frozenset({True}),
@@ -611,6 +609,8 @@ def triton_nvidia_kda_batched_replay_commit(
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
+    activation_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
     draft_token_num: int,
     num_heads: int,
     head_dim: int,
@@ -626,7 +626,7 @@ def triton_nvidia_kda_batched_replay_commit(
     record_metadata: torch.Tensor,
     record_stamps: torch.Tensor,
 ) -> None:
-    """Recover every KDA layer from FP32 U and BF16 K/raw-gate records.
+    """Recover every KDA layer from FP32 U and saved K/raw-gate records.
 
     Args:
         descriptors: Device pointers for every layer's inputs, weights, and state.
@@ -634,6 +634,8 @@ def triton_nvidia_kda_batched_replay_commit(
         read_indices: Source page indices, shaped ``[groups, batch]``.
         write_indices: Destination page indices, shaped ``[groups, batch]``.
         accepted_length: Accepted draft-token count for each request.
+        activation_dtype: Storage dtype of raw QKV and saved K/raw-gate records.
+        conv_state_dtype: Storage dtype of the bound convolution history pool.
         draft_token_num: Maximum number of draft tokens in the replay window.
         num_heads: Number of local KDA value heads.
         head_dim: Per-head key and value dimension.
@@ -641,7 +643,7 @@ def triton_nvidia_kda_batched_replay_commit(
         qkv_stride: Token stride of the packed QKV payload.
         conv_stride: Page stride of the convolution state.
         f_a_stride: Token stride of the FP32 correction payload.
-        beta_stride: Token stride of BF16 unnormalized key/raw-gate records.
+        beta_stride: Token stride of unnormalized key/raw-gate records.
         state_stride: Page stride of the recurrent state.
         gate_stride: Shared adapter field; no gate scratch is read here.
         conv_width: Width of the depthwise convolution kernel.
@@ -664,6 +666,8 @@ def triton_nvidia_kda_batched_replay_commit(
         read_indices,
         write_indices,
         accepted_length,
+        activation_dtype=activation_dtype,
+        conv_state_dtype=conv_state_dtype,
         draft_token_num=draft_token_num,
         num_heads=num_heads,
         head_dim=head_dim,

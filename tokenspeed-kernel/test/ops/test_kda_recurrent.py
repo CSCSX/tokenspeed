@@ -589,7 +589,7 @@ def test_kda_verify_conv_update_resolves_registered_producer(monkeypatch) -> Non
     "dtype,expected",
     [
         (torch.bfloat16, "triton_nvidia_kda_fused_paged_verify_split"),
-        (torch.float16, "triton_nvidia_kda_fused_paged_verify_no_store"),
+        (torch.float16, "triton_nvidia_kda_fused_paged_verify_split"),
     ],
 )
 def test_no_store_verify_resolves_by_priority_not_by_the_caller(
@@ -597,9 +597,8 @@ def test_no_store_verify_resolves_by_priority_not_by_the_caller(
 ) -> None:
     """Callers ask for store_states only; the registry picks the producers.
 
-    The split variant outranks its inline-producer twin, so bf16 gets it
-    without naming it, and fp16 -- which the split producer cannot read --
-    falls back instead of losing the fused verify altogether.
+    The split variant supports BF16 and FP16 and outranks the inline producer,
+    so both dtypes select it without naming the kernel.
     """
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -709,9 +708,8 @@ def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> N
 
     Every runtime replay test skips itself when this probe flips False, so
     this is the one that fails when a replay registration vanishes, a trait
-    is renamed, or the probe drifts from what the backend selects. fp16 has
-    no split producer (it dereferences bf16), so it resolves to the
-    inline-producer twin instead.
+    is renamed, or the probe drifts from what the backend selects. Both
+    BF16 and FP16 use the split producer and records recovery.
     """
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -760,7 +758,12 @@ def test_batched_replay_call_contract() -> None:
         conv_width=4,
         lower_bound=-5.0,
         **(
-            {"record_metadata": tensor, "record_stamps": tensor}
+            {
+                "activation_dtype": torch.bfloat16,
+                "conv_state_dtype": torch.bfloat16,
+                "record_metadata": tensor,
+                "record_stamps": tensor,
+            }
             if "record_metadata" in parameters
             else {}
         ),

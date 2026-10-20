@@ -2104,6 +2104,8 @@ def _gate_tiling_dot(rows: int, head_dim: int):
 @triton.jit
 def batched_kda_commit_conv_window_kernel(
     addresses,
+    qkv_ref,
+    conv_ref,
     group_indices,
     read_indices,
     write_indices,
@@ -2115,11 +2117,16 @@ def batched_kda_commit_conv_window_kernel(
     CONV_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Publish convolution windows after every recurrent program has read."""
+    """Publish convolution windows after every recurrent program has read.
+
+    qkv_ref and conv_ref provide only the raw-QKV and history storage types.
+    """
     i_l, i_n, i_cb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     ab = i_l * 10
-    qkv = tl.load(addresses + ab).to(tl.pointer_type(tl.bfloat16))
-    conv_pool = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
+    qkv = tl.load(addresses + ab).to(tl.pointer_type(qkv_ref.dtype.element_ty))
+    conv_pool = tl.load(addresses + ab + 2).to(
+        tl.pointer_type(conv_ref.dtype.element_ty)
+    )
     group = tl.load(group_indices + i_l).to(tl.int64)
     read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
     write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
@@ -2137,7 +2144,8 @@ def batched_kda_commit_conv_window_kernel(
             mask=mask,
             other=0.0,
         )
-        s0, s1, s2 = s1, s2, x
+        # Keep loop-carried history in the cache storage dtype.
+        s0, s1, s2 = s1, s2, x.to(conv_pool.dtype.element_ty)
     dst = conv_pool + write_page * STRIDE_CONV + offsets * 3
     tl.store(dst, s0, mask=mask & (write_page >= 0))
     tl.store(dst + 1, s1, mask=mask & (write_page >= 0))
@@ -2196,7 +2204,8 @@ def kda_commit_conv_window_kernel(
         x = tl.load(
             qkv_raw + (base + i_t) * stride_raw_tok + offsets, mask=mask, other=0.0
         )
-        s0, s1, s2 = s1, s2, x
+        # Keep loop-carried history in the cache storage dtype.
+        s0, s1, s2 = s1, s2, x.to(conv_pool.dtype.element_ty)
 
     dst = conv_out + b_write * stride_conv_out_page + offsets * 3
     tl.store(dst + 0, s0, mask=mask)
@@ -2219,6 +2228,7 @@ def kda_commit_conv_window(
 
     Args:
         qkv_raw: ``[N*T, 3*P]`` pre-conv packed q|k|v, request-major.
+            Accepted values are converted to the history storage dtype.
         conv_pool: ``[pages, 3*P, 3]`` committed conv window (read).
         conv_out: destination slab; may be ``conv_pool`` itself.
         read_indices: ``[N]`` committed page per request (-1 = fresh).
