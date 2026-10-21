@@ -278,7 +278,11 @@ null, so the first decode reads the landed state). When the decode role's
 own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
-and both sides omit the group from the manifest (`pd/cache_protocol.py`).
+and both sides omit the group from the manifest (`pd/cache_protocol.py`). The
+admission copies that immutable input checkpoint into the request's private
+live slot. This supplies the same prompt-end state as a remote landing even
+if the bootstrap token finishes the request before any decode forward runs;
+publication and checkpoint preparation can therefore still use the live slot.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
@@ -2035,3 +2039,14 @@ KVStore disabled, using the target router directly. Local offloaded prefill
 and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
 use the same batch, access, and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
+
+
+### KDA convolution field orientation
+
+`conv_state` stores convolution history as `[channel, history]` within a
+page. `conv_state_channels_last` stores `[history, channel]`; the field name
+makes its PD partition axis explicit (0 and 1 respectively). Both schemas
+partition Q, K and V channel segments independently when P and D use different
+TP sizes. The hybrid KDA pool exposes either layout as the same logical
+`[page, channel, history]` compute view, using a transpose for channels-last
+storage without copying the checkpoint. A layer cannot declare both fields.
