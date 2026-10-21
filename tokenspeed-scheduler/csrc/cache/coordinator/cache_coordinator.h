@@ -37,6 +37,7 @@
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/tail_table.h"
+#include "cache/prefix/checkpoint_tree.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -448,6 +449,15 @@ public:
     // per-prior cap has dropped.
     std::size_t NumTailEntries() const { return tails_.Size(); }
     std::int64_t TailCapEvictions() const { return tails_.CapEvictions(); }
+    struct RetentionStats {
+        std::uint64_t device_demoted_victims;
+        std::uint64_t host_demoted_victims;
+        std::size_t checkpoint_nodes;
+        std::size_t prefix_segments;
+    };
+    RetentionStats CheckpointRetentionStats() const {
+        return {device_demoted_victims_, host_demoted_victims_, checkpoints_.Size(), checkpoints_.PrefixSegments()};
+    }
     // Group blocks a tail entry holds in group i: every block of the page
     // below T, the last one partial unless T is a multiple of the block span.
     std::int32_t TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const;
@@ -577,8 +587,10 @@ private:
                                             std::uint64_t access_epoch);
     // Records a published tail in the tail table and evicts the tail the
     // per-prior cap dropped.
-    void recordPublishedTail(const CompletedPages& completed);
+    void recordPublication(const CompletedPages& completed);
     void recordTail(const ContentHash& prior, const TailPublication& tail);
+    bool checkpointComplete(const BlockPool& pool, const ContentHash& hash) const;
+    bool checkpointPresent(const ContentHash& hash) const;
     // Evicts every group's Device entries under a tail hash: a tail's blocks
     // are usable only together, so they leave together.
     void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens);
@@ -586,7 +598,7 @@ private:
     // Device eviction of one entry without the tail cascade; the cascade
     // calls it for the companions of the block that left.
     bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location);
-    bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location, bool demoted);
     std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
     // Drops a tail hash from the tail table once no tier holds an entry for it.
     void pruneTailIfUnreferenced(const ContentHash& hash);
@@ -617,6 +629,9 @@ private:
     std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     TailTable tails_;
+    CheckpointTree checkpoints_;
+    std::uint64_t device_demoted_victims_{0};
+    std::uint64_t host_demoted_victims_{0};
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
 };

@@ -618,6 +618,18 @@ Perception rules per directory:
   (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
   candidate boundaries inside a page; eviction of a tail's block removes its
   entry.
+* **`CheckpointTree`** (`checkpoint_tree.h`) — the ancestry of natural state
+  checkpoints, observed only at publication. It uses chained prefix hashes and
+  token prefixes, never client branch identifiers. A checkpoint is demoted only
+  while two complete descendant checkpoint sets remain in the same tier along
+  one observed continuation chain. Forks stop that walk. Metadata for vanished
+  boundaries is pruned; unary paths are compressed while preserving any forgotten
+  fork as a barrier. Metadata contains no owning cache references and cannot pin
+  storage. Immutable hashed prefix segments are shared across checkpoint
+  paths and reference-counted independently of physical cache blocks. Metadata
+  scales with the union of indexed prefixes, not the sum of conversation turns.
+  An indexed checkpoint stores its last full segment and a partial tail; binary
+  ancestor links support prefix comparisons without copying whole prompts.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -964,12 +976,32 @@ must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
 empty parents fit with zero eviction; otherwise select eviction candidates
 until the plan fits. Request-reclaimable candidates are collected and sorted
-once; each cache group loads and sorts one epoch of eligible candidates at a
+once; each history group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
-request reclaim. Selection compares the next candidate from each group with
-the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+request reclaim. State groups consider all eligible checkpoints because a newer
+checkpoint can have lower retention priority than an older one. Selection
+compares the next candidate from each group with
+the next request-reclaimable candidate using one policy: uncached request-only
+blocks first, then state checkpoints demoted by the two-descendant rule, then
+ordinary cached entries. Within each class it compares LRU access epoch, then
+boundary tier (probationary → established → suffix of a closed prefix).
+Fork history follows surviving prefix ancestry, including when an evicted
+branch shares an earlier fork with a surviving sibling. Fork positions beyond
+every retained checkpoint prefix are discarded with that ancestry.
+State candidates are reordered when a planned victim removes a descendant;
+proposed victims do not count as resident replacements. Demotion decisions are
+cached between checkpoint-residency changes rather than recomputed in sorting
+comparators. The rule is an eviction-time preference, not a reservation: a
+subsequent allocation may also evict the retained descendants. Complete means
+all State groups at that checkpoint; ordinary hybrid prefix matching still
+requires the associated history coverage and remains the authority on reuse.
+Current-prefix claims and pins remain protected. Host replacement uses the same checkpoint demotion
+and recency ordering, retaining its same-group-first allocation. Device hits
+refresh existing Host copies without pinning or allocating them; a lifetime
+`was_acquired` bit does not outweigh recency on Host. Successful flushes
+report demoted victim selections and ancestry metadata sizes for the preceding
+interval; Device and Host counters reset when their respective tier is cleared.
+Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
 

@@ -48,7 +48,8 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
       snapshot_pool_{snapshot_pool},
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
       enable_l3_storage_{enable_l3_storage && host_pool != nullptr},
-      prefix_granularity_{prefix_granularity} {
+      prefix_granularity_{prefix_granularity},
+      checkpoints_{prefix_granularity} {
     _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
     geometry_.reserve(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -149,6 +150,8 @@ bool CacheCoordinator::ClearDeviceCache() {
         evictCachedBlock(group_id, location);
         FatalCheck(!pool_.IsOccupied(location), "clearable Device cache entry disappeared");
     }
+    checkpoints_.Prune([&](const ContentHash& hash) { return checkpointPresent(hash); });
+    device_demoted_victims_ = 0;
     return true;
 }
 
@@ -179,6 +182,8 @@ bool CacheCoordinator::ClearCache() {
                 "clearable Host cache entry disappeared");
     }
     tails_.Clear();
+    checkpoints_.Clear();
+    host_demoted_victims_ = 0;
     return true;
 }
 
@@ -387,12 +392,24 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
             floor_tokens / (GroupIsState(i) ? prefix_granularity_ : geometry_[i].BlockGranularity());
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
+        if constexpr (Tier == CacheTier::kDevice) {
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchMatched(*host_pool_, group_keys[i], floor_pages, probe.per_group[i],
+                                                access_epoch);
+            }
+        }
         if (!probe.tail || probe.tail->group_keys[i].empty()) {
             continue;
         }
         // The tail's blocks follow the full pages in the same table.
         PrefixMatch tail_match = groups_[i].Index().AcquireMatched(pool, probe.tail->group_keys[i], /*begin_blocks=*/0,
                                                                    probe.tail->per_group[i], access_epoch);
+        if constexpr (Tier == CacheTier::kDevice) {
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchMatched(*host_pool_, probe.tail->group_keys[i], 0, probe.tail->per_group[i],
+                                                access_epoch);
+            }
+        }
         out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                        std::make_move_iterator(tail_match.blocks.begin()),
                                        std::make_move_iterator(tail_match.blocks.end()));
@@ -806,6 +823,10 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             PrefixMatch match = groups_[i].Index().AcquireMatched(
                 pool_, probe.state_at_prompt_end->group_keys[i],
                 /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i], access_epoch);
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchMatched(*host_pool_, probe.state_at_prompt_end->group_keys[i], 0,
+                                                probe.state_at_prompt_end->per_group[i], access_epoch);
+            }
             out.state_at_prompt_end[i] = std::move(match.blocks.front());
         }
     }
@@ -978,7 +999,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         cacheDeviceCompletedBlocksForGroup(i, tables[i], *progress.completed_pages, access_epoch);
     }
-    recordPublishedTail(*progress.completed_pages);
+    recordPublication(*progress.completed_pages);
 }
 
 template <CacheTier Tier>
@@ -1071,11 +1092,23 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         }
     }
 
-    // Retention value of one Host cache entry: keep what a request has already
-    // proven useful, then the most recently accessed, then a stable tie-break.
-    const auto value = [](std::uint32_t candidate_group, CacheBlockLocation location,
-                          const PrefixCacheIndex::CachedBlockMetadata& metadata) {
-        return std::tuple{metadata.was_acquired, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
+    std::unordered_set<ContentHash> demoted;
+    std::uint64_t host_priority_version = 0;
+    const auto refresh_demotions = [&] {
+        auto current =
+            checkpoints_.DemotedHashes([&](const ContentHash& hash) { return checkpointComplete(*host_pool_, hash); });
+        if (current != demoted) {
+            demoted = std::move(current);
+            ++host_priority_version;
+        }
+    };
+    if (std::ranges::any_of(unresolved_by_group, [](const auto& pending) { return !pending.empty(); })) {
+        refresh_demotions();
+    }
+    const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location,
+                           const PrefixCacheIndex::CachedBlockMetadata& metadata) {
+        const bool is_demoted = GroupIsState(candidate_group) && demoted.contains(metadata.content_hash);
+        return std::tuple{!is_demoted, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
                           location.slot_index};
     };
     const auto lookup_value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
@@ -1091,10 +1124,8 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             continue;
         }
         ++batch.stats.same_group_scans;
-        // Host retention ranks was_acquired before epoch, unlike the eviction
-        // index, so finding the best victims needs a full group scan; each
-        // unresolved block then evicts the least valuable entry in its own
-        // bucket, which is exactly the hole it needs.
+        // Checkpoint priority may change when another victim removes one of
+        // its descendants. Reevaluate State candidates for each allocation.
         std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
             groups_[group_id].Index().EvictableCandidates(*host_pool_);
         std::ranges::sort(local_victims, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
@@ -1104,12 +1135,34 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         std::vector<bool> consumed(local_victims.size(), false);
         std::erase_if(unresolved, [&](std::size_t index) {
             const std::int32_t bucket = buckets[index];
+            if (GroupIsState(group_id)) {
+                std::optional<std::size_t> selected;
+                for (std::size_t v = 0; v < local_victims.size(); ++v) {
+                    if (!consumed[v] && allocator.BucketOf(local_victims[v].location) == bucket &&
+                        (!selected ||
+                         value(group_id, local_victims[v].location, local_victims[v].metadata) <
+                             value(group_id, local_victims[*selected].location, local_victims[*selected].metadata))) {
+                        selected = v;
+                    }
+                }
+                if (!selected) {
+                    return false;
+                }
+                consumed[*selected] = true;
+                const bool complete = checkpointComplete(*host_pool_, local_victims[*selected].metadata.content_hash);
+                _assert(evictHostCachedBlock(group_id, local_victims[*selected].location,
+                                             demoted.contains(local_victims[*selected].metadata.content_hash)),
+                        "Host victim changed");
+                if (complete) refresh_demotions();
+                batch.blocks[index] = acquire_in_bucket(group_id, bucket);
+                return static_cast<bool>(batch.blocks[index]);
+            }
             for (std::size_t v = 0; v < local_victims.size(); ++v) {
                 if (consumed[v] || allocator.BucketOf(local_victims[v].location) != bucket) {
                     continue;
                 }
                 consumed[v] = true;
-                _assert(evictHostCachedBlock(group_id, local_victims[v].location),
+                _assert(evictHostCachedBlock(group_id, local_victims[v].location, false),
                         "selected Host child is not evictable");
                 batch.blocks[index] = acquire_in_bucket(group_id, bucket);
                 _assert(static_cast<bool>(batch.blocks[index]), "evicting a Host child did not free its bucket");
@@ -1146,6 +1199,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         std::ranges::sort(victim_parents);
 
         std::size_t victim_index = 0;
+        std::uint64_t parent_priority_version = host_priority_version;
         for (std::size_t result_index = 0; result_index < group_ids.size() && victim_index < victim_parents.size();
              ++result_index) {
             if (batch.blocks[result_index]) {
@@ -1154,6 +1208,31 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             const std::uint32_t target_group = group_ids[result_index];
             std::vector<std::size_t>& unresolved = unresolved_by_group[target_group];
             while (!unresolved.empty() && victim_index < victim_parents.size()) {
+                // A previously selected parent may have removed a descendant
+                // checkpoint, changing the remaining parents' retention value.
+                if (parent_priority_version != host_priority_version) {
+                    for (std::size_t v = victim_index; v < victim_parents.size(); ++v) {
+                        const auto parent = victim_parents[v].second;
+                        const auto group = host_pool_->BoundGroup(parent);
+                        if (!group || !GroupIsState(*group)) {
+                            continue;
+                        }
+                        std::optional<HostCacheValue> current_value;
+                        for (std::int32_t slot = 0; slot < groups_[*group].Allocator().CacheBlocksPerLcmBlock();
+                             ++slot) {
+                            const CacheBlockLocation location{.lcm_block_id = parent, .slot_index = slot};
+                            if (host_pool_->IsOccupied(location)) {
+                                const auto child_value = lookup_value(*group, location);
+                                current_value = current_value ? std::max(*current_value, child_value) : child_value;
+                            }
+                        }
+                        if (current_value) {
+                            victim_parents[v].first = *current_value;
+                        }
+                    }
+                    std::sort(victim_parents.begin() + victim_index, victim_parents.end());
+                    parent_priority_version = host_priority_version;
+                }
                 const std::int32_t victim_parent = victim_parents[victim_index++].second;
                 const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(victim_parent);
                 if (!bound_group ||
@@ -1165,10 +1244,13 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
                     const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
                     if (host_pool_->IsOccupied(location)) {
-                        _assert(evictHostCachedBlock(*bound_group, location),
+                        _assert(evictHostCachedBlock(
+                                    *bound_group, location,
+                                    GroupIsState(*bound_group) && !std::get<0>(lookup_value(*bound_group, location))),
                                 "selected Host parent changed before eviction");
                     }
                 }
+                if (GroupIsState(*bound_group)) refresh_demotions();
                 // The freed parent is the pool's only empty one, so each
                 // bucket may take its share of it; the rest stay unresolved.
                 const std::size_t before = unresolved.size();
@@ -1241,11 +1323,12 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     return true;
 }
 
-bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
+bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location, bool demoted) {
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(*host_pool_, location);
     if (!removed) {
         return false;
     }
+    if (demoted) ++host_demoted_victims_;
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
 }
@@ -1290,7 +1373,38 @@ void CacheCoordinator::pruneTailIfUnreferenced(const ContentHash& hash) {
     tails_.Remove(hash);
 }
 
-void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
+bool CacheCoordinator::checkpointComplete(const BlockPool& pool, const ContentHash& hash) const {
+    bool any = false;
+    for (const CacheGroup& group : groups_) {
+        if (group.Spec().attn_kind == AttnKind::kState) {
+            any = true;
+            if (!group.Index().Contains(pool, CacheKey{.group_id = group.Id(), .content_hash = hash})) {
+                return false;
+            }
+        }
+    }
+    return any;
+}
+
+bool CacheCoordinator::checkpointPresent(const ContentHash& hash) const {
+    for (const CacheGroup& group : groups_) {
+        if (group.Spec().attn_kind == AttnKind::kState) {
+            const CacheKey key{.group_id = group.Id(), .content_hash = hash};
+            if (group.Index().Contains(pool_, key) || (host_pool_ && group.Index().Contains(*host_pool_, key))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void CacheCoordinator::recordPublication(const CompletedPages& completed) {
+    if (completed.publish_state && std::ranges::any_of(groups_, [](const CacheGroup& group) {
+            return group.Spec().attn_kind == AttnKind::kState;
+        })) {
+        checkpoints_.Prune([&](const ContentHash& hash) { return checkpointPresent(hash); });
+        checkpoints_.Observe(completed);
+    }
     if (!completed.tail) {
         return;
     }
