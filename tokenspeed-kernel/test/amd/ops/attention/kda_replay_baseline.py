@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import sys
 from functools import cache
 from pathlib import Path
 
@@ -110,11 +112,20 @@ def check_original_gate_projection(projected, f_a, f_b):
 
 @cache
 def _original_module(source: Path, arch: str):
-    spec = importlib.util.spec_from_file_location(f"kda_original_{arch}", source)
+    source = source.resolve()
+    # Keep each immutable snapshot's JIT globals in a separate module.
+    identity = hashlib.sha256(str(source).encode()).hexdigest()
+    name = f"kda_original_{arch}_{identity}"
+    spec = importlib.util.spec_from_file_location(name, source)
     if spec is None or spec.loader is None:
         raise ValueError(f"Cannot load original AMD KDA source: {source}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]
+        raise
     return module
 
 
@@ -160,9 +171,9 @@ def prepare_records_verify(launcher, x, window, *, raw_gate, original_qkv, lower
 
 
 class RecordsKda:
-    """Bind accepted-parent gfx950 records wrappers to shared case buffers.
+    """Bind a reference snapshot's gfx950 records wrappers to shared case buffers.
 
-    Current and parent runners use these buffers sequentially. Reset state
+    Current and reference runners use these buffers sequentially. Reset state
     outside the timed interval; each lifecycle regenerates its own records.
     """
 

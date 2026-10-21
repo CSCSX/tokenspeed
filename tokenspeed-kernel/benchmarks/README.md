@@ -32,15 +32,17 @@ The unit tests use three independent layers and cache groups; the timing
 command checks every requested layer before measuring.
 
 Run the matrix from the repository root in a prepared AMD kernel environment.
-The two source revisions must be available in the local Git checkout:
+The three source revisions must be available in the local Git checkout:
 
 ```bash
 export PYTHONPATH="$PWD/tokenspeed-kernel/test:$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-amd/python${PYTHONPATH:+:$PYTHONPATH}"
 baseline_revision=3461560d467a76401ce3cb3d72742fccb05dd591
 accepted_parent_revision=d84269c5a222c2dcfb46c333c84b4967bd892a7a
+trial_reference_revision=668d50a198d005a9b39bf4837968437d902f880b
 source_path=tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py
 git show "$baseline_revision:$source_path" > /tmp/original-kda.py
 git show "$accepted_parent_revision:$source_path" > /tmp/accepted-parent-kda.py
+git show "$trial_reference_revision:$source_path" > /tmp/trial-reference-kda.py
 python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
   --concurrency 1 2 4 8 16 32 64 128 \
   --window-lengths 1 4 \
@@ -53,6 +55,8 @@ python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py 
   --baseline-revision "$baseline_revision" \
   --accepted-parent-source /tmp/accepted-parent-kda.py \
   --accepted-parent-revision "$accepted_parent_revision" \
+  --trial-reference-source /tmp/trial-reference-kda.py \
+  --trial-reference-revision "$trial_reference_revision" \
   --output /tmp/kda-replay-matrix.json
 ```
 
@@ -62,6 +66,11 @@ records verify and QKV retention, then one batched commit. The immutable
 original uses fused decode at T1, and gate GEMM, capture verify and raw-gate
 replay at T4. On gfx1250, T1 also includes gate GEMM. These directly measured
 totals determine performance acceptance.
+
+GFX950 also pairs the full lifecycle with an accepted parent and a separate
+trial reference. Each source has its own module, revision, SHA256 and labeled
+regression count. The fixed trial revision isolates the current optimization;
+it does not replace the immutable original or accepted-parent baseline.
 
 The separate one-layer verify timing includes gate production for the candidate
 but excludes it for the original, so it has no speedup ratio. Commit timing

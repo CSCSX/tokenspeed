@@ -1002,7 +1002,7 @@ def gluon_kda_fused_replay_gfx950(
 
     read_page_offset = read_idx.to(gl.int64)
     read_base = read_page_offset * state_stride + head_idx * D * D
-    panel_rows: gl.constexpr = 64 if T == 1 and BOUNDED else 16
+    panel_rows: gl.constexpr = 128 if T == 1 and BOUNDED else 16
     panel_count: gl.constexpr = D // panel_rows
     panel_value_offsets = gl.arange(0, panel_rows, layout=value_layout)
     _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
@@ -1074,7 +1074,7 @@ def gluon_kda_fused_replay_gfx950(
         k_values += (k_value,)
         decay_values += (decay,)
 
-    # Bounded T1 uses two wide panels. Other windows retain their load pipeline.
+    # Bounded T1 uses one state panel. Other windows retain their load pipeline.
     pipeline_depth: gl.constexpr = 2 if T == 1 and not BOUNDED else 1
     for prefetch_idx in gl.static_range(1, pipeline_depth):
         prefetch_offsets = (

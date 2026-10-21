@@ -26,6 +26,10 @@ perf:
     accepted_parent_source=.ci-artifacts/accepted-parent-kda-gfx950.py
     git fetch --no-tags --depth=1 origin "$accepted_parent_revision"
     git show "$accepted_parent_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py" > "$accepted_parent_source"
+    trial_reference_revision=668d50a198d005a9b39bf4837968437d902f880b
+    trial_reference_source=.ci-artifacts/trial-reference-kda-gfx950.py
+    git fetch --no-tags --depth=1 origin "$trial_reference_revision"
+    git show "$trial_reference_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py" > "$trial_reference_source"
     export TOKENSPEED_KDA_BASELINE_DIR="$PWD/.ci-artifacts"
     python3 -m pytest -q --confcutdir=tokenspeed-kernel/test/amd/ops/attention \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_ignores_rejected_records \
@@ -47,6 +51,8 @@ perf:
         --baseline-source "$baseline_source" \
         --accepted-parent-source "$accepted_parent_source" \
         --accepted-parent-revision "$accepted_parent_revision" \
+        --trial-reference-source "$trial_reference_source" \
+        --trial-reference-revision "$trial_reference_revision" \
         --output ".ci-artifacts/published/kda-replay-matrix-$page_relation.json"
     done
 

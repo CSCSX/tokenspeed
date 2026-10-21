@@ -319,12 +319,15 @@ def test_gate_reference_accepts_valid_fp32_cancellation_orders():
 @pytest.mark.parametrize(
     ("batch", "window"), [(1, 1), (4, 1), (8, 1), (17, 1), (17, 4)]
 )
-def test_kda_accepted_parent_lifecycle_launches_compile(monkeypatch, batch, window):
+def test_kda_reference_lifecycles_launches_compile(monkeypatch, batch, window):
     directory = os.environ.get("TOKENSPEED_KDA_BASELINE_DIR")
     if directory is None:
-        pytest.skip("requires the accepted-parent source snapshot")
+        pytest.skip("requires the accepted-parent and trial-reference snapshots")
     parent = _original_module(
         Path(directory) / "accepted-parent-kda-gfx950.py", "gfx950"
+    )
+    trial = _original_module(
+        Path(directory) / "trial-reference-kda-gfx950.py", "gfx950"
     )
     current = importlib.import_module(
         "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
@@ -359,7 +362,7 @@ def test_kda_accepted_parent_lifecycle_launches_compile(monkeypatch, batch, wind
         dtype=torch.uint64,
     )
     raw_gate = torch.empty(batch * window, heads * dim, dtype=torch.bfloat16)
-    for module in (current, parent):
+    for module in (current, parent, trial):
         for kernel in (
             module.gluon_kda_fused_paged_verify_nostore_vmajor_gfx950,
             module.gluon_kda_fused_replay_gfx950,

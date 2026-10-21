@@ -680,7 +680,8 @@ def test_inline_gate_matches_supplied_gate(graph):
 
 @pytest.mark.skipif(not current_platform().is_cdna4, reason="requires AMD gfx950")
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
-def test_one_token_recovery_preserves_decay(lower_bound):
+@pytest.mark.parametrize("in_place", [False, True])
+def test_one_token_recovery_preserves_decay(lower_bound, in_place):
     source_dir = os.environ.get("TOKENSPEED_KDA_BASELINE_DIR")
     if source_dir is None:
         pytest.skip("set TOKENSPEED_KDA_BASELINE_DIR to the accepted-parent source")
@@ -690,16 +691,21 @@ def test_one_token_recovery_preserves_decay(lower_bound):
     current = importlib.import_module(
         "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
     )
-    case = ReplayCase(3, 1, 2, in_place=True, seed=8940)
+    case = ReplayCase(3, 1, 2, in_place=in_place, seed=8940)
     case.accepted.copy_(torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32))
     sweep = torch.linspace(-80, 80, _HEADS * K, device="cuda")
     sweep[:7] = torch.tensor([-1e-2, -1e-4, -1e-6, 0, 1e-6, 1e-4, 1e-2], device="cuda")
     raw_gate = sweep.repeat(case.batch, 1).to(torch.bfloat16)
+    correction = torch.arange(1, K + 1, device="cuda", dtype=torch.float32) / K
+    pages = case.layers[0]["h_pool"].shape[0]
+    page_scale = 1 + torch.arange(pages, device="cuda", dtype=torch.float32) / pages
+    checkpoint = page_scale[:, None, None, None] * correction[None, None, :, None]
     for layer, x in enumerate(case.layers):
-        # K = U = 0 and checkpoint = 1 make one accepted update equal decay.
+        # Zero convolution gives K = U = 0 during verify. Distinct page/row
+        # values expose recovery indexing errors and stay close to the update.
         x["conv_w"].zero_()
-        x["h_pool"].fill_(1)
-        case.originals[layer][1].fill_(1)
+        x["h_pool"].copy_(checkpoint.expand_as(x["h_pool"]))
+        case.originals[layer][1].copy_(x["h_pool"])
         x["correction"].fill_(float("nan"))
         x["key_gate"].fill_(float("nan"))
         x["stamps"].fill_(-1)
@@ -727,7 +733,6 @@ def test_one_token_recovery_preserves_decay(lower_bound):
         )
 
     # Distinct U rows test value indexing while 127 columns still isolate decay.
-    correction = torch.arange(1, K + 1, device="cuda", dtype=torch.float32) / K
     key = torch.zeros(K, device="cuda", dtype=torch.bfloat16)
     key[-1] = 1
     for x in case.layers:
@@ -772,16 +777,32 @@ def test_one_token_recovery_preserves_decay(lower_bound):
         ).exp()
         writes = x["write_indices"].long()
         reference = case.originals[layer][1].clone()
+        checkpoints = reference[x["read_indices"].long()]
+        # Non-unit checkpoints introduce a rounded decay product; retain the
+        # independent numerical tolerance and exact parent comparison below.
         reference[writes] = torch.where(
             (case.accepted > 0)[:, None, None, None],
-            decay[:, :, None, :] + update[None, None, :, :],
-            1.0,
+            checkpoints * decay[:, :, None, :] + update[None, None, :, :],
+            checkpoints,
         )
-        assert bool((x["h_pool"][writes[case.accepted > 0]] != 1).any())
+        assert bool(
+            (
+                x["h_pool"][writes[case.accepted > 0]] != checkpoints[case.accepted > 0]
+            ).any()
+        )
         torch.testing.assert_close(x["h_pool"], reference, atol=1e-7, rtol=1e-5)
+        # For distinct destinations this also checks every source page exactly.
+        untouched = torch.ones(pages, dtype=torch.bool, device="cuda")
+        untouched[writes] = False
+        torch.testing.assert_close(
+            x["h_pool"][untouched],
+            case.originals[layer][1][untouched],
+            atol=0,
+            rtol=0,
+        )
         torch.testing.assert_close(
             x["h_pool"][writes[case.accepted == 0]],
-            reference[writes[case.accepted == 0]],
+            checkpoints[case.accepted == 0],
             atol=0,
             rtol=0,
         )
@@ -1106,19 +1127,21 @@ def _check_full_lifecycle_graph(case, runner):
     case.reset()
 
 
-def _measure_parent_lifecycle(timer, case, parent, measure_options):
+def _measure_records_lifecycle(
+    timer, case, reference, measure_options, *, reference_name
+):
     """Pair complete records lifecycles with equal work for all accepted counts."""
-    case.check(graph=True, runner=parent)
-    for runner in (case, parent):
+    case.check(graph=True, runner=reference)
+    for runner in (case, reference):
         _check_full_lifecycle_graph(case, runner)
     measured = _paired_measurements(
-        timer, case.lifecycle, parent.lifecycle, equivalent=True, **measure_options
+        timer, case.lifecycle, reference.lifecycle, equivalent=True, **measure_options
     )
-    measured["accepted_parent"] = measured.pop("original")
+    measured[reference_name] = measured.pop("original")
     measured["round_speedups"] = [
         accepted["median_us"] / candidate["median_us"]
         for accepted, candidate in zip(
-            measured["accepted_parent"]["rounds"],
+            measured[reference_name]["rounds"],
             measured["candidate"]["rounds"],
             strict=True,
         )
@@ -1178,6 +1201,8 @@ def main():
     parser.add_argument("--baseline-revision", required=True)
     parser.add_argument("--accepted-parent-source", type=Path, required=True)
     parser.add_argument("--accepted-parent-revision", required=True)
+    parser.add_argument("--trial-reference-source", type=Path, required=True)
+    parser.add_argument("--trial-reference-revision", required=True)
     parser.add_argument("--measurement-blocks", type=int, default=30)
     parser.add_argument("--paired-rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7100)
@@ -1260,6 +1285,16 @@ def main():
             "scope": "all layers on both sides: automatic gate production, records verify and QKV retention, then one batched commit; equal work for every acceptance pattern",
             "results": [],
         },
+        "trial_reference_lifecycle": {
+            "status": "running" if arch == "gfx950" else "not_run",
+            "reason": None if arch == "gfx950" else "gfx950-only comparison",
+            "revision": args.trial_reference_revision,
+            "source_sha256": hashlib.sha256(
+                args.trial_reference_source.read_bytes()
+            ).hexdigest(),
+            "scope": "all layers on both sides: automatic gate production, records verify and QKV retention, then one batched commit; equal work for every acceptance pattern",
+            "results": [],
+        },
         "results": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,9 +1332,9 @@ def main():
                     case.accepted,
                     t,
                 )
-                parent = (
-                    RecordsKda(
-                        _original_module(args.accepted_parent_source.resolve(), arch),
+                references = {
+                    name: RecordsKda(
+                        _original_module(source.resolve(), arch),
                         case.layers,
                         case.retained_qkv,
                         case.descriptors,
@@ -1311,9 +1346,12 @@ def main():
                         t,
                         lower_bound=LOWER_BOUND,
                     )
+                    for name, source in (
+                        ("accepted_parent", args.accepted_parent_source),
+                        ("trial_reference", args.trial_reference_source),
+                    )
                     if arch == "gfx950"
-                    else None
-                )
+                }
                 reference_gates = []
                 if arch == "gfx950" and t == 1:
                     for x in case.layers:
@@ -1429,23 +1467,28 @@ def main():
                         equivalent=all_positive and baseline_valid,
                         **measure_options,
                     )
-                    if parent is not None:
-                        parent_result = _measure_parent_lifecycle(
-                            timer, case, parent, measure_options
+                    for reference_name, reference in references.items():
+                        reference_result = _measure_records_lifecycle(
+                            timer,
+                            case,
+                            reference,
+                            measure_options,
+                            reference_name=reference_name,
                         )
-                        parent_result["accepted_length"] = name
-                        report["accepted_parent_lifecycle"]["results"].append(
-                            parent_result
+                        reference_result["accepted_length"] = name
+                        report[f"{reference_name}_lifecycle"]["results"].append(
+                            reference_result
                         )
-                        measured = parent_result["measurement"]
+                        measured = reference_result["measurement"]
                         print(
-                            f"PARENT C{batch} T{t} accepted={name} "
+                            f"{reference_name.upper()} C{batch} T{t} accepted={name} "
                             f"candidate_us={measured['candidate']['median_us']:.3f} "
-                            f"parent_us={measured['accepted_parent']['median_us']:.3f} "
+                            f"reference_us={measured[reference_name]['median_us']:.3f} "
                             f"speedup={measured['speedup']:.3f}x "
                             f"round_speedups={measured['round_speedups']}",
                             flush=True,
                         )
+                        del reference
                     report["results"].append(
                         {
                             "concurrency": batch,
@@ -1484,7 +1527,7 @@ def main():
                         f"baseline={original_correctness['status']}",
                         flush=True,
                     )
-                del original, parent, case
+                del original, references, case
     except Exception as error:
         report["status"] = "failed"
         report["error"] = f"{type(error).__name__}: {error}"
@@ -1495,6 +1538,7 @@ def main():
         report["accepted_parent_verify"]["status"] = "complete"
         report["accepted_parent_auto_verify"]["status"] = "complete"
         report["accepted_parent_lifecycle"]["status"] = "complete"
+        report["trial_reference_lifecycle"]["status"] = "complete"
     report["baseline_validation_failures"] = sum(
         row["original_correctness"]["status"] == "failed" for row in report["results"]
     )
@@ -1509,6 +1553,21 @@ def main():
         for row in report["results"]
         if row["lifecycle"]["speedup"] is not None and row["lifecycle"]["speedup"] < 1
     ]
+    report["lifecycle_regressions_reference"] = "original"
+    report["lifecycle_regression_count"] = len(report["lifecycle_regressions"])
+    for reference_name in ("accepted_parent", "trial_reference"):
+        section = report[f"{reference_name}_lifecycle"]
+        section["regressions"] = [
+            {
+                "concurrency": row["concurrency"],
+                "window_length": row["window_length"],
+                "accepted_length": row["accepted_length"],
+                "speedup": row["measurement"]["speedup"],
+            }
+            for row in section["results"]
+            if row["measurement"]["speedup"] < 1
+        ]
+        section["regression_count"] = len(section["regressions"])
     report.pop("active_case")
     publish()
     # Keep raw samples in the artifact; log only aggregates below the summary limit.
