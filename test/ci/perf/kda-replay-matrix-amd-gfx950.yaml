@@ -343,6 +343,7 @@ perf:
     import csv
     import hashlib
     import json
+    import math
     import os
     import re
     import signal
@@ -749,8 +750,157 @@ perf:
         return report
 
 
+    def counter_definitions(counter_text: str, names: tuple[str, ...]) -> dict:
+        """Keep exact inventory entries, including SDK block and dimension fields."""
+        matches = list(re.finditer(r"^Counter_Name[ \t]*:[ \t]*(\S+)[ \t]*$", counter_text, re.MULTILINE))
+        definitions = {name: [] for name in names}
+        for index, match in enumerate(matches):
+            name = match.group(1)
+            if name in definitions:
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(counter_text)
+                definitions[name].append(counter_text[match.start():end])
+        return definitions
+
+
+    def selected_recovery_sample(profile: dict, counter_names: tuple[str, ...]) -> dict:
+        """Join one counter sample to its own final recovery dispatch and graph."""
+        report = {"status": "unattributed", "reasons": [], "counter_rows": []}
+        try:
+            if profile["status"] != "collected_requires_review" or profile["reasons"]:
+                raise ValueError("profile did not complete with CSV output")
+            if any(profile["failure_evidence"].values()):
+                raise ValueError("profiler initialization failure evidence")
+            snapshots = [row for row in profile["guard_stages"] if row["stage"] == "after_workload"]
+            if len(snapshots) != 1:
+                raise ValueError("missing unique final SDK guard snapshot")
+            snapshot = snapshots[0]
+            if (
+                snapshot["returncode"] != 0 or snapshot["initialized"] != 1
+                or snapshot["constructor_flag"] != "0" or snapshot["proton_disable_flag"] != "1"
+                or snapshot["proton_native_libraries"] or not snapshot["tokenspeed_boundary_loaded"]
+                or not snapshot["proton_disabled_at_boundary"]
+            ):
+                raise ValueError("final SDK/Proton guard state differs from the requested state")
+            metadata = profile["workload_metadata"]
+            if len(metadata) != 1 or not metadata[0]["source_sha256"]:
+                raise ValueError("missing unique workload metadata/source hash")
+            metadata = metadata[0]
+            recovery, graphs, counters = [], [], []
+            verify_count = 0
+            for table in profile["csv"]:
+                if table.get("error") or any(table[key] for key in ("recovery_truncated", "counter_rows_truncated", "graph_launches_truncated")):
+                    raise ValueError("incomplete CSV evidence")
+                recovery.extend(table["recovery_rows"])
+                graphs.extend(table["graph_launch_rows"])
+                counters.extend(table["counter_rows"])
+                verify_count += sum(
+                    row["row_count"] for row in table["kernel_name_and_id_row_counts"]
+                    if row["kernel_name"].startswith(VERIFY)
+                )
+            report["counter_rows"] = counters
+            expected = metadata["trace_hypothesis"]
+            if (
+                len(recovery) != expected["recovery_count"]
+                or len(recovery) != expected["measured_recovery"]
+                or verify_count != expected["verify_count"]
+                or len(graphs) != 1 + metadata["replay_warmups"] + metadata["measured_replays"]
+                or metadata["measured_replays"] != 1
+            ):
+                raise ValueError("workload dispatch/graph counts differ from the recorded hypothesis")
+            if not recovery or len({row["Dispatch_Id"] for row in recovery}) != len(recovery):
+                raise ValueError("missing or duplicate recovery dispatches")
+            # CSV file order is not an execution-order guarantee.
+            recovery.sort(key=lambda row: (int(row["Start_Timestamp"]), int(row["Dispatch_Id"])))
+            graphs.sort(key=lambda row: int(row["Start_Timestamp"]))
+            if len({(row["Process_Id"], row["Correlation_Id"]) for row in graphs}) != len(graphs):
+                raise ValueError("duplicate graph correlations within one process")
+            for dispatch, graph in zip(recovery[-len(graphs):], graphs, strict=True):
+                if dispatch["Correlation_Id"] != graph["Correlation_Id"] or dispatch["Thread_Id"] != graph["Thread_Id"]:
+                    raise ValueError("recovery/graph correlation or thread mismatch")
+            selected = recovery[-1]
+            if selected["Kernel_Name"] != RECOVERY or int(selected["End_Timestamp"]) <= int(selected["Start_Timestamp"]):
+                raise ValueError("invalid selected recovery name or timestamps")
+            if len(counters) != len(counter_names) or {row["Counter_Name"] for row in counters} != set(counter_names):
+                raise ValueError("counter names/cardinality differ from the requested group")
+            grid = [int(selected[f"Grid_Size_{axis}"]) for axis in "XYZ"]
+            workgroup = [int(selected[f"Workgroup_Size_{axis}"]) for axis in "XYZ"]
+            links = ("Dispatch_Id", "Kernel_Id", "Kernel_Name", "Correlation_Id", "Agent_Id", "Queue_Id", "Thread_Id", "Start_Timestamp", "End_Timestamp")
+            for row in counters:
+                if not row["Process_Id"] or row["Process_Id"] != graphs[-1]["Process_Id"]:
+                    raise ValueError("counter/graph process mismatch")
+                if any(not row[field] or row[field] != selected[field] for field in links):
+                    raise ValueError("counter row does not identify the selected recovery dispatch")
+                if int(row["Grid_Size"]) != math.prod(grid) or int(row["Workgroup_Size"]) != math.prod(workgroup):
+                    raise ValueError("counter/dispatch geometry mismatch")
+                value = float(row["Counter_Value"])
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError("counter value is not finite and nonnegative")
+            waves = float(next(row["Counter_Value"] for row in counters if row["Counter_Name"] == "SQ_WAVES"))
+            if waves <= 0 or any(size <= 0 for size in grid + workgroup):
+                raise ValueError("empty wave count or dispatch geometry")
+            report.update(
+                status="selected", workload_metadata=metadata, dispatch=selected,
+                graph=graphs[-1], grid=grid, workgroup=workgroup, waves=waves,
+            )
+        except (KeyError, TypeError, ValueError, IndexError, StopIteration) as error:
+            report["reasons"].append(f"{type(error).__name__}: {error}")
+        return report
+
+
+    def collect_memory_requests(arguments: list[str], output_dir: Path, counter_text: str, basic_profile: dict) -> dict:
+        """Collect independent raw request groups without converting them to bytes."""
+        report = {
+            "status": "skipped", "groups": {},
+            "scope": (
+                "Raw TCC/EA request counts for one selected recovery dispatch under profiling, "
+                "aggregated by the SDK CSV writer across instances; not a direct DRAM-byte "
+                "measurement, with no per-XCD distribution recoverable. No byte conversion, "
+                "bandwidth, scale, stall, occupancy or performance-acceptance claim."
+            ),
+            "basic_sample": selected_recovery_sample(basic_profile, ("SQ_WAVES",)),
+        }
+        basic = report["basic_sample"]
+        if basic["status"] != "selected":
+            report["reason"] = "basic_profile_unattributed"
+            return report
+        groups = (
+            ("reads", ("SQ_WAVES", "TCC_EA0_RDREQ_128B", "TCC_EA0_RDREQ_64B", "TCC_EA0_RDREQ_32B")),
+            ("writes", ("SQ_WAVES", "TCC_EA0_WRREQ", "TCC_EA0_WRREQ_64B")),
+        )
+        report["status"] = "attempted"
+        for name, names in groups:
+            definitions = counter_definitions(counter_text, names)
+            missing = [counter for counter, entries in definitions.items() if not entries]
+            group = {"status": "unavailable", "requested_counters": list(names), "definitions": definitions, "missing_names": missing}
+            report["groups"][name] = group
+            if missing:
+                continue
+            try:
+                directory = output_dir / name
+                directory.mkdir(parents=True, exist_ok=True)
+                command = list(arguments)
+                begin = command.index("--pmc") + 1
+                end = command.index("--kernel-include-regex", begin)
+                command[begin:end] = names
+                command[command.index("-d") + 1] = str(directory)
+                group["profile"] = collect_profile(command, directory)
+                sample = selected_recovery_sample(group["profile"], names)
+                group["sample"] = sample
+                if sample["status"] != "selected":
+                    group["status"] = "profiler_failed" if group["profile"]["status"] == "profiler_failed" else "unattributed"
+                    continue
+                # IDs belong to each process. Compare work and geometry across passes.
+                differences = [key for key in ("workload_metadata", "grid", "workgroup", "waves") if sample[key] != basic[key]]
+                group["consistency"] = {"matches_basic_profile": not differences, "differences": differences}
+                group["status"] = "unattributed" if differences else "collected_requires_review"
+            except Exception as error:
+                group["status"] = "error"
+                group["error"] = f"{type(error).__name__}: {error}"
+        return report
+
+
     def collect_guarded_smoke(
-        diagnostic: dict, arguments: list[str], output_dir: Path, help_text: str
+        diagnostic: dict, arguments: list[str], output_dir: Path, help_text: str, counter_text: str
     ) -> dict:
         gate = sdk_guard_gate(diagnostic)
         report = {
@@ -776,6 +926,13 @@ perf:
         guarded_arguments.insert(guarded_arguments.index("--") + 2, str(guard))
         report["recovery"] = collect_profile(guarded_arguments, recovery_dir)
         report["status"] = report["recovery"]["status"]
+        try:
+            report["memory_requests"] = collect_memory_requests(
+                guarded_arguments, output_dir / "memory-requests", counter_text, report["recovery"]
+            )
+        except Exception as error:
+            # Optional counters must preserve the completed basic profile.
+            report["memory_requests"] = {"status": "error", "error": f"{type(error).__name__}: {error}"}
         return report
 
 
@@ -826,7 +983,7 @@ perf:
                 }
             try:
                 report["guarded_sdk_experiment"] = collect_guarded_smoke(
-                    report["initialization_diagnostic"], arguments, output_dir / "guarded-sdk", help_text
+                    report["initialization_diagnostic"], arguments, output_dir / "guarded-sdk", help_text, counter_text
                 )
             except Exception as error:
                 report["guarded_sdk_experiment"] = {

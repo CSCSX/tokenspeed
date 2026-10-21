@@ -1204,7 +1204,14 @@ If that probe confirms duplicate SDK initialization, a separate child disables
 later SDK constructors after checking that the first SDK is active. It also
 disables the unused Proton import, which can configure a second profiler.
 The KDA retry requires a successful GPU arithmetic probe and kernel dispatch trace.
-These diagnostics do not change timed workloads or installed libraries.
+After a valid basic recovery sample, separate optional passes collect raw
+TCC/EA read and write request counts for one selected recovery dispatch under
+profiling. The SDK CSV writer aggregates these counts across instances;
+they are not a direct DRAM-byte measurement, and no per-XCD distribution is
+recoverable. Each pass must match the basic workload, geometry and wave count,
+with its own dispatch and graph correlation. These diagnostics do not convert
+counts to bytes or report bandwidth or scale. They do not change timed workloads
+or installed libraries and do not determine performance acceptance.
 
 ## Transform
 
