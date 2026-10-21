@@ -69,7 +69,9 @@ _HEADS = 12
 _STATE_PAGE_BYTES = 884736
 
 
-def _reference(x, t, accepted, *, rounded_conv: bool, raw_gate=None):
+def _reference(
+    x, t, accepted, *, rounded_conv: bool, lower_bound: float | None, raw_gate=None
+):
     """Check recurrence independently of saved corrections and keys.
 
     The candidate uses rounded BF16 convolution outputs. The original keeps
@@ -116,7 +118,7 @@ def _reference(x, t, accepted, *, rounded_conv: bool, raw_gate=None):
             raw_gate.flatten(0, 1),
             x["A_log"],
             x["dt_bias"].view(heads, K),
-            lower_bound=LOWER_BOUND,
+            lower_bound=lower_bound,
         )
         .exp()
         .view(batch, t, heads, K)
@@ -289,7 +291,12 @@ class ReplayCase:
                 check_original_gate_projection(helper_gate, x["f_a"], x["w_fb"])
                 self.gate_reference_mismatches += int((raw_gate != helper_gate).sum())
             output, correction, kg, final_state, final_conv = _reference(
-                x, self.t, self.accepted, rounded_conv=True, raw_gate=raw_gate
+                x,
+                self.t,
+                self.accepted,
+                lower_bound=LOWER_BOUND,
+                rounded_conv=True,
+                raw_gate=raw_gate,
             )
             torch.testing.assert_close(
                 x["verify_output"].view_as(output), output, atol=1.6e-2, rtol=1e-2
@@ -406,6 +413,113 @@ def test_commit_wide_record_ring():
 
 
 @pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="requires the gfx950 checkpoint prefetch",
+)
+@pytest.mark.parametrize("batch", [4, 16])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("graph", [False, True])
+def test_verify_checkpoint_prefetch_preserves_page_guards(batch, lower_bound, graph):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_verify_gfx950,
+    )
+
+    t = 1
+    pages = 2 * batch + 2
+    live = batch - 3
+    x = _window(batch, t, pages=pages, seed=8931, num_heads=_HEADS)
+    raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    accepted = torch.ones(batch, device="cuda", dtype=torch.int32)
+    reference = _reference(
+        x,
+        t,
+        accepted,
+        rounded_conv=True,
+        lower_bound=lower_bound,
+        raw_gate=raw_gate,
+    )
+    original_state = x["h_pool"].clone()
+    original_history = x["conv_pool"].clone()
+    retained = torch.empty_like(x["qkv_raw"])
+    # Initialize the existing records contract while every source page is valid.
+    _prepare_records(x, t, raw_gate=raw_gate, original_qkv=retained)
+    x["read_indices"][live:] = torch.tensor(
+        [0, -1, pages], device="cuda", dtype=torch.int32
+    )
+    snapshots = {
+        name: x[name].clone()
+        for name in (
+            "qkv_raw",
+            "conv_w",
+            "f_a",
+            "w_fb",
+            "beta",
+            "A_log",
+            "dt_bias",
+            "read_indices",
+            "metadata",
+        )
+    }
+    original_gate = raw_gate.clone()
+    verify = prepare_records_verify(
+        gluon_kda_fused_verify_gfx950,
+        x,
+        t,
+        raw_gate=raw_gate,
+        original_qkv=retained,
+        lower_bound=lower_bound,
+    )
+    verify()
+    sentinels = {"correction": -19, "key_gate": -23, "stamps": -29}
+
+    def poison():
+        for name, value in sentinels.items():
+            x[name].fill_(value)
+        retained.fill_(-31)
+
+    poison()
+    if graph:
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            output = verify()
+        poison()
+        output.fill_(float("nan"))
+        capture.replay()
+    else:
+        output = verify()
+
+    expected_output, expected_u, expected_kg = reference[:3]
+    output = output.view_as(expected_output)
+    torch.testing.assert_close(
+        output[:live], expected_output[:live], atol=1.6e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        x["correction"][:live], expected_u[:live], atol=2e-6, rtol=2e-5
+    )
+    torch.testing.assert_close(x["key_gate"][:live], expected_kg[:live], atol=0, rtol=0)
+    expected_stamps = torch.stack(
+        (x["metadata"][:live, 2], x["metadata"][:live, 1]), dim=-1
+    )[:, None]
+    torch.testing.assert_close(x["stamps"][:live], expected_stamps, atol=0, rtol=0)
+    torch.testing.assert_close(retained[:live], x["qkv_raw"][:live], atol=0, rtol=0)
+    torch.testing.assert_close(
+        output[live:], torch.zeros_like(output[live:]), atol=0, rtol=0
+    )
+    for name, value in sentinels.items():
+        torch.testing.assert_close(
+            x[name][live:], torch.full_like(x[name][live:], value), atol=0, rtol=0
+        )
+    torch.testing.assert_close(
+        retained[live:], torch.full_like(retained[live:], -31), atol=0, rtol=0
+    )
+    torch.testing.assert_close(x["h_pool"], original_state, atol=0, rtol=0)
+    torch.testing.assert_close(x["conv_pool"], original_history, atol=0, rtol=0)
+    torch.testing.assert_close(raw_gate, original_gate, atol=0, rtol=0)
+    for name, original in snapshots.items():
+        torch.testing.assert_close(x[name], original, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
     not (current_platform().is_cdna4 or current_platform().is_cdna5),
     reason="requires AMD gfx950 or gfx1250",
 )
@@ -424,7 +538,7 @@ def test_verify_retains_original_qkv(graph):
     expected_output = x["verify_output"].clone()
     original = x["qkv_raw"].clone()
     accepted = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
-    reference = _reference(x, t, accepted, rounded_conv=True)
+    reference = _reference(x, t, accepted, lower_bound=LOWER_BOUND, rounded_conv=True)
     writes = x["read_indices"] + batch
     expected_state, expected_history = x["h_pool"].clone(), x["conv_pool"].clone()
     expected_state[writes.long()], expected_history[writes.long()] = reference[-2:]
@@ -684,6 +798,7 @@ def _check_original(
             x,
             case.t,
             case.accepted,
+            lower_bound=LOWER_BOUND,
             rounded_conv=False,
             raw_gate=reference_gates[layer] if decode and reference_gates else None,
         )
@@ -819,7 +934,14 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
     original_metadata = x["metadata"].clone()
     original_gate = raw_gate.clone()
     retained = case.retained_qkv[0]
-    reference = _reference(x, t, case.accepted, rounded_conv=True, raw_gate=raw_gate)
+    reference = _reference(
+        x,
+        t,
+        case.accepted,
+        lower_bound=LOWER_BOUND,
+        rounded_conv=True,
+        raw_gate=raw_gate,
+    )
     positions = original_metadata[:, 2, None] + torch.arange(t, device="cuda")
     rows = torch.arange(case.batch, device="cuda")[:, None]
     ring = positions % t

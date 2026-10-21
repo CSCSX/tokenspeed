@@ -1150,6 +1150,8 @@ MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
 A supplied raw gate is used directly. GFX1250 retains the separate gate producer.
 Both save the gate used by verify. For one-token windows, each GFX950 value split
 starts its first checkpoint-panel load before preparing the token vectors.
+The bounded gate starts this load after checking the page index and before
+checking record metadata. Softplus keeps the load after both checks.
 Without value splits, it keeps four panels in flight after preparation.
 Recovery keeps two panels in flight for one-token windows.
 Other recovery windows use one panel.

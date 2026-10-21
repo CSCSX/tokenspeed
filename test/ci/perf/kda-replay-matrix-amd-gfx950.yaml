@@ -30,6 +30,7 @@ perf:
     python3 -m pytest -q --confcutdir=tokenspeed-kernel/test/amd/ops/attention \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_ignores_rejected_records \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_wide_record_ring \
+      tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_verify_checkpoint_prefetch_preserves_page_guards \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_verify_retains_original_qkv \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_inline_gate_matches_supplied_gate \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_one_token_recovery_preserves_decay

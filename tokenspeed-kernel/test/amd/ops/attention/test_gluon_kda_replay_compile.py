@@ -108,7 +108,8 @@ def _inputs(window, device, *, batch):
         ("gfx950", 4, 17, 5, -5.0),
     ]
     # Softplus keeps the existing recovery path for every tested window.
-    + [("gfx950", window, 3, window + 1, None) for window in (1, 4, 8)],
+    + [("gfx950", window, 3, window + 1, None) for window in (1, 4, 8)]
+    + [("gfx950", 1, 4, 2, None)],
 )
 def test_kda_records_wrapper_launches_compile(
     monkeypatch, arch, window, batch, capacity, lower_bound

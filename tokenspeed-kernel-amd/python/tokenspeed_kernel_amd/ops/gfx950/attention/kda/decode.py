@@ -618,6 +618,29 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
                 )
         return
 
+    if HAS_LOWER_BOUND:
+        # Load a valid checkpoint while checking record metadata.
+        # Keep this setup identical to the softplus setup below.
+        read_page_offset = read_idx.to(gl.int64)
+        read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
+        panel_value_offsets = gl.arange(0, 16, layout=value_layout)
+
+        panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
+
+        # Start the first state load before preparing the token vectors.
+        off_pipe = ()
+        raw_pipe = ()
+        if VALUE_SPLITS == 1:
+            _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
+            _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
+            off_pipe = (_off,)
+            raw_pipe = (_raw,)
+        elif TOKENS_PER_SEQUENCE == 1:
+            first_offsets = (
+                panel_value_offsets[:, None] + value_split_idx * panels_per_split * 16
+            ) * D + key_offsets[None, :]
+            first_raw = gl.load(state_pool + read_base + first_offsets).to(gl.float32)
+
     slot = gl.load(metadata + sequence_idx * 3)
     generation = gl.load(metadata + sequence_idx * 3 + 1)
     start = gl.load(metadata + sequence_idx * 3 + 2)
@@ -633,25 +656,27 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     if not valid:
         return
 
-    read_page_offset = read_idx.to(gl.int64)
-    read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
-    panel_value_offsets = gl.arange(0, 16, layout=value_layout)
+    if not HAS_LOWER_BOUND:
+        # Preserve softplus load ordering; match the bounded setup above.
+        read_page_offset = read_idx.to(gl.int64)
+        read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
+        panel_value_offsets = gl.arange(0, 16, layout=value_layout)
 
-    panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
+        panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
 
-    # Start the first state load before preparing the token vectors.
-    off_pipe = ()
-    raw_pipe = ()
-    if VALUE_SPLITS == 1:
-        _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-        _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
-        off_pipe = (_off,)
-        raw_pipe = (_raw,)
-    elif TOKENS_PER_SEQUENCE == 1:
-        first_offsets = (
-            panel_value_offsets[:, None] + value_split_idx * panels_per_split * 16
-        ) * D + key_offsets[None, :]
-        first_raw = gl.load(state_pool + read_base + first_offsets).to(gl.float32)
+        # Start the first state load before preparing the token vectors.
+        off_pipe = ()
+        raw_pipe = ()
+        if VALUE_SPLITS == 1:
+            _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
+            _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
+            off_pipe = (_off,)
+            raw_pipe = (_raw,)
+        elif TOKENS_PER_SEQUENCE == 1:
+            first_offsets = (
+                panel_value_offsets[:, None] + value_split_idx * panels_per_split * 16
+            ) * D + key_offsets[None, :]
+            first_raw = gl.load(state_pool + read_base + first_offsets).to(gl.float32)
 
     # Process Q/K/V/decay together so Q/K/V share convolution loads.
     # Decay lanes use Q as an in-bounds dummy address and skip state writes.
