@@ -524,15 +524,12 @@ class L3Executor:
                     )
                     self._health.report_failure(token)
                 else:
-                    # A retired GET may be an eviction race or an object with
-                    # incompatible length. Negative-cache it without treating
-                    # object validity as backend unavailability. Soft timeout
-                    # also never changes health.
-                    if (
-                        kind == "query"
-                        or (kind == "get" and result.retired)
-                        or (result.retired and all(result.success))
-                    ):
+                    # Retired failures are object or capacity facts, never
+                    # backend unavailability: a retired GET may be an
+                    # eviction race or an object with incompatible length,
+                    # and a retired PUT may be the store's allocation
+                    # rejection. Soft timeout also never changes health.
+                    if kind == "query" or result.retired:
                         self._health.report_success(token)
                     else:
                         self._health.report_failure(token)

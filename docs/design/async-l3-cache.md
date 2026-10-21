@@ -271,8 +271,9 @@ request slot or an earlier operation's ID.
 The executor's private health monitor rejects work during cooldown and permits
 one recovery probe. It has no separate thread or public control interface.
 Health epochs prevent a stale successful call from undoing a newer outage.
-Existence misses and safely retired GET misses do not indicate an outage;
-exceptions, PUT failures and unknown native failures do. A soft timeout is
+Existence misses, safely retired GET misses and retired PUT capacity
+rejections do not indicate an outage; exceptions, unretired PUT failures and
+unknown native failures do. A soft timeout is
 only a scheduling decision. The first version uses fixed deadlines and
 credits and explicit pressure watermarks; it does not estimate per-request
 transfer benefit or auto-tune limits. Pressure does not report a backend fault,
@@ -324,7 +325,10 @@ For the Mooncake adapter, exact byte counts prove GET success. Nonnegative
 short reads are retired failures. `OBJECT_NOT_FOUND` (`-704`) is a metadata
 miss before destination transfer submission. PUT `OBJECT_ALREADY_EXISTS`
 (`-705`) is a create-only rejection before source transfer and is idempotent
-success. Other negative transfer errors, exceptions after native submission,
+success. PUT `NO_AVAILABLE_HANDLE` (`-200`) is the master's allocation
+rejection before any source transfer: a retired per-page failure that leaves
+the page unacknowledged for the scheduler to re-offer, never a quarantine.
+Other negative transfer errors, exceptions after native submission,
 and malformed transfer results do not prove retirement.
 
 `failures_retire` declares the backend's guarantee when a call raises or returns
@@ -343,7 +347,9 @@ bounded FIFO lifetime; expiry/reprobe after external object repair is separate
 work. Python reports facts and does not choose negative-cache policy.
 
 An unretired result quarantines every reference of that job. It is never
-published, freed or repaired by an existence recheck. The first version
+published, freed or repaired by an existence recheck. One generic negative
+transfer result is enough: the executor rejects all further submissions,
+and `close()` reports that a process restart is required. The first version
 stops new L3 work for the replica after quarantine and requires process
 restart to reclaim that storage safely. Ordinary computation and valid L2
 hits can continue within the remaining capacity. A deployment SDK must honor

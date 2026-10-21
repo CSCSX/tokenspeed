@@ -711,7 +711,7 @@ Its responsibilities:
   at all: it never constrains the boundary and never claims a hit, so its
   table is empty at first admission and the scheduler materializes it as a
   sparse private suffix from the replay window's first token
-  ([Scheduler §1.3](scheduler.md#_1-3-bounded-replay)). Probe and admit are
+  ([Scheduler §1.3](scheduler.md#13-bounded-replay)). Probe and admit are
   deliberately split so the probe can be taken once and the admission retried
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
@@ -728,7 +728,7 @@ Its responsibilities:
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
   never copies it; a tail's full blocks below that page are copied like on
-  every role ([Scheduler §3.2](scheduler.md#_3-2-d-%E2%80%94-decode-worker)).
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a

@@ -474,16 +474,21 @@ class Engine(EngineBase):
         self,
         model_path: str,
         load_format: str | None = None,
+        flush_cache: bool = True,
+        weight_version: str | None = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
         This method allows updating the model weights from disk without restarting
         the engine. It can be used to load a different model or update weights with
-        new training.
+        new training. With L3 enabled, a flush requires an explicit
+        `weight_version` so the new weights publish under a new namespace.
         """
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
         )
 
         return self.llm.run(self.tokenizer_manager.update_weights_from_disk(obj))

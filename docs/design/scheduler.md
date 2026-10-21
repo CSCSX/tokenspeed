@@ -22,7 +22,7 @@ carries what it computed since its previous admission — the prefix pages
 completed and its computed-token count — which the coordinator publishes
 and reclaims inside the same `Admit` (`AdvanceRequestProgress` in
 `scheduler/operations/progress.h` is the one place that hashes those pages
-and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrc-cache-coordinator)
+and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
 Decode-role remote admission covers the complete unmatched prompt in one
@@ -57,7 +57,7 @@ See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
 tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
-[cache-concepts](cache-concepts.md#the-coordinator-layer-csrc-cache-coordinator)):
+[cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)):
 the hit boundary `T` is a token count, and `extend_prefix_lens` carries it
 as is. The probe is bounded
 in tokens, and the bound is the minimum of two rules: the configured replay

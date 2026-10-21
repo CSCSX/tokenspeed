@@ -764,7 +764,9 @@ class RequestHandler:
         land in a peer still serving the previous ``weight_version``.
         Flushed L3 updates require an explicit ``weight_version``. An
         explicit new version with ``flush_cache=False`` is rejected
-        before the GPU load.
+        before the GPU load. Re-sending the current version is a no-op:
+        the namespace already names it, and ``set_weight_version`` would
+        raise on a serving executor that still has unretired operations.
         """
 
         ok, err = self._require_weight_version_for_l3_flush(recv_req)
@@ -774,11 +776,11 @@ class RequestHandler:
         if not ok:
             return False, err
         version = resolve_l3_weight_version(_requested_weight_version(recv_req))
-        if version is None:
+        if version is None or str(version) == str(self.server_args.weight_version):
             return True, msg
-        self.server_args.weight_version = str(version)
         if self._l3 is not None:
             self._l3.set_weight_version(str(version))
+        self.server_args.weight_version = str(version)
         return True, msg
 
     def handle_generate_request(

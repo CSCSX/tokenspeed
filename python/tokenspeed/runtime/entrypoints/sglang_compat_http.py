@@ -343,6 +343,7 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
         obj = UpdateWeightFromDiskReqInput(
             model_path=str(body["model_path"]),
             load_format=body.get("load_format"),
+            flush_cache=bool(body.get("flush_cache", True)),
             weight_version=body.get("weight_version"),
         )
         success, message, *_ = await _llm(request).update_weights_from_disk(obj)

@@ -155,7 +155,8 @@ void Scheduler::prepareStorage(Request& request) {
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
     admission->storage_prepared = true;
     // Decode uses its ordinary remote landing. No extra L3 handshake here.
-    if (config_.role == Role::kD || config_.disable_prefix_cache || !storage_transfers_->CanStart()) {
+    if (config_.role == Role::kD || config_.disable_prefix_cache) return;
+    if (!storage_transfers_->CanStart()) {
         if (storage_transfers_->PressureGateClosed()) ++storage_pressure_bypasses_;
         return;
     }

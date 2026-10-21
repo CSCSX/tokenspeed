@@ -157,9 +157,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
-        // L3 only: the fewest whole prefix pages an L3 hit must add beyond the
-        // Host hit before the request waits for a pre-admission prefetch of
-        // them; required (>= 1) with L3, 0 without.
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
@@ -591,7 +588,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
         .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
-        .def("host_pool_pinned_blocks", &tokenspeed::Scheduler::HostPoolPinnedBlocks)
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
         .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)

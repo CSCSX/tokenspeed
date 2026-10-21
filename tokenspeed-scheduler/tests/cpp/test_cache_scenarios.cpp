@@ -1920,6 +1920,142 @@ TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageT
     AckWriteBacks(readmit);
 }
 
+// The D role's admission probes Device alone: its cache arrives by the
+// ordinary remote landing, so even with L3 enabled and storage allowed it
+// must never start a query, a GET or a backup. Dropping the kD check in
+// prepareStorage would emit a StorageQueryOperation at this plan.
+class L3DecodeRoleSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.role = Role::kD;
+        cfg.enable_l3_storage = true;
+        cfg.storage_config = StorageConfig{16,
+                                           32,
+                                           cfg.host_allocator.total_pages - 1,
+                                           64,
+                                           32,
+                                           2,
+                                           100,
+                                           100,
+                                           StoragePressure{16, 1048576, 1000},
+                                           StoragePressure{8, 524288, 500}};
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(L3DecodeRoleSuite, TheDecodeRoleNeverPreparesStorage) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    // Storage healthy and idle: a role that prepares storage would query now.
+    ExecutionEvent tick;
+    tick.With(cache::StorageTick{1, true, true, StoragePressure{0, 0, 0}});
+    scheduler_->Advance(std::move(tick));
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(plan).empty());
+    const ForwardBatch* admission = FindRemoteAdmission(plan);
+    ASSERT_NE(admission, nullptr);
+    EXPECT_EQ(admission->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(admission->extend_prefix_lens.at(0), 0) << "the whole prompt is the peer's work";
+}
+
+TEST_F(L3DecodeRoleSuite, AClosedPressureGateIsNotADecodeBypass) {
+    // The gate closes at the high watermark, but a request that never
+    // prepares storage is not "skipped by pressure".
+    ExecutionEvent tick;
+    tick.With(cache::StorageTick{1, true, true, StoragePressure{16, 0, 0}});
+    scheduler_->Advance(std::move(tick));
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(plan).empty());
+    EXPECT_TRUE(scheduler_->GetStorageStats().pressure_gate_closed);
+    EXPECT_EQ(scheduler_->GetStorageStats().pressure_bypasses, 0);
+}
+
+// The L3 prefetch window (operations/storage.cpp): the lookahead opens at
+// most max_prefetch_tokens past the local hit, and a gap below
+// min_prefetch_tokens starts nothing. Both edges are observable in the
+// emitted query's keys.
+class L3PrefetchWindowSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 128;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 128;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        cfg.enable_l3_storage = true;
+        cfg.storage_config = StorageConfig{16,
+                                           32,
+                                           cfg.host_allocator.total_pages - 1,
+                                           64,
+                                           32,
+                                           2,
+                                           100,
+                                           100,
+                                           StoragePressure{16, 1048576, 1000},
+                                           StoragePressure{8, 524288, 500}};
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(L3PrefetchWindowSuite, TheLookaheadStopsAtMaxPrefetchTokensPastTheLocalHit) {
+    // "warm" leaves [1 2 3 4] in the Device cache but its last page stays the
+    // replay tail while it decodes, so "long" probes a 2-token local hit.
+    // The window opens at 2 + 32 = 34 tokens, so the query covers pages
+    // 2..17 only: 16 keys, not the 32 an uncapped remainder would fill
+    // (max_keys_per_operation).
+    Submit(MakeRequestSpec("warm", /*num_pages=*/2));
+    PlanOnce();
+    SendForwardDone("warm", {42});
+
+    Submit(MakeRequestSpec("long", /*num_pages=*/40));
+    ExecutionEvent tick;
+    tick.With(cache::StorageTick{1, false, true, StoragePressure{0, 0, 0}});
+    scheduler_->Advance(std::move(tick));
+    const ExecutionPlan plan = PlanOnce();
+    const auto queries = ExtractCacheOpsOfKind<StorageOperation>(plan);
+    ASSERT_EQ(queries.size(), 1u);
+    const auto& query = std::get<StorageQueryOperation>(std::get<StorageOperation>(queries.front()));
+    EXPECT_EQ(query.keys.size(), 16u);
+}
+
+TEST_F(L3PrefetchWindowSuite, AGapBelowMinPrefetchTokensStartsNoQuery) {
+    // A finished "warm" leaves its whole 78-token prefix matchable; "long"
+    // adds a single cacheable token past it. The gap (1) is below
+    // min_prefetch_tokens (2), so "long" takes the ordinary admission with
+    // its local hit and no query starts.
+    Submit(MakeRequestSpec("warm", /*num_pages=*/39));
+    PlanOnce();
+    SendForwardDone("warm", {42});
+    SendFinish("warm");
+    PlanOnce();  // the finish settles; the pages stay cached
+
+    Submit(MakeRequestSpec("long", /*num_pages=*/40));
+    ExecutionEvent tick;
+    tick.With(cache::StorageTick{1, true, true, StoragePressure{0, 0, 0}});
+    scheduler_->Advance(std::move(tick));
+    const ExecutionPlan plan = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(plan).empty());
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"long"});
+}
+
 // Two victims whose images share pages carried by one earlier, still
 // unacknowledged store: neither copies them again, and both wait for it.
 class SharedImagePagesSuite : public FusedRetractionL2TestSuite {

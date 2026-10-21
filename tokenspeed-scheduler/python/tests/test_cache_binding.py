@@ -36,8 +36,9 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(request, "rolling_hashes")
     assert not hasattr(request, "storage_hit_pages")
 
-    # Cache.PrefetchOp / Cache.PrefetchDoneEvent exist again, as the
-    # pre-admission L3 fill (not the old adjunct API).
+    # The pre-admission prefetch protocol is gone with the adjunct API.
+    assert not hasattr(Cache, "PrefetchOp")
+    assert not hasattr(Cache, "PrefetchDoneEvent")
     assert not hasattr(Cache, "BackUpOp")
     assert not hasattr(Cache, "CacheKind")
     assert not hasattr(Cache.WriteBackOp, "is_retract")

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import types
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -47,7 +48,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     storage_object_key,
 )
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig, parse_extra_config
-from tokenspeed.runtime.cache.l3.executor import L3Executor
+from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 from tokenspeed.runtime.cache.l3.factory import create_storage_backend
 from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeKvStore,
@@ -1809,6 +1810,94 @@ class TestMooncakeKvStoreTest:
         assert result.success == (False,)
         assert not result.retired
         assert calls == ["exists"]
+
+    def test_capacity_pressure_put_retires_as_a_per_page_failure(self):
+        # NO_AVAILABLE_HANDLE (-200) is the master's allocation rejection
+        # before any source transfer: retired, not a quarantine.
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-200, 0],
+        )
+        result = adapter.batch_put_from_result(
+            ["pressure", "saved"],
+            SimpleNamespace(data_ptr=lambda: 100),
+            [0, 8],
+            [8, 8],
+        )
+        assert result.success == (False, True)
+        assert result.retired
+        assert result.object_failures == (False, False)
+
+    def test_capacity_pressure_put_keeps_the_executor_in_service(self):
+        class Buffer(bytearray):
+            def data_ptr(self):
+                return ctypes.addressof((ctypes.c_char * len(self)).from_buffer(self))
+
+        class Store:
+            def __init__(self):
+                self.objects = {}
+
+            def batch_is_exist(self, keys):
+                return [int(key in self.objects) for key in keys]
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                results = []
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    if key == "pressure":
+                        results.append(-200)
+                    else:
+                        self.objects[key] = ctypes.string_at(ptr, size)
+                        results.append(0)
+                return results
+
+        class Host:
+            def __init__(self):
+                self.host_buffer = Buffer(b"abcdefgh")
+
+            def host_block_range(self, group_index, block_id):
+                del group_index, block_id
+                return 0, 4
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = Store()
+        adapter.failures_retire = False
+        executor = L3Executor(
+            adapter,
+            Host(),
+            key_prefix="m",
+            rank=0,
+            ownership=None,
+            config=StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=32, prefix_granularity=2
+            ),
+            prefix_for_weight_version=None,
+        )
+
+        def run(op_id, keys, offsets):
+            executor.submit(StorageJob(op_id, "put", keys, offsets, (4,) * len(keys)))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                completions = executor.poll().completions
+                if completions:
+                    assert len(completions) == 1
+                    return completions[0]
+                time.sleep(0.001)
+            raise AssertionError("L3 operation did not finish")
+
+        try:
+            pressured = run(1, ("pressure", "saved"), (0, 4))
+            assert pressured.success == (False, True)
+            assert pressured.retired
+            assert adapter.store.objects == {"saved": b"efgh"}
+            # Capacity pressure must neither quarantine the executor nor open
+            # its health circuit: the scheduler re-offers the unacknowledged
+            # page on a later round.
+            assert executor.snapshot().health.state == "healthy"
+            assert run(2, ("retry",), (0,)).success == (True,)
+            assert adapter.store.objects["retry"] == b"abcd"
+        finally:
+            executor.close(timeout_s=3)
 
     def test_truncated_exists_does_not_ack_unuploaded_keys(self):
         class _Store:

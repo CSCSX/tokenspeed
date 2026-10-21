@@ -4,6 +4,9 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
@@ -614,6 +617,81 @@ class TestRequestHandlerL3WeightVersion:
 
         handler._l3.set_weight_version.assert_not_called()
         assert handler.server_args.weight_version == "v1"
+
+    def test_unchanged_version_is_a_noop_for_a_busy_executor(self):
+        # A re-sent current version must not reach set_weight_version: a
+        # serving executor still holds submitted-but-unpolled jobs, and its
+        # raise killed the scheduler after the GPU weights had loaded.
+        handler = self._handler()
+        handler.server_args.kvstore_storage_backend = "memory"
+        executor = _busy_l3_executor()
+        handler._l3 = executor
+        try:
+            handler._device.update_weights.return_value = (True, "ok")
+            req = UpdateWeightsFromDistributedReqInput(
+                names=["w"],
+                dtype_names=["float16"],
+                shapes=[[1]],
+                flush_cache=False,
+                weight_version="v1",
+            )
+
+            handler.process_requests([req])
+
+            handler._device.update_weights.assert_called_once_with(req)
+            output = handler.send_func.send_pyobj.call_args.args[0]
+            assert output.success
+            assert handler.server_args.weight_version == "v1"
+            assert executor.key_prefix == "tsl3-test"
+        finally:
+            executor.close(timeout_s=5)
+
+    def test_failed_prefix_switch_keeps_the_committed_version(self):
+        handler = self._handler()
+        handler.server_args.kvstore_storage_backend = "memory"
+        executor = _busy_l3_executor()
+        handler._l3 = executor
+        try:
+            req = UpdateWeightsFromDistributedReqInput(
+                names=["w"],
+                dtype_names=["float16"],
+                shapes=[[1]],
+                flush_cache=True,
+                weight_version="v2",
+            )
+
+            with pytest.raises(RuntimeError, match="must retire"):
+                handler._commit_l3_weight_version(req, "ok")
+
+            assert handler.server_args.weight_version == "v1"
+            assert executor.key_prefix == "tsl3-test"
+        finally:
+            executor.close(timeout_s=5)
+
+
+class _CpuHostAllocation:
+    """CPU substitute for the GPU-pinned Host allocation."""
+
+    def __init__(self):
+        self.host_buffer = bytearray(64)
+
+
+def _busy_l3_executor():
+    """A real L3 executor one submitted-but-unpolled job keeps non-idle."""
+    executor = L3Executor(
+        MemoryKvStore(),
+        _CpuHostAllocation(),
+        key_prefix="tsl3-test",
+        rank=0,
+        ownership=None,
+        config=StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=32, prefix_granularity=2
+        ),
+        prefix_for_weight_version=lambda version: f"tsl3-test-{version}",
+    )
+    executor.submit(StorageJob(1, "put", ("key",), (0,), (4,)))
+    assert not executor.is_idle()
+    return executor
 
 
 class TestEngineStampsL3Version:

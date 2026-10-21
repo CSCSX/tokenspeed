@@ -309,13 +309,16 @@ class MooncakeKvStore:
             )
             return StorageIOResult((False,) * len(keys), False, (False,) * len(keys))
         # Mooncake's public ErrorCode::OBJECT_ALREADY_EXISTS (-705) is a
-        # create-only rejection before transfer. Other errors do not prove
-        # retirement, even if another writer's object now exists.
+        # create-only rejection before transfer. NO_AVAILABLE_HANDLE (-200)
+        # is the master's allocation rejection, likewise before any source
+        # transfer; capacity pressure retires as a per-page failure the
+        # scheduler re-offers. Other errors do not prove retirement, even if
+        # another writer's object now exists.
         for index, result in zip(indices, results):
             flags[index] = int(result) in (0, -705)
         return StorageIOResult(
             tuple(flags),
-            all(int(result) in (0, -705) for result in results),
+            all(int(result) in (0, -705, -200) for result in results),
             (False,) * len(keys),
         )
 
