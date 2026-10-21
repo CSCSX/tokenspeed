@@ -46,7 +46,7 @@ env:
 jobs:
   test:
     if: >-
-      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') || (fromJSON(inputs.matrix).include[0].config == 'test/ci/perf/kda-replay-matrix-amd-gfx950.yaml' && fromJSON(inputs.matrix).include[1] == null)
+      (github.ref_name != 'amd_replay_ssm_opt' && github.event.pull_request.head.ref != 'amd_replay_ssm_opt' && github.event.workflow_run.head_branch != 'amd_replay_ssm_opt') || (fromJSON(inputs.matrix).include[0].config == 'test/ci/perf/kda-replay-matrix-amd-gfx950.yaml' && (fromJSON(inputs.matrix).include[1] == null || (fromJSON(inputs.matrix).include[1].config == 'test/ci/ut/ut-kda-record-guards-mi450-sim.yaml' && fromJSON(inputs.matrix).include[1].runner == 'amd-mi45x-cpu-test' && fromJSON(inputs.matrix).include[2] == null)))
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix) }}
