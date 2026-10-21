@@ -1206,12 +1206,10 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         }
     }
 
-    // Retention value of one Host cache entry: keep what a request has already
-    // proven useful, then the most recently accessed, then a stable tie-break.
+    // Keep the most recently accessed Host entries; location only breaks ties.
     const auto value = [](std::uint32_t candidate_group, CacheBlockLocation location,
                           const PrefixCacheIndex::CachedBlockMetadata& metadata) {
-        return std::tuple{metadata.was_acquired, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
-                          location.slot_index};
+        return std::tuple{metadata.last_access_epoch, candidate_group, location.lcm_block_id, location.slot_index};
     };
     const auto lookup_value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
         const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
@@ -1226,10 +1224,8 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             continue;
         }
         ++batch.stats.same_group_scans;
-        // Host retention ranks was_acquired before epoch, unlike the eviction
-        // index, so finding the best victims needs a full group scan; each
-        // unresolved block then evicts the least valuable entry in its own
-        // bucket, which is exactly the hole it needs.
+        // Collect the group's evictable entries once; each unresolved block
+        // evicts the oldest eligible entry in its own placement bucket.
         std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
             groups_[group_id].Index().EvictableCandidates(*host_pool_);
         std::ranges::sort(local_victims, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
