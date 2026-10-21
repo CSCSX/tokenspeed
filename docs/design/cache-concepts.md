@@ -798,8 +798,9 @@ Its responsibilities:
   (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
   retraction); a chunk end or decode step publishes no state (see
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
-  Evicting a History block under a chain hash evicts the state checkpoints
-  under that hash as well, so a state never outlives the KV it continues.
+  On Device, evicting a History block under a chain hash also evicts the
+  State checkpoints under that hash, so Device state does not outlive the
+  KV it continues.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -818,7 +819,8 @@ Its responsibilities:
   prefix hit refreshes its access epoch, and earlier reuse grants no
   additional protection. Pinned entries, partially pinned foreign parents,
   and blocks allocated earlier in the same batch remain protected. Child
-  reuse preserves the requested placement bucket. No group has an eviction
+  reuse preserves the requested placement bucket. Host eviction removes each
+  selected entry independently. No group has an eviction
   preference or a fixed share of the pool; capacity follows the access
   pattern, without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the
