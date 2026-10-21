@@ -1151,8 +1151,8 @@ A supplied raw gate is used directly. GFX1250 retains the separate gate producer
 Both save the gate used by verify. For one-token windows, each GFX950 value split
 starts its first checkpoint-panel load before preparing the token vectors.
 Without value splits, it keeps four panels in flight after preparation.
-Recovery keeps two panels in flight for one-token windows.
-Other recovery windows use one panel.
+GFX950 recovery uses 64-row panels for one-token windows with a bounded gate.
+Other windows keep 16-row panels, with two in flight for one-token softplus.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against
@@ -1167,7 +1167,7 @@ address checks out of the state-update loop.
 Batched descriptors use the shared ten-column table: original QKV (0), conv
 history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
 The remaining columns are reserved. Recovery retains one program per head,
-request and layer with the eight-panel state pipeline. It stages accepted
+request and layer. It stages accepted
 U, K and raw gate once in LDS, then applies the same updates per value panel.
 It commits each head's convolution history after loading all old taps,
 including when source and destination alias. History retains its bound pool

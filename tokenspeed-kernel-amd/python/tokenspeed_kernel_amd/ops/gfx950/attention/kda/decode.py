@@ -987,7 +987,9 @@ def gluon_kda_fused_replay_gfx950(
 
     read_page_offset = read_idx.to(gl.int64)
     read_base = read_page_offset * state_stride + head_idx * D * D
-    panel_value_offsets = gl.arange(0, 16, layout=value_layout)
+    panel_rows: gl.constexpr = 64 if T == 1 and BOUNDED else 16
+    panel_count: gl.constexpr = D // panel_rows
+    panel_value_offsets = gl.arange(0, panel_rows, layout=value_layout)
     _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
     _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
     off_pipe = (_off,)
@@ -1057,25 +1059,24 @@ def gluon_kda_fused_replay_gfx950(
         k_values += (k_value,)
         decay_values += (decay,)
 
-    # T1 keeps its register occupancy with two panels.
-    # Four panels at T4 slowed recovery when only part of a window was accepted.
-    pipeline_depth: gl.constexpr = 2 if T == 1 else 1
+    # Bounded T1 uses two wide panels. Other windows retain their load pipeline.
+    pipeline_depth: gl.constexpr = 2 if T == 1 and not BOUNDED else 1
     for prefetch_idx in gl.static_range(1, pipeline_depth):
         prefetch_offsets = (
-            panel_value_offsets[:, None] + prefetch_idx * 16
+            panel_value_offsets[:, None] + prefetch_idx * panel_rows
         ) * D + key_offsets[None, :]
         prefetch_raw = gl.load(state_pool + read_base + prefetch_offsets).to(gl.float32)
         off_pipe = off_pipe + (prefetch_offsets,)
         raw_pipe = raw_pipe + (prefetch_raw,)
 
-    for panel_idx in gl.static_range(8):
+    for panel_idx in gl.static_range(panel_count):
         panel_offsets = off_pipe[0]
         running = raw_pipe[0]
         for token_offset in gl.static_range(T):
             # Inactive rows are initialized; unconditional reads share one barrier.
             delta = (
                 correction_shared.index(token_offset)
-                .slice(panel_idx * 16, 16, dim=0)
+                .slice(panel_idx * panel_rows, panel_rows, dim=0)
                 .load(value_layout)
             )
             if token_offset < replay_steps:
@@ -1085,9 +1086,9 @@ def gluon_kda_fused_replay_gfx950(
         gl.store(state_pool + write_base + panel_offsets, running)
 
         next_idx = panel_idx + pipeline_depth
-        if next_idx < 8:
+        if next_idx < panel_count:
             next_offsets = (
-                panel_value_offsets[:, None] + next_idx * 16
+                panel_value_offsets[:, None] + next_idx * panel_rows
             ) * D + key_offsets[None, :]
             next_raw = gl.load(state_pool + read_base + next_offsets).to(gl.float32)
             off_pipe = off_pipe[1:] + (next_offsets,)

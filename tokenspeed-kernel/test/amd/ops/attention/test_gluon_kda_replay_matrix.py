@@ -722,6 +722,16 @@ def test_one_token_recovery_preserves_decay(lower_bound):
             x["stamps"], x["metadata"][:, [2, 1]][:, None], atol=0, rtol=0
         )
 
+    # Distinct U rows test value indexing while 127 columns still isolate decay.
+    correction = torch.arange(1, K + 1, device="cuda", dtype=torch.float32) / K
+    key = torch.zeros(K, device="cuda", dtype=torch.bfloat16)
+    key[-1] = 1
+    for x in case.layers:
+        x["correction"].copy_(correction.expand_as(x["correction"]))
+        x["key_gate"][..., :K].copy_(key.expand_as(x["key_gate"][..., :K]))
+    normalized_key = key.float() * torch.rsqrt(key.float().square().sum() + 1e-6)
+    update = correction[:, None] * normalized_key[None, :]
+
     def commit(launcher):
         x = case.layers[0]
         launcher(
@@ -759,7 +769,9 @@ def test_one_token_recovery_preserves_decay(lower_bound):
         writes = x["write_indices"].long()
         reference = case.originals[layer][1].clone()
         reference[writes] = torch.where(
-            (case.accepted > 0)[:, None, None, None], decay[:, :, None, :], 1.0
+            (case.accepted > 0)[:, None, None, None],
+            decay[:, :, None, :] + update[None, None, :, :],
+            1.0,
         )
         assert bool((x["h_pool"][writes[case.accepted > 0]] != 1).any())
         torch.testing.assert_close(x["h_pool"], reference, atol=1e-7, rtol=1e-5)
