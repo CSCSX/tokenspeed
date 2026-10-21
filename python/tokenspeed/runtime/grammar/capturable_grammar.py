@@ -407,7 +407,7 @@ class EagerGrammarBuffers:
             self.candidates[first : first + count].copy_(
                 input_ids_buf[-count * n :].view(count, n), non_blocking=True
             )
-            torch.cuda.current_stream().synchronize()
+            torch.get_device_module(input_ids_buf.device).current_stream().synchronize()
         self.filler.fill(batch)
         rows = bs * n if has_candidates else bs
         self.bitmask[:rows].copy_(self.host_bitmask[:rows], non_blocking=True)
