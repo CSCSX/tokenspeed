@@ -308,6 +308,25 @@ def gemv_row(acc, x_smem, xs_smem, tiles, scales, row: gl.constexpr):
 
 
 @gluon.jit
+def gemv_chain(x_smem, xs_smem, tiles, scales):
+    """Every activation row times the loaded weight tiles, as an
+    accumulator: MFMA row ``m`` holds row ``m % RP`` (``RP`` the row count
+    of ``x_smem``). :func:`gemv_result` reads it; a select keeps rows of
+    several chains in one accumulator (see :func:`gemv_row`)."""
+    acc = gemv_zero(tiles[0].shape[0], tiles[0].shape[2] // 16)
+    SPLIT: gl.constexpr = acc.shape[0]
+    NW: gl.constexpr = acc.shape[2] // 16
+    RP: gl.constexpr = x_smem.shape[0]
+    al: gl.constexpr = a_layout(SPLIT, NW)
+    sal: gl.constexpr = scale_layout(SPLIT, NW, 0)
+    for i in gl.static_range(len(tiles)):
+        a = _a_tile(x_smem, i * SPLIT, 0, RP, SPLIT, al)
+        a_s = _a_tile(xs_smem, i * SPLIT, 0, RP, SPLIT, sal)
+        acc = _mfma(acc, a, a_s, tiles[i], scales[i], i)
+    return acc
+
+
+@gluon.jit
 def gemv_result(acc, RP: gl.constexpr):
     """``[RP, 16 * NW]`` FP32 rows of a GEMV accumulator (as :func:`gemv`)."""
     NW: gl.constexpr = acc.shape[2] // 16

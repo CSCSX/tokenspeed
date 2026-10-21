@@ -29,19 +29,23 @@ mixer's inject logits: ``h_b + bf16(out) * 2 sigmoid(inject_b)``.
 
 Every task serves every row of the launch:
 
-* router (M3), 65 tasks. Each task runs 8 router rows (BF16), but the last
-  task runs the shared expert gate. M3 publishes the 512 logits as BF16.
-* expert up (M4), 220 tasks: rank ``r`` (0-9 routed, 10 shared) x 32
-  intermediate columns. A task polls its input rows first (M2 published them
+* router (M3), 65 blocks of 8 router rows (BF16); the last block is the
+  shared expert gate. Past 2 rows, two tasks per block split the rows
+  (:func:`router_rows`). M3 publishes the 512 logits as BF16.
+* expert up (M4), 200 routed tasks: rank ``r`` (0-9) x 32 intermediate
+  columns, then the shared expert's tasks (:func:`shared_blocks` blocks of
+  32 columns each). A task polls its input rows first (M2 published them
   before M3 ran). Then it routes (:func:`routing`, the CTA's waves together).
-  Then it streams each row's expert weights, two rows in flight. Each row's
-  chain lands in its own MFMA rows of one accumulator. Thus one epilogue
-  publishes ``silu(gate) * up`` of every row as MXFP8 blocks.
+  Then it streams units of weights, two in flight: a routed task's unit is
+  a row's expert, a shared task's unit is a block, read once for every row.
+  A routed task keeps each row's result in its own MFMA rows of one
+  accumulator, so one epilogue publishes ``silu(gate) * up`` of every row
+  as MXFP8 blocks.
 * expert down (M5), 160 tasks of 16 hidden columns. A task routes again and
-  polls every row's 11 intermediates. It runs each row's 11 down projections
-  as one rank-3 MFMA whose batch dimension is the expert (into its own MFMA
-  rows of one accumulator). One epilogue combines them and writes the
-  layer's output streams.
+  polls every row's 11 intermediates. Its chains are the (row, rank) down
+  projections, 16 per rank-3 MFMA whose batch dimension is the chain. The
+  epilogue combines each row's chains in rank order (the same order at any
+  row count) and writes the layer's output streams.
 
 The stages read routed experts in place from TokenSpeed's N16 MoE banks. The
 MXFP8 pipeline pads the intermediate to ``INTER_PAD``, and its scales use the
@@ -65,16 +69,10 @@ RANKS = gl.constexpr(11)  # the routed top 10, then the shared expert
 INTER = gl.constexpr(640)
 INTER_PAD = gl.constexpr(768)
 ROUTER_TASKS = gl.constexpr(65)
-UP_TASKS = gl.constexpr(220)  # RANKS * INTER / 32
+UP_BLOCKS = gl.constexpr(220)  # RANKS * INTER / 32: 32-column blocks
 DOWN_TASKS = gl.constexpr(160)  # HIDDEN / 16
 W13_CELLS = gl.constexpr(10)  # 256-wide K cells of HIDDEN
 W2_CELLS = gl.constexpr(3)  # of INTER_PAD
-# Rows of M5 weights a task keeps in flight. Each row takes about 45 VGPRs.
-# Two spill at four rows. The task issues the first while M4 ends, and the
-# next as a row's chain frees its registers.
-DOWN_INFLIGHT = gl.constexpr(1)
-# Rows whose M5 intermediates one poll round trip covers.
-DOWN_POLL_ROWS = gl.constexpr(2)
 
 REGIONS = (
     ("lg", 256),  # router logits, BF16 pairs
@@ -84,18 +82,42 @@ REGIONS = (
 )
 
 
+def shared_blocks(rows: int) -> int:
+    """32-column blocks of the shared expert per M4 task. Past one row, a
+    task reads its weights once for every row, so it takes more blocks."""
+    return {1: 1, 2: 2}.get(rows, 4)
+
+
+def up_tasks(rows: int) -> int:
+    """M4's tasks: 20 per routed rank, then the shared expert's."""
+    return int(TOP_K) * 20 + 20 // shared_blocks(rows)
+
+
+def router_rows(rows: int) -> int:
+    """Rows of one router task. Past two rows, two: the tasks of a block of
+    experts split the rows, so a task's per-row work stays short."""
+    return 2 if rows > 2 else rows
+
+
 def stages(
-    bases: dict[str, int], X: str, W: str, OUT: tuple[str, ...]
+    bases: dict[str, int], rows: int, X: str, W: str, OUT: tuple[str, ...]
 ) -> tuple[Stage, ...]:
-    """M3-M5, placed by ``bases``. ``X`` is the MLP mixer's region prefix and
+    """M3-M5 for ``rows`` rows, placed by ``bases``. ``X`` is the MLP
+    mixer's region prefix and
     ``W`` is the region of the residual streams. M5 also publishes the output
     streams in the regions ``OUT`` (none or one)."""
     m3, m4, m5 = placement(bases, ("m3", "m4", "m5"))
     return (
-        Stage("m3", int(ROUTER_TASKS), m3, reads=(X + "xbf",), writes=("lg", "sg")),
+        Stage(
+            "m3",
+            int(ROUTER_TASKS) * -(-rows // router_rows(rows)),
+            m3,
+            reads=(X + "xbf",),
+            writes=("lg", "sg"),
+        ),
         Stage(
             "m4",
-            int(UP_TASKS),
+            up_tasks(rows),
             m4,
             reads=("lg", X + "x8", X + "xe"),
             writes=("dn8", "dne"),
@@ -148,78 +170,94 @@ def _pick(values, k):
 
 
 @gluon.jit
-def _by_rank(values, ranks):
-    """A :func:`_route_row` vector in the layout of ``ranks`` (``arange(16)``)."""
-    return gl.convert_layout(values, ranks.type.layout)
-
-
-@gluon.jit
 def router_stage(mb, task, weights, X: gl.constexpr, STAGE: gl.constexpr):
-    """M3 task ``task``: logits of experts ``8 task .. 8 task + 7`` (BF16), or
-    for the last task the shared expert gate logit (FP32).
+    """M3 task ``task``: for rows ``RT h .. RT h + RT - 1`` (``RT`` =
+    :func:`router_rows`, ``h = task // 65``), the logits of experts
+    ``8 b .. 8 b + 7`` (BF16, ``b = task % 65``), or for the last block the
+    shared expert gate logit (FP32).
 
     Args:
         weights: The block's :class:`Weights`.
         X: Region prefix of the MLP mixer (its BF16 row ``xbf``).
     """
     mb.stamp(STAGE, trace.START)
-    is_gate = task == ROUTER_TASKS - 1
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RT: gl.constexpr = _task_rows(mb.plan)
+    RTP: gl.constexpr = triton.next_power_of_2(RT)
+    block = task % ROUTER_TASKS
+    row0 = task // ROUTER_TASKS * RT
+    is_gate = block == ROUTER_TASKS - 1
     rl: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [gl.num_warps(), 1], [1, 0])
     r = gl.arange(0, 8, gl.SliceLayout(1, rl))
     k = gl.arange(0, 4096, gl.SliceLayout(0, rl))
     rows = gl.where(
         is_gate,
         weights.gate_w + 0 * (r[:, None] * HIDDEN),
-        weights.router_w + (task * 8 + r)[:, None] * HIDDEN,
+        weights.router_w + (block * 8 + r)[:, None] * HIDDEN,
     )
     w = gl.load(rows + k[None, :], mask=(k < HIDDEN)[None, :], other=0.0)
     gl.amd.hint.sched_barrier()
-    # The BF16 rows: poll compactly, then share them through LDS.
-    R: gl.constexpr = schedule.rows(mb.plan)
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    i = gl.arange(0, 2048, lanes)
+    # The task's BF16 rows (past the last row: the last row again): poll
+    # compactly, then share them through LDS.
+    pl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, gl.num_warps()], [1, 0])
+    j = gl.arange(0, RTP, gl.SliceLayout(1, pl))[:, None]
+    i = gl.arange(0, 2048, gl.SliceLayout(0, pl))[None, :]
+    index = mb.row_offset(gl.minimum(row0 + j, R - 1)) + gl.minimum(i, HIDDEN // 2 - 1)
+    (words,) = mb.poll_pairs((mb.pairs(X + "xbf", index),))
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
-    x_words = gl.allocate_shared_memory(
-        gl.int32, [triton.next_power_of_2(R) * 2048], flat
-    )
-    words = mb.poll_rows((X + "xbf",), (gl.minimum(i, HIDDEN // 2 - 1),), R)
-    for row in gl.static_range(R):
-        x_words.slice(row * 2048, 2048).store(
-            gl.where(i < HIDDEN // 2, words[row][0], 0)
-        )
+    x_words = gl.allocate_shared_memory(gl.int32, [RTP * 2048], flat)
+    x_words.store(gl.reshape(gl.where(i < HIDDEN // 2, words, 0), [RTP * 2048]))
     gl.barrier()
     mb.stamp(STAGE, trace.READY)
-    for row in gl.static_range(R):
-        x = x_words.slice(row * 2048, 2048).reinterpret(gl.bfloat16, [4096], flat)
-        x = x.load(gl.SliceLayout(0, rl))
-        logit = gl.sum(w.to(gl.float32) * x.to(gl.float32)[None, :], axis=1)
-        if is_gate:
-            one = gl.arange(0, 1, lanes)
-            mb.row(row).put(
-                "sg", one, gl.full([1], 0.0, gl.float32, lanes) + gl.max(logit, axis=0)
-            )
-        else:
-            mx.put_bf16(mb.row(row), "lg", task * 4, logit)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    for t in gl.static_range(RT):
+        row = row0 + t
+        if row < R:
+            x = x_words.slice(t * 2048, 2048).reinterpret(gl.bfloat16, [4096], flat)
+            x = x.load(gl.SliceLayout(0, rl))
+            logit = gl.sum(w.to(gl.float32) * x.to(gl.float32)[None, :], axis=1)
+            if is_gate:
+                one = gl.arange(0, 1, lanes)
+                mb.row(row).put(
+                    "sg",
+                    one,
+                    gl.full([1], 0.0, gl.float32, lanes) + gl.max(logit, axis=0),
+                )
+            else:
+                mx.put_bf16(mb.row(row), "lg", block * 4, logit)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
 
 
-@gluon.jit
-def _up_tiles(task, experts, weights):
-    """Issue the weight loads of M4 task ``task`` (``experts`` from
-    :func:`_route_row`): blocks ``4 q .. 4 q + 3`` (gate, up, gate, up rows
-    of columns ``32 q ..``) of its rank's expert.
+@gluon.constexpr_function
+def _task_rows(plan):
+    """:func:`router_rows` of a launch's plan."""
+    return 2 if plan.plan.rows > 2 else plan.plan.rows
 
-    The shared expert's blocks alternate like the banks'. Thus every rank is
+
+@gluon.jit
+def _up_tiles(
+    task, unit: gl.constexpr, routes, weights, R: gl.constexpr, C: gl.constexpr
+):
+    """Issue the weight loads of unit ``unit`` of M4 task ``task``
+    (``routes`` from :func:`routing`): blocks ``4 q .. 4 q + 3`` (gate, up,
+    gate, up rows of columns ``32 q ..``) of an expert. A routed rank's
+    unit is a row: the row's expert, block ``q = task % 20``. A shared expert
+    task's unit is its block ``q = C (task - 200) + unit``.
+
+    The shared expert's blocks alternate like the banks'. Thus every unit is
     one load sequence with a scalar base. A branch per rank would join two
     sequences' registers, and the copies there wait for the loads.
     """
     rank = task // 20
-    q = task % 20
     routed = rank < TOP_K
     # Wave-uniform, so the loads take a scalar base (else every load becomes
     # a waterfall loop over the lanes' bases).
-    expert = wave_uniform_i32(_pick(experts, rank)).to(gl.int64)
+    row = _route_row(routes, _last_row(unit, R))[0]
+    expert = wave_uniform_i32(_pick(row, rank)).to(gl.int64)
+    q = task % 20
+    if C > 1:
+        q = gl.where(routed, q, (task - TOP_K * 20) * C + unit)
     if routed:
         tiles, scales = mx.load_weight_tiles(
             weights.w13 + expert * (2 * INTER_PAD * HIDDEN // 2),
@@ -269,7 +307,7 @@ def _up_publish(mb, task, out):
 
 @gluon.constexpr_function
 def _batch_layouts(num_warps):
-    """Rank-3 MFMA over the 16 (11 used) ranks: 2 ranks per wave."""
+    """Rank-3 MFMA over a group of 16 M5 chains: 2 chains per wave."""
     mma = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 128],
@@ -281,9 +319,9 @@ def _batch_layouts(num_warps):
 
 @gluon.constexpr_function
 def _batch_scale_layout(num_warps):
-    """E8M0 scales ``[16 ranks, 16 rows, 4 K groups]`` of :func:`_batch_layouts`.
+    """E8M0 scales ``[16 chains, 16 rows, 4 K groups]`` of :func:`_batch_layouts`.
 
-    Waves own ranks ``0 .. num_warps - 1`` and a register repeat adds
+    Waves own chains ``0 .. num_warps - 1`` and a register repeat adds
     ``num_warps`` (as the MFMA layout places its batch dimension).
     """
     warp_bits = num_warps.bit_length() - 1
@@ -296,17 +334,54 @@ def _batch_scale_layout(num_warps):
     )
 
 
+@gluon.constexpr_function
+def _chain_groups(rows):
+    """Groups of 16 M5 chains. Chain ``c < 11 rows`` is rank ``c % 11`` of
+    row ``c // 11`` (rank 10: the shared expert)."""
+    return (rows * RANKS + 15) // 16
+
+
+@gluon.constexpr_function
+def _chain_slots(rows):
+    """LDS rows per k-iteration of M5's intermediates (chain ``c``'s at row
+    ``c``), a power of 2."""
+    return triton.next_power_of_2(rows * RANKS)
+
+
 @gluon.jit
-def _down_tiles(task, experts, weights):
-    """Issue the weight loads of M5 task ``task`` (``experts`` from
-    :func:`_route_row`)."""
+def _chain_rows(c, R: gl.constexpr):
+    """``(valid, row, rank)`` of chain ``c``."""
+    valid = c < R * RANKS
+    return valid, gl.where(valid, c // RANKS, 0), gl.where(valid, c % RANKS, 0)
+
+
+@gluon.jit
+def _chain_values(table, c, R: gl.constexpr):
+    """``table[c // 11, c % 11]`` (a :func:`routing` tensor) of each chain
+    ``c [16]``, in the layout of ``c``."""
+    rl: gl.constexpr = table.type.layout
+    cj = gl.convert_layout(c, gl.SliceLayout(0, rl))
+    _, row, rank = _chain_rows(cj, R)
+    rr = gl.arange(0, table.shape[0], gl.SliceLayout(1, rl))[:, None]
+    picked = gl.gather(table, gl.zeros_like(table.to(gl.int32)) + rank[None, :], 1)
+    # A thread holds every row of its rank (rows in registers).
+    value = gl.sum(gl.where(rr == row[None, :], picked, 0), axis=0)
+    return gl.convert_layout(value, c.type.layout)
+
+
+@gluon.jit
+def _down_tiles(task, group: gl.constexpr, experts, weights, R: gl.constexpr):
+    """Issue the weight loads of chains ``16 group ..`` of M5 task ``task``
+    (``experts`` from :func:`routing`). Chains past the last row load
+    nothing."""
     bl: gl.constexpr = _batch_layouts(gl.num_warps())[2]
-    # B tiles of every rank: rank 10 is the shared expert, 11-15 unused.
     rb = gl.arange(0, 16, gl.SliceLayout(1, gl.SliceLayout(2, bl)))
     kb = gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, bl)))
     nb = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, bl)))
-    eb = _by_rank(experts, rb)
-    routed = rb < TOP_K
+    cb = group * 16 + rb
+    eb = _chain_values(experts, cb, R)
+    used_b, _, rank_b = _chain_rows(cb, R)
+    routed = used_b & (rank_b < TOP_K)
     tile_base = gl.where(
         routed,
         (eb.to(gl.int64) * HIDDEN + task * 16) * (INTER_PAD // 2),
@@ -324,7 +399,9 @@ def _down_tiles(task, experts, weights):
     rs = gl.arange(0, 16, gl.SliceLayout(1, gl.SliceLayout(2, sl)))
     ns = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, sl)))
     gs = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, sl)))
-    es = _by_rank(experts, rs)
+    cs = group * 16 + rs
+    es = _chain_values(experts, cs, R)
+    used_s, _, rank_s = _chain_rows(cs, R)
     cell = (
         (task // 2) * (W2_CELLS * 256)
         + gs[None, None, :] * 64
@@ -332,13 +409,13 @@ def _down_tiles(task, experts, weights):
         + task % 2
     )
     s_base = gl.where(
-        (rs < TOP_K)[:, None, None],
+        (used_s & (rank_s < TOP_K))[:, None, None],
         weights.s2
         + (es.to(gl.int64) * (HIDDEN // 32 * W2_CELLS * 256))[:, None, None]
         + cell,
         weights.shared_dn_s + cell,
     )
-    used = (rb < RANKS)[:, None, None]
+    used = used_b[:, None, None]
     tiles = ()
     scales = ()
     for i in gl.static_range(INTER // 128):
@@ -346,7 +423,7 @@ def _down_tiles(task, experts, weights):
         scales += (
             gl.load(
                 s_base + (i // 2) * 256 + (i % 2) * 2,
-                mask=(rs < RANKS)[:, None, None],
+                mask=used_s[:, None, None],
                 other=127,
             ),
         )
@@ -365,19 +442,19 @@ def _down_inputs(mb, task, M: gl.constexpr, W: gl.constexpr):
     intermediate (into LDS), the residual columns of region ``W``, and the
     MLP mixer's (prefix ``M``) inject gates and the shared expert gate.
 
-    The intermediates poll ``DOWN_POLL_ROWS`` rows per round trip, which
-    bounds a thread's polled pairs (and their registers). The first trip
-    also polls the other inputs of every row.
+    The polls take two round trips, which bounds a thread's polled pairs
+    (and their registers).
 
     Returns:
-        ``(x_words, xs_smem, residual, mix, shared_gate)``: LDS ``[RP * 128,
-        32]`` int32 and ``[RP * 128, 4]`` uint8 (row ``r``'s k-iteration
-        ``i``, rank ``k`` at LDS row ``(8 r + i) * 16 + k``), then FP32
-        ``[RP, 4, 16]`` (:func:`_stream_layout`), ``[RP, 4]`` and ``[RP]``.
+        ``(x_words, xs_smem, residual, mix, shared_gate)``: LDS ``[8 S, 32]``
+        int32 and ``[8 S, 4]`` uint8 (k-iteration ``i``'s intermediate of
+        chain ``c`` at LDS row ``i S + c``, ``S = _chain_slots(rows)``), then
+        FP32 ``[RP, 4, 16]``
+        (:func:`_stream_layout`), ``[RP, 4]`` and ``[RP]``.
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
-    G: gl.constexpr = _rows_per_poll(RP)
+    S: gl.constexpr = _chain_slots(R)
     NW: gl.constexpr = gl.num_warps()
     # Residual columns (a BF16 pair per lane), and the inject half-logits
     # ([row, stream, 0..1]) with the shared gate ([row, stream, 2..3]).
@@ -397,26 +474,51 @@ def _down_inputs(mb, task, M: gl.constexpr, W: gl.constexpr):
         mb.pairs(M + "inj", mb.row_offset(gr) + gh * 4 + gb),
         mb.pairs("sg", mb.row_offset(gr) + gb * 0),
     )
+    # The words of k-iteration i ([S, 32]) and every k-iteration's exponents
+    # ([8, S, 4], k-iterations 5 to 7 padding). Padding polls the row's
+    # pair 0, so it costs one cache line per instruction.
+    wl: gl.constexpr = gl.BlockedLayout([1, 1], [2, 32], [NW, 1], [1, 0])
+    ok, row, rank = _chain_rows(gl.arange(0, S, gl.SliceLayout(1, wl)), R)
+    word = mb.row_offset(row)[:, None] + gl.where(
+        ok[:, None],
+        (rank * 160)[:, None] + gl.arange(0, 32, gl.SliceLayout(0, wl))[None, :],
+        0,
+    )
+    el: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 16, 4], [NW, 1, 1], [2, 1, 0])
+    ei = gl.arange(0, 8, gl.SliceLayout(1, gl.SliceLayout(2, el)))[:, None, None]
+    ec = gl.arange(0, S, gl.SliceLayout(0, gl.SliceLayout(2, el)))[None, :, None]
+    ee = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, el)))[None, None, :]
+    e_ok, e_row, e_rank = _chain_rows(ec, R)
+    e_ok = e_ok & (ei < INTER // 128)
+    exponent = mb.row_offset(e_row) + gl.where(e_ok, e_rank * 20 + ei * 4 + ee, 0)
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    x_words = gl.allocate_shared_memory(gl.int32, [RP * 128, 32], flat)
-    xs_smem = gl.allocate_shared_memory(gl.uint8, [RP * 128, 4], flat)
+    x_words = gl.allocate_shared_memory(gl.int32, [8 * S, 32], flat)
+    xs_smem = gl.allocate_shared_memory(gl.uint8, [8 * S, 4], flat)
     # Throttle: wave 0 waits for M4's exponents (each M4 task writes its
     # block's exponent after its words) before every wave polls the inputs.
-    mb.row(R - 1).pre_poll_spread("dne", UP_TASKS)
-    word_ok, word_i, exp_ok, exp_i = _intermediate_index(mb, 0, G)
-    got_w, got_e, got_h, got_g = mb.poll_pairs(
+    mb.row(R - 1).pre_poll_spread("dne", UP_BLOCKS)
+    got_0, got_1, got_e, got_h = mb.poll_pairs(
         (
-            mb.pairs("dn8", word_i),
-            mb.pairs("dne", exp_i),
+            mb.pairs("dn8", word),
+            mb.pairs("dn8", word + gl.where(ok[:, None], 32, 0)),
+            mb.pairs("dne", exponent),
             mb.pairs(W, mb.row_offset(r) + column // 2),
+        )
+    )
+    x_words.slice(0, S, 0).store(gl.where(ok[:, None], got_0, 0))
+    x_words.slice(S, S, 0).store(gl.where(ok[:, None], got_1, 0))
+    xs_smem.store(gl.reshape(gl.where(e_ok, got_e, 127).to(gl.uint8), [8 * S, 4]))
+    got_2, got_3, got_4, got_g = mb.poll_pairs(
+        (
+            mb.pairs("dn8", word + gl.where(ok[:, None], 64, 0)),
+            mb.pairs("dn8", word + gl.where(ok[:, None], 96, 0)),
+            mb.pairs("dn8", word + gl.where(ok[:, None], 128, 0)),
             gates,
         )
     )
-    _store_intermediates(x_words, xs_smem, 0, word_ok, got_w, exp_ok, got_e)
-    for first in gl.static_range(G, RP, G):
-        word_ok, word_i, exp_ok, exp_i = _intermediate_index(mb, first, G)
-        got_w, got_e = mb.poll_pairs((mb.pairs("dn8", word_i), mb.pairs("dne", exp_i)))
-        _store_intermediates(x_words, xs_smem, first, word_ok, got_w, exp_ok, got_e)
+    x_words.slice(2 * S, S, 0).store(gl.where(ok[:, None], got_2, 0))
+    x_words.slice(3 * S, S, 0).store(gl.where(ok[:, None], got_3, 0))
+    x_words.slice(4 * S, S, 0).store(gl.where(ok[:, None], got_4, 0))
     residual = mx.bf16_half(got_h, column)
     halves = gl.where(gh < 2, got_g.to(gl.float32, bitcast=True), 0.0)
     logit = gl.sum(halves, axis=2).to(gl.bfloat16).to(gl.float32)
@@ -429,106 +531,47 @@ def _down_inputs(mb, task, M: gl.constexpr, W: gl.constexpr):
     return x_words, xs_smem, residual, mix, shared_gate
 
 
-@gluon.constexpr_function
-def _rows_per_poll(rows):
-    return min(rows, DOWN_POLL_ROWS)
-
-
 @gluon.jit
-def _intermediate_index(mb, FIRST: gl.constexpr, G: gl.constexpr):
-    """``(valid, pair offsets)`` of the words ``[G, 8, 16, 32]`` and the
-    exponents ``[G, 8, 16, 4]`` (row ``FIRST + g``, k-iteration, rank, ..)
-    of the ranks' MXFP8 intermediates.
-
-    A wave polls one k-iteration, and an instruction polls two ranks' words
-    (or 16 ranks' exponents). Padding (k-iterations 5 to 7, ranks 11 to 15)
-    polls the row's pair 0, so it costs one cache line per instruction.
-    """
-    NW: gl.constexpr = gl.num_warps()
-    wl: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 1, 1], [1, 1, 2, 32], [1, NW, 1, 1], [3, 2, 1, 0]
-    )
-    el: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 1, 1], [1, 1, 16, 4], [1, NW, 1, 1], [3, 2, 1, 0]
-    )
-    word_ok, word_i = _rank_index(mb, wl, FIRST, G, 160, 32)
-    exp_ok, exp_i = _rank_index(mb, el, FIRST, G, 20, 4)
-    return word_ok, word_i, exp_ok, exp_i
-
-
-@gluon.jit
-def _rank_index(
-    mb,
-    layout: gl.constexpr,
-    FIRST: gl.constexpr,
-    G: gl.constexpr,
-    RANK_PAIRS: gl.constexpr,
-    N: gl.constexpr,
-):
-    s3: gl.constexpr = gl.SliceLayout(3, layout)
-    r = (
-        FIRST
-        + gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(2, s3)))[:, None, None, None]
-    )
-    k = gl.arange(0, 8, gl.SliceLayout(0, gl.SliceLayout(2, s3)))[None, :, None, None]
-    rank = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, s3)))[
-        None, None, :, None
-    ]
-    w = gl.arange(
-        0, N, gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, layout)))
-    )[None, None, None, :]
-    valid = (k < INTER // 128) & (rank < RANKS)
-    return valid, mb.row_offset(r) + gl.where(valid, rank * RANK_PAIRS + k * N + w, 0)
-
-
-@gluon.jit
-def _store_intermediates(
-    x_words, xs_smem, FIRST: gl.constexpr, word_ok, words, exp_ok, exps
-):
-    """Rows ``FIRST ..`` of the polled intermediates into :func:`_down_inputs`'
-    LDS (padding as zero words and unit scales)."""
-    G: gl.constexpr = words.shape[0]
-    x_words.slice(FIRST * 128, G * 128, 0).store(
-        gl.reshape(gl.where(word_ok, words, 0), [G * 128, 32])
-    )
-    xs_smem.slice(FIRST * 128, G * 128, 0).store(
-        gl.reshape(gl.where(exp_ok, exps, 127).to(gl.uint8), [G * 128, 4])
-    )
-
-
-@gluon.jit
-def _down_chain(x_view, xs_smem, tiles, scales, row: gl.constexpr):
-    """M5's rank-batched MFMA chain of request ``row`` (its A rows from
-    :func:`_down_inputs`' LDS), broadcast to every MFMA row."""
+def _down_chains(x_view, xs_smem, loaded, R: gl.constexpr):
+    """Every group's rank-batched MFMA chain (A rows from
+    :func:`_down_inputs`' LDS, broadcast to every MFMA row; ``loaded`` from
+    :func:`_down_tiles`)."""
     mma: gl.constexpr = _batch_layouts(gl.num_warps())[0]
     al: gl.constexpr = _batch_layouts(gl.num_warps())[1]
     sl: gl.constexpr = _batch_scale_layout(gl.num_warps())
+    S: gl.constexpr = _chain_slots(R)
     a_full = gl.zeros([16, 16, 128], gl.uint8, al)
     as_full = gl.zeros([16, 16, 4], gl.uint8, sl)
-    acc = gl.zeros([16, 16, 16], gl.float32, mma)
-    for i in gl.static_range(INTER // 128):
-        x = x_view.slice((row * 8 + i) * 16, 16, 0).load(gl.SliceLayout(1, al))
-        a, _ = gl.broadcast(gl.expand_dims(x, 1), a_full)
-        xs = xs_smem.slice((row * 8 + i) * 16, 16, 0).load(gl.SliceLayout(1, sl))
-        a_s, _ = gl.broadcast(gl.expand_dims(xs, 1), as_full)
-        acc = gl.amd.cdna4.mfma_scaled(
-            a.to(gl.float8e4nv, bitcast=True),
-            a_s,
-            "e4m3",
-            tiles[i],
-            scales[i],
-            "e2m1",
-            acc,
-        )
-    return acc
+    accs = ()
+    for g in gl.static_range(len(loaded)):
+        tiles, scales = loaded[g]
+        acc = gl.zeros([16, 16, 16], gl.float32, mma)
+        for i in gl.static_range(INTER // 128):
+            x = x_view.slice(i * S + g * 16, 16, 0).load(gl.SliceLayout(1, al))
+            a, _ = gl.broadcast(gl.expand_dims(x, 1), a_full)
+            xs = xs_smem.slice(i * S + g * 16, 16, 0).load(gl.SliceLayout(1, sl))
+            a_s, _ = gl.broadcast(gl.expand_dims(xs, 1), as_full)
+            acc = gl.amd.cdna4.mfma_scaled(
+                a.to(gl.float8e4nv, bitcast=True),
+                a_s,
+                "e4m3",
+                tiles[i],
+                scales[i],
+                "e2m1",
+                acc,
+            )
+        accs += (acc,)
+    return accs
 
 
 @gluon.jit
-def _down_epilogue(mb, task, acc, route_weights, inputs, out, OUT: gl.constexpr):
-    """Every row of M5 task ``task`` from its gathered accumulator
-    ``acc`` (MFMA row ``m`` holds row ``m % RP``). The epilogue:
+def _down_epilogue(mb, task, accs, routes, inputs, out, OUT: gl.constexpr):
+    """Every row of M5 task ``task`` from the chains' accumulators ``accs``
+    (:func:`_down_chains`). The epilogue:
 
-    1. Combines the ranks with ``route_weights`` (:func:`routing`).
+    1. Combines each row's ranks with its weights (:func:`routing`) in rank
+       order. The order does not depend on the row count, so a row's result
+       is the same at any row count.
     2. Adds the result to the residual.
     3. Stores the layer's output streams ``out`` (BF16 ``[rows, 4 * HIDDEN]``).
 
@@ -537,30 +580,44 @@ def _down_epilogue(mb, task, acc, route_weights, inputs, out, OUT: gl.constexpr)
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
+    NW: gl.constexpr = gl.num_warps()
     _, _, residual, mix, shared_gate = inputs
-    # [rank, row, column]. The MFMA rows of a row agree.
-    y = gl.max(gl.reshape(acc, [16, 16 // RP, RP, 16]), axis=1)
-    y = y.to(gl.bfloat16).to(gl.float32)
-    yl: gl.constexpr = y.type.layout
-    rk = gl.arange(0, 16, gl.SliceLayout(1, gl.SliceLayout(2, yl)))[:, None, None]
-    w = gl.convert_layout(gl.permute(route_weights, [1, 0]), gl.SliceLayout(2, yl))
-    routed = gl.sum(gl.where(rk < TOP_K, y * w[:, :, None], 0.0), axis=0)
-    shared = gl.sum(gl.where(rk == TOP_K, y, 0.0), axis=0)
-    sl: gl.constexpr = _stream_layout(gl.num_warps())
-    routed = gl.convert_layout(
-        routed.to(gl.bfloat16).to(gl.float32), gl.SliceLayout(1, sl)
+    # Each chain's result (every MFMA row agrees) through LDS.
+    flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
+    G: gl.constexpr = triton.next_power_of_2(len(accs)) * 16
+    chains = gl.allocate_shared_memory(gl.float32, [G, 16, 16], flat)
+    for g in gl.static_range(len(accs)):
+        chains.slice(g * 16, 16, 0).store(accs[g].to(gl.bfloat16).to(gl.float32))
+    gl.barrier()
+    sl: gl.constexpr = _stream_layout(NW)
+    ol: gl.constexpr = gl.SliceLayout(1, sl)
+    # MFMA row 0 of every row's 16 chains from its first, [rows x 16, 1, 16]
+    # with a column's 16 chains in one thread.
+    wl: gl.constexpr = gl.BlockedLayout(
+        [16, 1, 1], [RP, 1, 64 // RP], [1, 1, NW], [2, 1, 0]
     )
-    shared = gl.convert_layout(shared, gl.SliceLayout(1, sl))
+    x = gl.arange(0, RP * 16, gl.SliceLayout(1, gl.SliceLayout(2, wl)))[:, None, None]
+    n = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, wl)))[None, None, :]
+    chain = gl.minimum((x // 16) * RANKS + x % 16, G - 1)
+    window = gl.reshape(chains.gather(chain + 0 * n, 0), [RP, 16, 16])
+    k = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, window.type.layout)))
+    k = k[None, :, None]
+    w = gl.convert_layout(routes[1], gl.SliceLayout(2, window.type.layout))
+    routed = gl.sum(gl.where(k < TOP_K, window * w[:, :, None], 0.0), axis=1)
+    shared = gl.sum(gl.where(k == TOP_K, window, 0.0), axis=1)
+    routed = gl.convert_layout(routed, ol)
+    shared = gl.convert_layout(shared, ol)
+    routed = routed.to(gl.bfloat16).to(gl.float32)
     block = (routed + shared_gate[:, None] * shared).to(gl.bfloat16).to(gl.float32)
     streams = (residual + block[:, None, :] * mix[:, :, None]).to(gl.bfloat16)
     r = gl.arange(0, RP, gl.SliceLayout(1, gl.SliceLayout(2, sl)))[:, None, None]
-    b = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(2, sl)))[None, :, None]
+    bb = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(2, sl)))[None, :, None]
     c = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, sl)))[None, None, :]
-    gl.store(out + r * (4 * HIDDEN) + b * HIDDEN + task * 16 + c, streams, mask=r < R)
+    gl.store(out + r * (4 * HIDDEN) + bb * HIDDEN + task * 16 + c, streams, mask=r < R)
     if OUT != "":
         streams = streams.to(gl.float32)
         for i in gl.static_range(4):
-            stream = gl.sum(gl.where(b == i, streams, 0.0), axis=1)
+            stream = gl.sum(gl.where(bb == i, streams, 0.0), axis=1)
             mx.put_bf16_rows(mb, OUT, (i * HIDDEN + task * 16) // 2, stream)
 
 
@@ -741,41 +798,76 @@ def _up_finish(
     DOWN: gl.constexpr,
 ):
     """M4 task ``task`` for every row (``routes`` from :func:`routing`, ``x``
-    from :func:`_up_inputs`). With ``DOWN``, it also issues the first rows'
-    loads of M5 task ``down_task`` before the last GEMV (see
+    from :func:`_up_inputs`). With ``DOWN``, it also issues the loads of the
+    first chain group of M5 task ``down_task`` before the last GEMV (see
     :func:`_down_issue`) and returns them. Else it returns ``()``.
-
-    Every row runs the rank's own weights: the routed rows' experts, or the
-    shared expert for each row of a shared-rank task (a re-read from L2).
     """
     R: gl.constexpr = schedule.rows(mb.plan)
+    C: gl.constexpr = _shared_blocks(mb.plan)
+    U: gl.constexpr = max(R, C)
     x_smem, xs_smem = x
     mb.stamp("m4", trace.READY)
-    # Two rows' weights are in flight. Rows 0 and 1 load at once. Row r + 2
-    # loads as soon as row r computes (its registers are free then).
+    # Two units' weights are in flight. Units 0 and 1 load at once. Unit
+    # u + 2 loads as soon as unit u computes (its registers are free then).
+    # Each unit's GEMV runs every row (an MFMA has 16 rows anyway). A routed
+    # task keeps row u of unit u and publishes once. A shared expert task
+    # publishes every unit's block for every row.
+    shared = task >= TOP_K * 20
+    gl.static_assert(
+        C * triton.next_power_of_2(R) <= 16, "a block per 16 // RP MFMA rows"
+    )
     loaded = ()
-    for r in gl.static_range(_up_ahead(R)):
-        loaded += (_up_tiles(task, _route_row(routes, r)[0], weights),)
+    for u in gl.static_range(_up_ahead(U)):
+        loaded += (_up_tiles(task, u, routes, weights, R, C),)
     head = ()
-    if (R == 1) & DOWN:
+    if (U == 1) & DOWN:
         head = _down_issue(down_task, routes, weights, R)
-    # Every row's chain adds into one accumulator (its own MFMA rows), so
-    # one epilogue serves all rows.
+    RP: gl.constexpr = xs_smem.shape[0]
     acc = mx.gemv_zero(2, 4)
-    for r in gl.static_range(R):
-        tiles, scales = loaded[r]
-        acc = mx.gemv_row(acc, x_smem, xs_smem, tiles, scales, r)
-        # Keep each row's loads after the chain that frees their registers.
+    m = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, acc.type.layout)))
+    units = ()
+    for u in gl.static_range(U):
+        tiles, scales = loaded[u]
+        own = mx.gemv_chain(x_smem, xs_smem, tiles, scales)
+        # Keep each unit's loads after the chain that frees their registers.
         gl.amd.hint.sched_barrier()
-        if r + 2 < R:
-            loaded += (_up_tiles(task, _route_row(routes, r + 2)[0], weights),)
-        elif (r + 2 == R) & DOWN:
-            # M5's first rows stream while M4's last row computes.
+        if u + 2 < U:
+            loaded += (_up_tiles(task, u + 2, routes, weights, R, C),)
+        elif (u + 2 == U) & DOWN:
+            # M5's first chains stream while M4's last unit computes.
             head = _down_issue(down_task, routes, weights, R)
-    _up_publish(mb, task, mx.gemv_result(acc, xs_smem.shape[0]))
+        # MFMA row m keeps row m % RP of unit u: a routed task's row u, or
+        # every row of a shared task's block m // RP.
+        # A routed task keeps row u of unit u. A shared task keeps every
+        # unit (its blocks), and publishes them after its last load.
+        units += (own,)
+        acc = gl.where((m % RP == u)[None, :, None], own, acc)
+    if C > 1:
+        if shared:
+            for k in gl.static_range(C):
+                _up_publish(
+                    mb,
+                    TOP_K * 20 + (task - TOP_K * 20) * C + k,
+                    mx.gemv_result(units[k], RP),
+                )
+        else:
+            _up_publish(mb, task, mx.gemv_result(acc, RP))
+    else:
+        _up_publish(mb, task, mx.gemv_result(acc, RP))
     mb.stamp("m4", trace.COMPUTED)
     mb.stamp("m4", trace.END)
     return head
+
+
+@gluon.constexpr_function
+def _last_row(unit, rows):
+    return min(unit, rows - 1)
+
+
+@gluon.constexpr_function
+def _shared_blocks(plan):
+    """:func:`shared_blocks` of a launch's plan."""
+    return {1: 1, 2: 2}.get(plan.plan.rows, 4)
 
 
 @gluon.constexpr_function
@@ -784,17 +876,15 @@ def _up_ahead(rows):
 
 
 @gluon.constexpr_function
-def _inflight(rows):
-    return min(rows, DOWN_INFLIGHT)
+def _before_poll(groups):
+    """M5 chain groups whose loads issue before the input poll."""
+    return max(1, groups - 1)
 
 
 @gluon.jit
 def _down_issue(task, routes, weights, R: gl.constexpr):
-    """Issue M5 task ``task``'s weight loads of its first ``DOWN_INFLIGHT`` rows."""
-    head = ()
-    for r in gl.static_range(_inflight(R)):
-        head += (_down_tiles(task, _route_row(routes, r)[0], weights),)
-    return head
+    """Issue M5 task ``task``'s weight loads of its first chain group."""
+    return (_down_tiles(task, 0, routes[0], weights, R),)
 
 
 @gluon.jit
@@ -809,36 +899,26 @@ def _down_finish(
     W: gl.constexpr,
     OUT: gl.constexpr,
 ):
-    """M5 task ``task`` for every row, with the first rows' loads (``head``)
-    already issued. The task issues loads up to ``DOWN_INFLIGHT`` rows and
-    polls every row's inputs. A poll waits for the loads, which land while
-    the slowest M4 task finishes. Then the task runs each row's chain into
-    one accumulator and one epilogue. Row ``r + DOWN_INFLIGHT``'s loads issue
-    once row ``r``'s chain frees its registers.
+    """M5 task ``task`` for every row, with the first chain groups' loads
+    (``head``) already issued. The task issues every other group's loads,
+    then polls every row's inputs. A poll waits for the loads, which land
+    while the slowest M4 task finishes. Then the groups' chains run, and one
+    epilogue serves every row.
     """
     R: gl.constexpr = schedule.rows(mb.plan)
-    RP: gl.constexpr = triton.next_power_of_2(R)
+    G: gl.constexpr = _chain_groups(R)
     loaded = head
-    for r in gl.static_range(len(head), _inflight(R)):
-        loaded += (_down_tiles(task, _route_row(routes, r)[0], weights),)
+    for g in gl.static_range(len(head), _before_poll(G)):
+        loaded += (_down_tiles(task, g, routes[0], weights, R),)
     inputs = _down_inputs(mb, task, M, W)
+    # The last group issues after the poll, whose registers it reuses. Its
+    # loads stream while the first groups' chains run.
+    for g in gl.static_range(_before_poll(G), G):
+        loaded += (_down_tiles(task, g, routes[0], weights, R),)
     mb.stamp("m5", trace.READY)
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    x_view = inputs[0].reinterpret(gl.uint8, [RP * 128, 128], flat)
-    mma: gl.constexpr = _batch_layouts(gl.num_warps())[0]
-    acc = gl.zeros([16, 16, 16], gl.float32, mma)
-    m = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, mma)))[None, :, None]
-    for r in gl.static_range(R):
-        tiles, scales = loaded[r]
-        own = _down_chain(x_view, inputs[1], tiles, scales, r)
-        acc = gl.where(m % RP == r, own, acc)
-        # Keep the next row's loads after this chain, which frees their
-        # registers.
-        gl.amd.hint.sched_barrier()
-        if r + DOWN_INFLIGHT < R:
-            loaded += (
-                _down_tiles(task, _route_row(routes, r + DOWN_INFLIGHT)[0], weights),
-            )
+    x_view = inputs[0].reinterpret(gl.uint8, [8 * _chain_slots(R), 128], flat)
+    accs = _down_chains(x_view, inputs[1], loaded, R)
     mb.stamp("m5", trace.COMPUTED)
-    _down_epilogue(mb, task, acc, routes[1], inputs, out, OUT)
+    _down_epilogue(mb, task, accs, routes, inputs, out, OUT)
     mb.stamp("m5", trace.END)

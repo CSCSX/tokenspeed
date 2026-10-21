@@ -88,7 +88,15 @@ def _tail(src: tuple[str, ...], final: bool, rows: int) -> tuple[Stage, ...]:
     return (
         *out_proj.stages({"c1": 96}, "a_", src),
         *hc.stages("m_", {"m1": 0, "m2": 176}, rows, ("w",)),
-        *moe.stages({"m3": 28, "m4": 93, "m5": 96}, "m_", "w", ("h",) if final else ()),
+        *moe.stages(
+            # M5 first takes the CTAs after M4's: their M5 weights stream
+            # while M4 runs.
+            {"m3": 28, "m4": 93, "m5": 96},
+            rows,
+            "m_",
+            "w",
+            ("h",) if final else (),
+        ),
         *final_mixer,
     )
 

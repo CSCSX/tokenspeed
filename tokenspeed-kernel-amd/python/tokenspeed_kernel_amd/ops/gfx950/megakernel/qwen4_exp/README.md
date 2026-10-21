@@ -68,7 +68,7 @@ once.
 | `p2` | `ple.py` | 80 per row | 176 | The gate, the Gemma norms and the dilated depthwise conv of 128 channels of one stream. Writes the next conv state. |
 | `a1`, `m1`, `f1` | `hc.py` | 28 per row | 0, 0, 57 | Mixer reduce: the per-stream Gemma norm, the low-rank down projection and the inject logits, for one K half of the streams. |
 | `a2`, `m2`, `f2` | `hc.py` | 80 | 176, 176, 0 | Mixer mix: the up projection of 32 columns of each stream. Publishes the mixed row as MXFP8 and as BF16. |
-| `b1` | `gdn.py` | 128 | 28 | 128 rows of `in_proj_qkvz`. Tasks 0 to 79 also run the causal conv. Tasks 80 to 127 also compute two `in_proj_b` / `in_proj_a` logits each. |
+| `b1` | `gdn.py` | 256 | 28 | 64 rows of `in_proj_qkvz`. Tasks 0 to 159 also run the causal conv. Tasks 160 to 255 also compute one `in_proj_b` / `in_proj_a` logit each. |
 | `b3` | `gdn.py` | 48 per row | 28 | The gated delta rule of one value head, then the gated RMS norm. Publishes the result as MXFP8. |
 | `q1` | `qsa.py` | 109 | 28 | 128 rows of `qkv_proj` or `index_qk_proj`. |
 | `q2` | `qsa.py` | 31 per row | 246 | Q and K norm and MRoPE, the KV cache write, the index q heads, and the index key with its block compression. |
@@ -78,9 +78,9 @@ once.
 | `q5` | `qsa.py` | 64 per row | 64 | Attention of one KV head over one of 32 splits. Publishes `acc / l` and the base-2 LSE. |
 | `q6` | `qsa.py` | 48 per row | 128 | The LSE merge of 128 dims of a head, then the output gate. Publishes the result as MXFP8. |
 | `c1` | `out_proj.py` | 160 | 96 | The output projection of 16 hidden columns, then the gated residual combine of the 4 streams. |
-| `m3` | `moe.py` | 65 | 28 | Router logits of 8 experts each. The last task computes the shared expert gate. |
-| `m4` | `moe.py` | 220 | 93 | Routes, then the gate and up projection of 32 intermediate columns of one rank (10 routed and 1 shared). Publishes `silu(gate) * up` as MXFP8. |
-| `m5` | `moe.py` | 160 | 96 | Routes, then all 11 down projections of 16 hidden columns as one rank-3 MFMA. Combines them into the output streams. |
+| `m3` | `moe.py` | 65 (130 past 2 rows) | 28 | Router logits of 8 experts each, for every row or (past 2 rows) for 2 rows. The last block of experts is the shared expert gate. |
+| `m4` | `moe.py` | 220 (200 + 20 / C past 1 row) | 93 | Routes, then the gate and up projection of 32 intermediate columns of one routed rank, or of `C` (`shared_blocks`) 32-column blocks of the shared expert, read once for every row. Publishes `silu(gate) * up` as MXFP8. |
+| `m5` | `moe.py` | 160 | 96 | Routes, then the down projections of 16 hidden columns of every (row, rank) chain, 16 chains per rank-3 MFMA. Combines each row's chains in rank order into the output streams. |
 
 Each module's docstring gives the exact math, the rounding points, and the
 mailbox regions. The plan functions `delta_plan` and `qsa_plan` in `layer.py`
@@ -105,8 +105,8 @@ timeline:
     loads with the B1 weights.
   - `projection_attention_stage` (`q1` and `q5`) issues the K and V gather
     with the Q1 weights.
-  - `up_down_stage` (`m4` and `m5`) issues the M5 weights during the M4
-    GEMV.
+  - `up_down_stage` (`m4` and `m5`) issues the first M5 chain group's
+    weights during the last M4 GEMV, and the other groups right after M4.
 
   These early loads gave the largest wins of the tuning.
 - `q4f` has its own CTA (255). On a shared CTA, it was about 20 us late at
@@ -116,7 +116,14 @@ timeline:
 ## Rows and verify
 
 - The weight stages (`p1`, the mixer mix stages, `b1`, `q1`, `c1`, `m3` to
-  `m5`) keep the rows as the leading tensor dimension.
+  `m5`) keep the rows as the leading tensor dimension. Past 2 rows, `m3`
+  splits the rows over two tasks per block of experts, so a
+  task's per-row work stays short.
+- `m4` streams 2 units of weights at a time: a routed task's unit is a row's
+  expert, a shared expert task's unit is a block that every row reads.
+- `m5` packs every (row, rank) down projection into chains, 16 per MFMA
+  batch (3 batches at 4 rows instead of 4 rows of 16 rank slots), so every
+  row's weights are in flight before the poll without register spills.
 - The mixer reduce stages (`a1`, `m1`, `f1`) run 28 tasks per row. The norm
   and the quantization of a row take about as long as the GEMV. Thus the rows
   run on different CTAs, and a 4-row verify layer is about 11 us faster than

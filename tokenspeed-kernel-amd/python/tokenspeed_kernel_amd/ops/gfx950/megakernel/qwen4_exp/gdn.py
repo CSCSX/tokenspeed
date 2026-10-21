@@ -23,11 +23,11 @@
 Each stage serves every row of the launch. B1 runs all rows as MFMA rows and
 reads each weight once. B3 runs one task per (row, value head).
 
-* projection (B1), 128 tasks of 128 rows of ``in_proj_qkvz`` (MXFP4) on the
-  mixed row (MXFP8). Tasks 0-79 own the ``q | k | v`` channels and apply the
+* projection (B1), 256 tasks of 64 rows of ``in_proj_qkvz`` (MXFP4) on the
+  mixed row (MXFP8). Tasks 0-159 own the ``q | k | v`` channels and apply the
   depthwise causal conv: ``silu(w . [s0, s1, s2, x])``. Its per-slot state
   ``[QKV, 3]`` (channel-major BF16) becomes ``[s1, s2, x]``.
-  Tasks 80-127 own ``z`` and each also computes two of the 96 BF16
+  Tasks 160-255 own ``z`` and each also computes one of the 96 BF16
   ``in_proj_b | in_proj_a`` logits on the BF16 mixed row.
 * recurrence (B3), one task per value head. The task runs the gated delta
   rule on the head's FP32 state ``[V, K]``. It reads the state from the
@@ -63,9 +63,9 @@ KEY = gl.constexpr(2048)  # KEY_HEADS * HEAD
 VALUE = gl.constexpr(6144)  # VALUE_HEADS * HEAD
 QKV = gl.constexpr(10240)  # conv channels: q | k | v
 CONV = gl.constexpr(4)
-ROWS = gl.constexpr(128)  # projection rows of a B1 task
-CONV_TASKS = gl.constexpr(80)  # QKV / ROWS
-PROJ_TASKS = gl.constexpr(128)  # (QKV + VALUE) / ROWS
+ROWS = gl.constexpr(64)  # projection rows of a B1 task
+CONV_TASKS = gl.constexpr(160)  # QKV / ROWS
+PROJ_TASKS = gl.constexpr(256)  # (QKV + VALUE) / ROWS
 SCALE = gl.constexpr(0.08838834764831845)  # HEAD ** -0.5
 
 REGIONS = (
@@ -183,8 +183,8 @@ def projection_recurrence_stage(
 
 @gluon.jit
 def _projection_issue(task, weights):
-    """Issue B1 task ``task``'s weight loads: one 16-row block per wave, no
-    split-K (160 KiB per task)."""
+    """Issue B1 task ``task``'s weight loads: 4 16-row blocks, each split
+    over two waves along K (80 KiB per task)."""
     return mx.load_weight_tiles(
         weights.qkvz_w,
         weights.qkvz_s,
@@ -192,9 +192,9 @@ def _projection_issue(task, weights):
         K=HIDDEN,
         kit0=0,
         KITS=20,
-        SPLIT=1,
-        NW=8,
-        GROUP=8,
+        SPLIT=2,
+        NW=4,
+        GROUP=4,
         GROUP_STRIDE=0,
         SCALES="k4",
     )
@@ -249,8 +249,8 @@ def _projection_finish(
             xs_smem,
             tiles,
             scales,
-            SPLIT=1,
-            NW=8,
+            SPLIT=2,
+            NW=4,
             SEG=0,
             SEG_STRIDE=0,
             FIRST=0,
@@ -279,14 +279,13 @@ def _projection_finish(
         gl.store(new + 2, x, mask=has_out)
         mx.put_bf16_rows(mb, "qkvz", task * (ROWS // 2), out)
     else:
-        # Two b / a logits on the BF16 mixed rows, with the z rows' GEMV.
-        row = (task - CONV_TASKS) * 2
+        # One b / a logit on the BF16 mixed rows, with the z rows' GEMV.
+        row = task - CONV_TASKS
         bl: gl.constexpr = gl.BlockedLayout(
             [1, 8], [1, 64], [1, gl.num_warps()], [1, 0]
         )
         k = gl.arange(0, 4096, gl.SliceLayout(0, bl))
         wr = gl.load(weights.ba_w + row * HIDDEN + k, mask=k < HIDDEN, other=0.0)
-        wr2 = gl.load(weights.ba_w + (row + 1) * HIDDEN + k, mask=k < HIDDEN, other=0.0)
         gl.amd.hint.sched_barrier()
         # One poll: every row's MXFP8 and BF16 mixed row.
         rk = gl.arange(0, RP, gl.SliceLayout(1, bl))
@@ -303,26 +302,14 @@ def _projection_finish(
         # TokenSpeed's projections output BF16.
         xk = mx.bf16_half(extras[0], k[None, :])
         logit = gl.sum(xk * wr.to(gl.float32)[None, :], axis=1).to(gl.bfloat16)
-        logit2 = gl.sum(xk * wr2.to(gl.float32)[None, :], axis=1).to(gl.bfloat16)
-        two = gl.arange(0, 2, gl.SliceLayout(0, bl))[None, :]
-        pair = gl.where(
-            two == 0,
-            logit.to(gl.float32)[:, None],
-            logit2.to(gl.float32)[:, None],
-        )
-        mb.put(
-            "ba",
-            mb.row_offset(rk)[:, None] + row + two,
-            pair,
-            mask=(rk < R)[:, None],
-        )
+        mb.put("ba", mb.row_offset(rk) + row, logit.to(gl.float32), mask=rk < R)
         projs = mx.gemv(
             x_smem,
             xs_smem,
             tiles,
             scales,
-            SPLIT=1,
-            NW=8,
+            SPLIT=2,
+            NW=4,
             SEG=0,
             SEG_STRIDE=0,
             FIRST=0,
