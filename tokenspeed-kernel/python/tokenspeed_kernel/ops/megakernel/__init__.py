@@ -230,13 +230,15 @@ def qwen4_exp_qsa_layer_decode(
     raw_key: torch.Tensor,
     rope_position: torch.Tensor,
     staging: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    draft: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    accepted: torch.Tensor | None,
     scratch: torch.Tensor,
     step: torch.Tensor,
     layer_index: int,
     mixed_out: torch.Tensor | None,
 ) -> None:
-    """One decode step, or one speculative verify, of a packed QSA attention
-    layer.
+    """One decode step, one speculative verify, or one MTP draft step of a
+    packed QSA attention layer.
 
     Args:
         layer, h, h_out, chain, scratch, step, layer_index: As in
@@ -254,6 +256,14 @@ def qwen4_exp_qsa_layer_decode(
             ``QSAVerifyState`` ``(this layer's raw index keys [rows, dim],
             positions [rows, 3], logical positions [rows], recent locations
             [rows])`` that the kernel writes instead of the recent ring.
+        draft: None, except in an MTP draft step (``chain`` 1): the requests'
+            QSA draft scratch ``(raw keys [rows, 4, 1, dim], group-start
+            positions [rows, 3], position tags [rows, 4])``. The kernel stages
+            the index keys there instead of the recent ring, and its
+            compression reads the members that earlier draft steps staged.
+        accepted: None, except in an MTP draft catch-up step (the draft's
+            first step over the verified rows): each row's int32 accepted
+            length. Rows at or past it write K / V but no index keys.
         mixed_out: When :func:`prepare_qwen4_exp_qsa_layer` packed the layer
             with the model's final mixer (``tensors["final_mixer"]``, the last
             layer), the BF16 ``[rows, hidden]`` mixer output (the LM head's
@@ -277,6 +287,8 @@ def qwen4_exp_qsa_layer_decode(
         raw_key=raw_key,
         rope_position=rope_position,
         staging=staging,
+        draft=draft,
+        accepted=accepted,
         scratch=scratch,
         step=step,
         layer_index=layer_index,

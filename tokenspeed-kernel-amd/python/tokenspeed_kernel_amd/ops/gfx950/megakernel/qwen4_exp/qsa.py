@@ -69,6 +69,10 @@ token of this launch produced comes from the row of that token:
 The launch writes the KV and compressed caches as in decode. The index key
 goes to the verify staging of TokenSpeed instead of the recent ring.
 TokenSpeed fills the recent ring for the accepted tokens.
+
+An MTP draft step (one row per request) stages its index key in the QSA
+indexer's draft scratch instead of the ring, tagged with its position. A
+block member that an earlier draft step staged comes from there.
 """
 
 from __future__ import annotations
@@ -221,6 +225,17 @@ class Cache:
     staged_positions: gl.tensor | gl.constexpr
     staged_logical: gl.tensor | gl.constexpr
     staged_recent: gl.tensor | gl.constexpr
+    # None, or in an MTP draft step (one row per request) the request's draft
+    # scratch that the launch writes instead of the ring: raw keys [COMPRESS,
+    # IDX_DIM] by position % COMPRESS, int64 group-start positions [3] and
+    # int64 position tags [COMPRESS] (TokenSpeed's QSA draft staging).
+    draft_k: gl.tensor | gl.constexpr
+    draft_positions: gl.tensor | gl.constexpr
+    draft_logical: gl.tensor | gl.constexpr
+    # None, or in an MTP draft catch-up step (the draft's first step, over the
+    # verified rows) the row's int32 accepted length: a row at or past it is
+    # a rejected token. It writes its K / V, but no index or compressed key.
+    accepted: gl.tensor | gl.constexpr
 
     @gluon.jit
     def row(self, r):
@@ -234,6 +249,16 @@ class Cache:
             staged_positions = self.staged_positions + r * 3
             staged_logical = self.staged_logical + r
             staged_recent = self.staged_recent + r
+        draft_k = self.draft_k
+        draft_positions = self.draft_positions
+        draft_logical = self.draft_logical
+        if self.draft_k is not None:
+            draft_k = self.draft_k + r * (COMPRESS * IDX_DIM)
+            draft_positions = self.draft_positions + r * 3
+            draft_logical = self.draft_logical + r * COMPRESS
+        accepted = self.accepted
+        if self.accepted is not None:
+            accepted = self.accepted + r
         return Cache(
             self.cos_sin,
             self.positions + r,
@@ -259,6 +284,10 @@ class Cache:
             staged_positions,
             staged_logical,
             staged_recent,
+            draft_k,
+            draft_positions,
+            draft_logical,
+            accepted,
         )
 
 
@@ -444,12 +473,14 @@ def _index_q_head(mb, j, weights, cache, STAGE: gl.constexpr):
 
 @gluon.jit
 def _index_key(mb, L, tok, weights, cache, STAGE: gl.constexpr):
-    """The index key: compression, then the recent ring or the verify staging.
+    """The index key: compression, then the recent ring, the verify staging
+    or the draft scratch.
 
     A block member (and the first position of the block) at or after the
     first token of the request in the launch, ``L - tok``, comes from the row
     of that token (this launch). Earlier members come from the ring, which
-    earlier steps wrote.
+    earlier steps wrote. In a draft step, a member that an earlier draft step
+    staged comes from the draft scratch, where its position tag matches.
     """
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     d = gl.arange(0, IDX_DIM, lanes)
@@ -481,6 +512,16 @@ def _index_key(mb, L, tok, weights, cache, STAGE: gl.constexpr):
         positions - (COMPRESS - 1),
         cache.rope_position + ring * cache.rope_stride,
     )
+    if cache.draft_k is not None:
+        k0, k0p = _draft_member(cache, L - 3, k0, k0p, d, dp)
+        k1, k1p = _draft_member(cache, L - 2, k1, k1p, d, dp)
+        k2, k2p = _draft_member(cache, L - 1, k2, k2p, d, dp)
+        head_tag = gl.load(cache.draft_logical + (L + 1) % COMPRESS)
+        start = gl.where(
+            (L >= COMPRESS - 1) & (head_tag == L - (COMPRESS - 1)),
+            cache.draft_positions,
+            start,
+        )
     cos, sin = _rope_tables(cache.cos_sin, start, gl.where(head_here, pos_stride, 1), d)
     gl.amd.hint.sched_barrier()
     # The raw keys of the members that can be rows of this launch, the last
@@ -515,7 +556,10 @@ def _index_key(mb, L, tok, weights, cache, STAGE: gl.constexpr):
     pooled = (((k0 + k1) + k2) + k3) / 4.0
     pooled_p = (((k0p + k1p) + k2p) + k3p) / 4.0
     ck = _index_norm_rotate(pooled, pooled_p, w, wp, cos, sin, d).to(gl.bfloat16)
-    write = completes & qsa_ok & recent_ok
+    keep = L >= 0
+    if cache.accepted is not None:
+        keep = L < gl.load(cache.accepted)
+    write = completes & qsa_ok & recent_ok & keep
     mb.stamp(STAGE, trace.COMPUTED)
     mx.put_bf16(mb, "ck", 0, gl.where(write, ck.to(gl.float32), 0.0))
     qsa_loc = qpage * 256 + L % 256
@@ -528,9 +572,27 @@ def _index_key(mb, L, tok, weights, cache, STAGE: gl.constexpr):
     gl.store(dst + d, ck, mask=(d >= 0) & write)
     a = gl.arange(0, 4, lanes)
     pos = gl.load(positions + gl.minimum(a, 2) * pos_stride)
-    if cache.staged_k is None:
-        gl.store(ring_row + (L % COMPRESS) * IDX_DIM + d, k3.to(gl.bfloat16))
-        gl.store(start + a, pos, mask=(a < 3) & (L % COMPRESS == 0))
+    if cache.draft_k is not None:
+        # A draft step writes no ring: its keys are speculative. The scratch
+        # keeps them for the next draft step's compression.
+        slot = L % COMPRESS
+        gl.store(cache.draft_k + slot * IDX_DIM + d, k3.to(gl.bfloat16), mask=recent_ok)
+        gl.store(
+            cache.draft_logical + slot + a,
+            (L + a * 0).to(gl.int64),
+            mask=(a < 1) & recent_ok,
+        )
+        gl.store(
+            cache.draft_positions + a,
+            pos,
+            mask=(a < 3) & (slot == 0) & recent_ok,
+        )
+    elif cache.staged_k is None:
+        gl.store(ring_row + (L % COMPRESS) * IDX_DIM + d, k3.to(gl.bfloat16), mask=keep)
+        # A block's first token writes the block's rope position to the ring
+        # page. (``start`` can point at a row of this launch instead.)
+        header = cache.rope_position + ring * cache.rope_stride
+        gl.store(header + a, pos, mask=(a < 3) & (L % COMPRESS == 0) & keep)
     else:
         # A verify writes no ring: TokenSpeed commits the accepted tokens'
         # staged keys after acceptance.
@@ -539,6 +601,18 @@ def _index_key(mb, L, tok, weights, cache, STAGE: gl.constexpr):
         gl.store(cache.staged_logical + a, (L + a * 0).to(gl.int64), mask=a < 1)
         recent_loc = gl.where(recent_ok, rpage * 64 + L % 64, 0)
         gl.store(cache.staged_recent + a, (recent_loc + a * 0).to(gl.int32), mask=a < 1)
+
+
+@gluon.jit
+def _draft_member(cache, e, k, kp, d, dp):
+    """Block member at position ``e`` (and its NeoX partners): the draft
+    scratch's key when its tag is ``e``, else ``k`` / ``kp`` (the ring's)."""
+    slot = (e + COMPRESS) % COMPRESS
+    tagged = (e >= 0) & (gl.load(cache.draft_logical + slot) == e)
+    row = cache.draft_k + slot * IDX_DIM
+    k = gl.where(tagged, gl.load(row + d).to(gl.float32), k)
+    kp = gl.where(tagged, gl.load(row + dp).to(gl.float32), kp)
+    return k, kp
 
 
 @gluon.constexpr_function

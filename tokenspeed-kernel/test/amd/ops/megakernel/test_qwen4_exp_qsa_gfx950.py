@@ -175,6 +175,11 @@ def test_qsa_stages_match_tokenspeed_math(L):
             raw_key.stride(0),
             rope_position,
             rope_position.stride(0),
+            # No verify staging, draft scratch or accepted lengths: decode.
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,

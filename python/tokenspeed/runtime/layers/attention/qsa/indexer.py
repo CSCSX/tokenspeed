@@ -163,29 +163,42 @@ class QSAIndexer(nn.Module):
         )
         return values.reshape(3, -1).T
 
-    def _draft_scratch_buffers(
-        self,
-        token_k: torch.Tensor,
-        position_values: torch.Tensor,
-        bs: int,
+    def draft_scratch(
+        self, bs: int, key_dtype: torch.dtype, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the request-local raw-key ring for one draft MTP round."""
+        """The request-local raw-key ring of one draft MTP round: raw keys
+        ``[bs, compress_ratio, 1, dim]``, int64 group-start positions ``[bs,
+        3]`` and int64 position tags ``[bs, compress_ratio]``. One set per
+        batch size and device, shared by the regular path and the
+        megakernel."""
 
-        key = (bs, token_k.device)
+        key = (bs, device)
         scratch = self._draft_scratch.get(key)
         if scratch is None:
             scratch = (
-                token_k.new_empty((bs, self.compress_ratio, 1, self.index_head_dim)),
-                position_values.new_empty((bs, 3)),
+                torch.empty(
+                    (bs, self.compress_ratio, 1, self.index_head_dim),
+                    dtype=key_dtype,
+                    device=device,
+                ),
+                torch.empty((bs, 3), dtype=torch.int64, device=device),
                 torch.full(
                     (bs, self.compress_ratio),
                     _DRAFT_INVALID_POSITION,
                     dtype=torch.int64,
-                    device=token_k.device,
+                    device=device,
                 ),
             )
             self._draft_scratch[key] = scratch
+        elif scratch[0].dtype != key_dtype:
+            raise RuntimeError("QSA draft scratch requested with another key dtype")
         return scratch
+
+    def reset_draft_tags(
+        self, bs: int, key_dtype: torch.dtype, device: torch.device
+    ) -> None:
+        """Start a draft round: no staged key of an earlier round matches."""
+        self.draft_scratch(bs, key_dtype, device)[2].fill_(_DRAFT_INVALID_POSITION)
 
     @staticmethod
     def _draft_accepted_write_mask(
@@ -425,11 +438,7 @@ class QSAIndexer(nn.Module):
         if is_draft_decode_step and token_k.shape[0] != ctx.bs:
             raise RuntimeError("QSA draft decode requires one row per request")
         if is_draft_first_step or is_draft_decode_step:
-            draft_scratch = self._draft_scratch_buffers(
-                token_k,
-                self._position_values(positions),
-                ctx.bs,
-            )
+            draft_scratch = self.draft_scratch(ctx.bs, token_k.dtype, token_k.device)
         layout = qsa_forward_layout(
             ctx,
             hidden_states.shape[0],

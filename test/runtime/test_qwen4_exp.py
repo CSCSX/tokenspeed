@@ -908,7 +908,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
 
     indexer._select_slots = select
     draft_scratch = tuple(torch.empty(2) for _ in range(3))
-    indexer._draft_scratch_buffers = lambda *args: draft_scratch
+    indexer.draft_scratch = lambda *args: draft_scratch
     prepared = SimpleNamespace(
         logical_positions=torch.arange(8),
         request_indices=torch.zeros(8, dtype=torch.int64),
@@ -1333,12 +1333,7 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
         stage_draft=False,
     )
     raw[1, 3, 0] = -99
-    seed_position = torch.tensor([3], dtype=torch.long, device=device)
-    scratch = indexer._draft_scratch_buffers(
-        committed_keys[:1],
-        indexer._position_values(seed_position),
-        1,
-    )
+    scratch = indexer.draft_scratch(1, committed_keys.dtype, committed_keys.device)
 
     for value in range(3, 8):
         logical = torch.tensor([value], dtype=torch.long, device=device)

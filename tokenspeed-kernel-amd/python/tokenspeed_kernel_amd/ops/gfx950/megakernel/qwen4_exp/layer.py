@@ -653,6 +653,8 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
     raw_key: torch.Tensor,
     rope_position: torch.Tensor,
     staging: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    draft: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    accepted: torch.Tensor | None,
     scratch: torch.Tensor,
     step: torch.Tensor,
     layer: int,
@@ -684,6 +686,15 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
             positions [>= rows] int64, recent locations [>= rows] int32)``,
             which the launch writes instead of the ring (TokenSpeed commits the
             accepted ones). The ``seq_len`` of a verify row is its own ``L + 1``.
+        draft: None, or in an MTP draft step (``chain`` 1, one row per
+            request) the requests' QSA draft scratch ``(raw keys [rows, 4, 1,
+            IDX_DIM] BF16, group-start positions [rows, 3] int64, position
+            tags [rows, 4] int64)``, which the launch writes instead of the
+            ring. Compression reads a member from it where its tag matches.
+        accepted: None, or in an MTP draft catch-up step (the draft's first
+            step: ``chain`` verified tokens per request, no staging) each
+            row's int32 accepted length ``[rows]``. A row at or past it is a
+            rejected token: it writes its K / V but no index or compressed key.
         mixed_out: The model's final mixer output, BF16 ``[rows, HIDDEN]``, when
             ``weights`` has the final mixer (the last layer). Else ``None``.
     """
@@ -710,6 +721,28 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
             or recent.dtype != torch.int32
         ):
             raise ValueError("staging needs dense rows of QSAVerifyState")
+    if draft is not None:
+        draft_k, draft_positions, draft_logical = draft
+        if chain != 1 or staging is not None:
+            raise ValueError("a draft step is one row per request, without staging")
+        if (
+            tuple(draft_k.shape) != (rows, int(qsa.COMPRESS), 1, int(qsa.IDX_DIM))
+            or tuple(draft_positions.shape) != (rows, 3)
+            or tuple(draft_logical.shape) != (rows, int(qsa.COMPRESS))
+            or draft_positions.dtype != torch.int64
+            or draft_logical.dtype != torch.int64
+            or not all(
+                t.is_contiguous() for t in (draft_k, draft_positions, draft_logical)
+            )
+        ):
+            raise ValueError("draft needs the dense QSA draft scratch of the rows")
+    if accepted is not None and (
+        staging is not None
+        or draft is not None
+        or accepted.dtype != torch.int32
+        or tuple(accepted.shape) != (rows,)
+    ):
+        raise ValueError("accepted needs int32 [rows], without staging or draft")
     _check_streams(h, h_out, scratch, plan)
     _check_rows(
         plan,
@@ -753,6 +786,8 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
         rope_position,
         rope_position.stride(0),
         *(staging if staging is not None else (None,) * 4),
+        *(draft if draft is not None else (None,) * 3),
+        accepted,
     )
     gluon_qwen4_exp_qsa_layer_gfx950[(plan.grid,)](
         scratch,

@@ -30,6 +30,9 @@ as `prepare_qwen4_exp_*` and `qwen4_exp_*_decode`.
 - A verify writes TokenSpeed's verify buffers and no state page: the GDN and
   PLE verify scratch rows, the ReplaySSM payload and `QSAVerifyState`.
   TokenSpeed's post-verify commit then writes the accepted state.
+- An MTP draft step (one row per request, `draft` operand) writes the
+  speculative index keys to the QSA indexer's draft scratch, not to the
+  recent ring, as the regular draft path does.
 - The launchers' docstrings list every operand. Row counts, positions,
   sequence lengths and table widths are runtime values.
 
@@ -44,6 +47,9 @@ seam. The flag `--qwen4-exp-decode-megakernel` enables it.
 - A forward uses the kernels when it is a decode step of at most 4 rows,
   padded graph rows included. Each request has one token, or `k + 1` tokens of
   a target verify with ReplaySSM. Other forwards use the regular path.
+- The MTP draft model's one QSA layer, with its final mixer, uses the same
+  kernel for the draft steps after the first. The first draft step catches
+  up on the verified rows and keeps the regular path.
 
 ## Stages
 
@@ -129,7 +135,8 @@ timeline:
     goes to TokenSpeed's verify staging, not to the recent ring.
 - A launch of `R` rows gives bit for bit the results of `R` one-row launches.
   A verify of `k + 1` tokens gives bit for bit the results of `k + 1` decode
-  steps.
+  steps. Draft steps give bit for bit the results of decode steps; only the
+  place of the index keys differs.
 
 ## Weights
 
@@ -169,7 +176,7 @@ Tests are in `tokenspeed-kernel/test/amd/ops/megakernel/`:
 | `test_qwen4_exp_gdn_gfx950.py` | The Gated DeltaNet stages. |
 | `test_qwen4_exp_qsa_gfx950.py` | The QSA stages, and the top-k against TokenSpeed's block selection. |
 | `test_qwen4_exp_moe_gfx950.py` | The MoE stages and the `"n32"` scales. |
-| `test_qwen4_exp_layer_gfx950.py` | Both layers (with PLE and the final mixer), the one-row input, rows against one-row launches, and verify against decode steps. |
+| `test_qwen4_exp_layer_gfx950.py` | Both layers (with PLE and the final mixer), the one-row input, rows against one-row launches, verify against decode steps, and draft steps against decode steps. |
 
 Each stage test runs a slice of the real plan (`Plan.only`) and compares it
 with a torch reference of TokenSpeed's math.

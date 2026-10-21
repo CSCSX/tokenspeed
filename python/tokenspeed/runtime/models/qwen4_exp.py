@@ -887,7 +887,7 @@ def load_qwen4_exp_weights(
     return loaded
 
 
-def _prepare_decode_megakernels(model: Qwen4ExpModel | None) -> None:
+def prepare_model_decode_megakernels(model: Qwen4ExpModel | None) -> None:
     """Pack the decode megakernels when ``--qwen4-exp-decode-megakernel`` is set."""
     if model is not None and global_server_args_dict["qwen4_exp_decode_megakernel"]:
         model.prepare_decode_megakernels()
@@ -914,7 +914,7 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         )
 
     def post_quant_warmup(self) -> None:
-        _prepare_decode_megakernels(self.model)
+        prepare_model_decode_megakernels(self.model)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -961,7 +961,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
 
     def post_quant_warmup(self) -> None:
-        _prepare_decode_megakernels(self.model)
+        prepare_model_decode_megakernels(self.model)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

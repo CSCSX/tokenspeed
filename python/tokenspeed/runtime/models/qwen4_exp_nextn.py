@@ -48,6 +48,7 @@ from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpModel,
     load_qwen4_exp_weights,
+    prepare_model_decode_megakernels,
 )
 from tokenspeed.runtime.utils import add_prefix
 
@@ -232,6 +233,14 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
 
     def get_hot_token_id(self):
         return None
+
+    def post_quant_warmup(self) -> None:
+        # The draft steps after the first are one-row decode steps of the
+        # draft layer, which the QSA megakernel serves. Steps that reuse the
+        # first step's top-k keep the regular path: the megakernel selects
+        # its own.
+        if not self.index_share_for_mtp_iteration:
+            prepare_model_decode_megakernels(self.model)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

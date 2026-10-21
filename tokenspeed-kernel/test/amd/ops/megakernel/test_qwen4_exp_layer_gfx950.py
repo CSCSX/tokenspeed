@@ -438,6 +438,8 @@ def test_qsa_layer_matches_tokenspeed_math(L, final):
         raw_key=raw_key,
         rope_position=rope_position,
         staging=None,
+        draft=None,
+        accepted=None,
         scratch=scratch,
         step=torch.full((1,), 5, dtype=torch.int32, device=dev),
         layer_index=3,
@@ -887,6 +889,8 @@ def test_qsa_layer_rows_equal_one_row_launches(lengths, final):
                 raw_key=state["raw_key"],
                 rope_position=state["rope_position"],
                 staging=None,
+                draft=None,
+                accepted=None,
                 scratch=scratch,
                 step=torch.full((1,), step + first, dtype=torch.int32, device=dev),
                 layer_index=3,
@@ -995,6 +999,8 @@ def test_qsa_layer_verify_equals_decode_steps(starts, chain, final):
             raw_key=state["raw_key"],
             rope_position=state["rope_position"],
             staging=staging,
+            draft=None,
+            accepted=None,
             scratch=scratch,
             step=torch.full((1,), step, dtype=torch.int32, device=dev),
             layer_index=3,
@@ -1031,3 +1037,187 @@ def test_qsa_layer_verify_equals_decode_steps(starts, chain, final):
     assert torch.equal(staged[1], L[:, None].expand(-1, 3))
     assert torch.equal(staged[2], L)
     assert torch.equal(staged[3], (ring * 64 + L % 64).int())
+
+
+# Four draft positions from a block's first token (before and past the top-k),
+# and from its third token (the completed block mixes ring and draft members).
+@pytest.mark.parametrize("start", [1000, 1002, 2996])
+def test_qsa_layer_draft_steps_equal_decode_steps(start):
+    """MTP draft steps (one row, ``draft`` scratch) compute what decode steps
+    compute (outputs, KV and compressed caches). They stage each index key
+    and its group-start position in the draft scratch, which the next steps'
+    compression reads, and write no ring."""
+    page, max_pos = 256, 4096
+    g = torch.Generator().manual_seed(80 + start % 7)
+    dev = "cuda"
+    tensors = _qsa_tensors(g, False)
+    fused = prepare_qwen4_exp_qsa_layer(max_rows=1, tensors=tensors, dense_tiled=False)
+    scratch = torch.zeros(fused.scratch_pairs, dtype=torch.int64, device=dev)
+    h = (torch.randn(4, WIDTH, generator=g) * 3).bfloat16().cuda()
+
+    def table(pages: int) -> torch.Tensor:
+        return (torch.randperm(pages, generator=g) + 1).view(1, pages).int().cuda()
+
+    full_table, qsa_table, recent_table = (
+        table(max_pos // page),
+        table(max_pos // 256),
+        table(max_pos // 64),
+    )
+    ring_pages = max_pos // 64 + 1
+    initial = {
+        "k_cache": torch.randn((max_pos // page + 1) * page, 2, 256, generator=g)
+        .bfloat16()
+        .cuda(),
+        "v_cache": torch.randn((max_pos // page + 1) * page, 2, 256, generator=g)
+        .bfloat16()
+        .cuda(),
+        "compressed": (torch.randn(max_pos // 256 + 1, 64, 1, 128, generator=g) * 0.1)
+        .bfloat16()
+        .cuda(),
+        "raw_key": torch.randn(ring_pages, 4, 1, 128, generator=g).bfloat16().cuda(),
+        "rope_position": torch.zeros(ring_pages, 3, dtype=torch.int64, device=dev),
+    }
+    draft = (
+        torch.zeros(1, 4, 1, 128, dtype=torch.bfloat16, device=dev),
+        torch.zeros(1, 3, dtype=torch.int64, device=dev),
+        torch.full((1, 4), -1, dtype=torch.int64, device=dev),
+    )
+
+    def launch(state, t, draft_scratch):
+        L = start + t
+        h_out = torch.empty(1, WIDTH, dtype=torch.bfloat16, device=dev)
+        qwen4_exp_qsa_layer_decode(
+            fused,
+            h[t : t + 1],
+            h_out,
+            chain=1,
+            cos_sin=_cos_sin(max_pos),
+            positions=torch.full((3, 1), L, dtype=torch.int64, device=dev),
+            seq_len=torch.full((1,), L + 1, dtype=torch.int32, device=dev),
+            full_table=full_table,
+            page_size=page,
+            k_cache=state["k_cache"],
+            v_cache=state["v_cache"],
+            qsa_table=qsa_table,
+            recent_table=recent_table,
+            compressed=state["compressed"],
+            raw_key=state["raw_key"],
+            rope_position=state["rope_position"],
+            staging=None,
+            draft=draft_scratch,
+            accepted=None,
+            scratch=scratch,
+            step=torch.full((1,), 10 + t, dtype=torch.int32, device=dev),
+            layer_index=0,
+            mixed_out=None,
+        )
+        torch.cuda.synchronize()
+        return h_out
+
+    decode = {k: v.clone() for k, v in initial.items()}
+    drafted = {k: v.clone() for k, v in initial.items()}
+    for t in range(4):
+        assert torch.equal(launch(decode, t, None), launch(drafted, t, draft)), t
+        for name in ("k_cache", "v_cache", "compressed"):
+            assert torch.equal(decode[name], drafted[name]), (name, t)
+    assert torch.equal(drafted["raw_key"], initial["raw_key"])
+    assert torch.equal(drafted["rope_position"], initial["rope_position"])
+    for t in range(4):
+        L = start + t
+        ring = int(recent_table[0, L // 64])
+        assert torch.equal(draft[0][0, L % 4], decode["raw_key"][ring, L % 4])
+        assert int(draft[2][0, L % 4]) == L
+        if L % 4 == 0:
+            assert torch.equal(draft[1][0], decode["rope_position"][ring])
+
+
+# Rows 997-1000: 999 completes a block. Accepted lengths before, at and past it.
+@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+def test_qsa_layer_draft_catch_up_writes_accepted_index_keys(accepted):
+    """The MTP draft's first step runs the verified rows as a chain. Every row
+    computes and writes K / V as a decode step does. Only the accepted rows
+    write index keys and compressed keys (TokenSpeed's draft write mask)."""
+    start, chain, page, max_pos = 997, 4, 256, 4096
+    g = torch.Generator().manual_seed(90 + accepted)
+    dev = "cuda"
+    tensors = _qsa_tensors(g, False)
+    fused = prepare_qwen4_exp_qsa_layer(
+        max_rows=chain, tensors=tensors, dense_tiled=False
+    )
+    scratch = torch.zeros(fused.scratch_pairs, dtype=torch.int64, device=dev)
+    h = (torch.randn(chain, WIDTH, generator=g) * 3).bfloat16().cuda()
+
+    def table(pages: int) -> torch.Tensor:
+        return (torch.randperm(pages, generator=g) + 1).view(1, pages).int().cuda()
+
+    full_table, qsa_table, recent_table = (
+        table(max_pos // page),
+        table(max_pos // 256),
+        table(max_pos // 64),
+    )
+    ring_pages = max_pos // 64 + 1
+    initial = {
+        "k_cache": torch.randn((max_pos // page + 1) * page, 2, 256, generator=g)
+        .bfloat16()
+        .cuda(),
+        "v_cache": torch.randn((max_pos // page + 1) * page, 2, 256, generator=g)
+        .bfloat16()
+        .cuda(),
+        "compressed": (torch.randn(max_pos // 256 + 1, 64, 1, 128, generator=g) * 0.1)
+        .bfloat16()
+        .cuda(),
+        "raw_key": torch.randn(ring_pages, 4, 1, 128, generator=g).bfloat16().cuda(),
+        "rope_position": torch.zeros(ring_pages, 3, dtype=torch.int64, device=dev),
+    }
+    ring = int(recent_table[0, start // 64])
+    initial["rope_position"][ring] = (start // 4) * 4
+
+    def launch(state, first, n, step, limit):
+        L = torch.arange(start + first, start + first + n, device=dev)
+        h_out = torch.empty(n, WIDTH, dtype=torch.bfloat16, device=dev)
+        qwen4_exp_qsa_layer_decode(
+            fused,
+            h[first : first + n],
+            h_out,
+            chain=n,
+            cos_sin=_cos_sin(max_pos),
+            positions=L[None].expand(3, -1).contiguous(),
+            seq_len=(L + 1).int(),
+            full_table=full_table.expand(n, -1),
+            page_size=page,
+            k_cache=state["k_cache"],
+            v_cache=state["v_cache"],
+            qsa_table=qsa_table.expand(n, -1),
+            recent_table=recent_table.expand(n, -1),
+            compressed=state["compressed"],
+            raw_key=state["raw_key"],
+            rope_position=state["rope_position"],
+            staging=None,
+            draft=None,
+            accepted=limit,
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=dev),
+            layer_index=0,
+            mixed_out=None,
+        )
+        torch.cuda.synchronize()
+        return h_out
+
+    caught_up = {k: v.clone() for k, v in initial.items()}
+    out = launch(
+        caught_up,
+        0,
+        chain,
+        5,
+        torch.full((chain,), start + accepted, dtype=torch.int32, device=dev),
+    )
+    every_step = {k: v.clone() for k, v in initial.items()}
+    accepted_steps = {k: v.clone() for k, v in initial.items()}
+    for t in range(chain):
+        assert torch.equal(out[t : t + 1], launch(every_step, t, 1, 100 + t, None)), t
+        if t < accepted:
+            launch(accepted_steps, t, 1, 200 + t, None)
+    for name in ("k_cache", "v_cache"):
+        assert torch.equal(caught_up[name], every_step[name]), name
+    for name in ("raw_key", "rope_position", "compressed"):
+        assert torch.equal(caught_up[name], accepted_steps[name]), name

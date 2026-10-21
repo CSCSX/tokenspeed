@@ -52,6 +52,7 @@ the same launches with ``chain = k + 1``:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel.ops.gemm import MXFP4_LINEAR_MFMA_LAYOUT
@@ -79,15 +80,35 @@ MAX_ROWS = 4
 
 
 class MegakernelSteps:
-    """Model-wide megakernel state: the mailbox scratch and the step counter."""
+    """Model-wide megakernel state: the mailbox scratch, the step counter, and
+    the operands that all layers of one forward share."""
 
     def __init__(self, device: torch.device, scratch_pairs: int) -> None:
         self.scratch = torch.zeros(scratch_pairs, dtype=torch.int64, device=device)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
+        # Per-row operands of the current forward (a verify's rows), built
+        # by its first layer launch. Each costs small kernels, the same in
+        # every layer.
+        self._shared: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
     def advance(self) -> None:
         """Give the next forward's launches a new tag (graph safe)."""
         self.step.add_(1)
+        self._shared.clear()
+
+    def shared(
+        self, key: tuple, build: Callable[[], tuple[torch.Tensor, ...]]
+    ) -> tuple[torch.Tensor, ...]:
+        """The operands ``build()`` makes, made once per forward for ``key``.
+
+        ``key`` names the source buffers (their data pointers) and the shape
+        of the result. A CUDA graph captures the build in the first layer.
+        """
+        value = self._shared.get(key)
+        if value is None:
+            value = build()
+            self._shared[key] = value
+        return value
 
 
 def _dense(proj: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor, str] | None:
@@ -268,9 +289,10 @@ def runs_fused(hidden_states: torch.Tensor, ctx: ForwardContext) -> bool:
     """Whether this forward can take a megakernel layer (fixed per graph).
 
     The forward must be a decode step of at most ``MAX_ROWS`` token rows
-    (padded graph rows included). It must have one token per request, or a
-    target verify's ``k + 1`` (with ReplaySSM, whose payload the kernels
-    fill).
+    (padded graph rows included). It must have one token per request (a
+    decode step or an MTP draft step), or ``k + 1``: a target verify (with
+    ReplaySSM, whose payload the kernels fill) or the draft's first step,
+    which catches up on the verified rows.
     """
     rows = hidden_states.shape[0]
     if not (
@@ -280,7 +302,9 @@ def runs_fused(hidden_states: torch.Tensor, ctx: ForwardContext) -> bool:
         and rows % ctx.bs == 0
     ):
         return False
-    return rows == ctx.bs or ctx.attn_backend.linear_attn_backend.replay_ssm
+    if rows == ctx.bs or ctx.draft_narrowing is not None:
+        return True
+    return ctx.attn_backend.linear_attn_backend.replay_ssm
 
 
 def _chain(hidden_states: torch.Tensor, ctx: ForwardContext) -> int:
@@ -339,8 +363,10 @@ def forward_delta_layer(
         conv_out, conv_out_rows, replay = gdn.fused_verify_operands(
             layer.layer_id, attn.A_log.data, attn.dt_bias.data
         )
-        state_in = state_in[: ctx.bs].repeat_interleave(chain)
-        state_out = torch.full_like(state_in, -1)
+        state_in, state_out = steps.shared(
+            ("gdn_rows", state_in.data_ptr(), ctx.bs, chain),
+            lambda: _verify_state_rows(state_in[: ctx.bs], chain),
+        )
     out = hidden_states.new_empty(rows, layer.hc_count * layer.hidden_size)
     qwen4_exp_delta_layer_decode(
         fused,
@@ -410,6 +436,25 @@ def forward_final_qsa_layer(
     return mixed, out
 
 
+def _verify_state_rows(
+    state_in: torch.Tensor, chain: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A verify's per-row state pages: each request's input page for each of
+    its ``chain`` rows, and no output page (-1)."""
+    rows = state_in.repeat_interleave(chain)
+    return rows, torch.full_like(rows, -1)
+
+
+def _verify_attention_rows(
+    seq_lens: torch.Tensor, tables: tuple[torch.Tensor, ...], chain: int
+) -> tuple[torch.Tensor, ...]:
+    """A verify's per-row ``seq_len`` and page tables. Token ``t`` of request
+    ``r`` sits at ``seq_lens[r] - chain + t`` (TokenSpeed's verify layout)."""
+    token = torch.arange(1 - chain, 1, dtype=torch.int32, device=seq_lens.device)
+    seq_len = (seq_lens.int()[:, None] + token[None, :]).reshape(-1)
+    return (seq_len, *(t.repeat_interleave(chain, dim=0) for t in tables))
+
+
 def _qsa_decode(
     layer: torch.nn.Module,
     fused: FusedDecodeLayer,
@@ -431,37 +476,56 @@ def _qsa_decode(
     k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
     raw_key, compressed, rope_position = layer.indexer.cache_fields(pool)
     if positions.dim() == 1:
-        # Plain RoPE positions: all three MRoPE axes read the same row.
-        positions = positions.unsqueeze(0).expand(3, -1)
+        # Plain RoPE positions: all three MRoPE axes read the same row. The
+        # drafter's later steps pass int32 positions.
+        positions = positions.to(torch.int64).unsqueeze(0).expand(3, -1)
     tables = (
         full.page_table[: ctx.bs],
         metadata.qsa_block_table[: ctx.bs],
         metadata.recent_block_table[: ctx.bs],
     )
+    draft = None
+    accepted = None
     if chain == 1:
         seq_len, staging = metadata.seq_lens[: ctx.bs], None
+        if backend.is_draft:
+            # An MTP draft step: the index keys are speculative. They go to
+            # the draft scratch, as on the regular path, not the recent ring.
+            draft = layer.indexer.draft_scratch(
+                ctx.bs, torch.bfloat16, hidden_states.device
+            )
     else:
         # A target verify: each token row has its own length and its
         # request's tables. Each row stages its index key for the post-verify
         # commit instead of writing the recent ring.
         # Token t of request r sits at seq_lens[r] - chain + t (TokenSpeed's
         # verify layout). MRoPE positions can differ from this layout.
-        token = torch.arange(
-            1 - chain, 1, dtype=torch.int32, device=hidden_states.device
+        seq_len, *tables = steps.shared(
+            ("qsa_rows", metadata.seq_lens.data_ptr())
+            + tuple(t.data_ptr() for t in tables)
+            + (ctx.bs, chain),
+            lambda: _verify_attention_rows(metadata.seq_lens[: ctx.bs], tables, chain),
         )
-        seq_len = (metadata.seq_lens[: ctx.bs].int()[:, None] + token[None, :]).reshape(
-            -1
-        )
-        tables = tuple(t.repeat_interleave(chain, dim=0) for t in tables)
-        token_k, position_values, logical, recent = backend.verify_staging_buffers(
-            layer.layer_id, ctx.bs
-        )
-        staging = (
-            token_k.reshape(rows, -1),
-            position_values.reshape(rows, -1),
-            logical.reshape(rows),
-            recent.reshape(rows),
-        )
+        if backend.is_draft:
+            # The draft's first step: the verified rows as a chain. Every row
+            # writes its K / V. Rows past the accepted length write no index
+            # key (TokenSpeed's draft write mask). The step publishes the
+            # accepted lengths as the draft's decode lengths, after the rows'
+            # lengths above, and starts a new draft scratch round.
+            staging = None
+            ctx.draft_narrowing.publish_accepted_prefix()
+            accepted = metadata.seq_lens[: ctx.bs].repeat_interleave(chain)
+            layer.indexer.reset_draft_tags(ctx.bs, torch.bfloat16, hidden_states.device)
+        else:
+            token_k, position_values, logical, recent = backend.verify_staging_buffers(
+                layer.layer_id, ctx.bs
+            )
+            staging = (
+                token_k.reshape(rows, -1),
+                position_values.reshape(rows, -1),
+                logical.reshape(rows),
+                recent.reshape(rows),
+            )
     out = hidden_states.new_empty(rows, layer.hc_count * layer.hidden_size)
     qwen4_exp_qsa_layer_decode(
         fused,
@@ -481,6 +545,8 @@ def _qsa_decode(
         raw_key=_paged(raw_key, 4),
         rope_position=rope_position,
         staging=staging,
+        draft=draft,
+        accepted=accepted,
         scratch=steps.scratch,
         step=steps.step,
         layer_index=layer.layer_id,
