@@ -32,13 +32,16 @@ TokenSpeed folds the ``1 / 4`` projection scale into ``W_down`` and ``W_inj``.
 
 Two stages run it:
 
-* reduce (A1 / M1), ``20 + 8 rows`` tasks. Task ``2 p + h`` (``p < 10``) runs
-  low-rank outputs ``32 p .. 32 p + 31``. These are two 16-row blocks of
-  ``W_down``. The task runs them over the K half of streams ``2 h, 2 h + 1``
-  and publishes the FP32 partial sums. One CU's memory path issues the 80 KiB
-  of weights of a task in about 0.6 us. Task ``20 + 8 q + 4 h + r`` publishes
-  row ``q``'s partial inject logit ``r`` of the same stream half. Consumers
-  add the halves.
+* reduce (A1 / M1), ``28 rows`` tasks: 20 low-rank tasks and 8 inject tasks
+  per row. Task ``20 q + 2 p + h`` (``p < 10``) runs row ``q``'s low-rank
+  outputs ``32 p .. 32 p + 31``. These are two 16-row blocks of ``W_down``.
+  The task runs them over the K half of streams ``2 h, 2 h + 1`` and
+  publishes the FP32 partial sums. One CU's memory path issues the 80 KiB of
+  weights of a task in about 0.6 us. The norm and the quantization of a row
+  take about as long as the GEMV, so each row has its own tasks and the rows
+  run in parallel. Task ``20 rows + 8 q + 4 h + r`` publishes row ``q``'s
+  partial inject logit ``r`` of the same stream half. Consumers add the
+  halves.
 * mix (A2 / M2), 80 tasks. Task ``t`` runs the up projection of columns
   ``32 t .. 32 t + 31`` of every stream (8 blocks, one per wave). Its input is
   the low-rank activation, quantized to MXFP8. The task publishes that slice
@@ -61,7 +64,7 @@ memory.
 from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.megakernel import mx, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.megakernel import mailbox, mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.megakernel.plan import Stage
 from tokenspeed_kernel_amd.ops.gfx950.megakernel.qwen4_exp.dims import (
     EPS,
@@ -105,7 +108,7 @@ def stages(
     return (
         Stage(
             reduce_name,
-            int(DOWN_TASKS) + int(INJ_TASKS) * rows,
+            (int(DOWN_TASKS) + int(INJ_TASKS)) * rows,
             reduce_base,
             reads=reads,
             writes=(prefix + "lr", prefix + "inj", prefix + "inv"),
@@ -214,17 +217,15 @@ def _load_row_streams(streams, r, first, NS: gl.constexpr):
 
 
 @gluon.jit
-def _reduce_down(mb, task, streams, mixer, P: gl.constexpr, STAGE: gl.constexpr):
-    """A low-rank task of :func:`reduce_stage`, for every row."""
-    R: gl.constexpr = schedule.rows(mb.plan)
+def _reduce_down(mb, task, row, streams, mixer, P: gl.constexpr, STAGE: gl.constexpr):
+    """A low-rank task of :func:`reduce_stage`, for row ``row``."""
     # Global streams load first and the weights load right after. The norm
     # then waits for the streams only (vmcnt counts loads in issue order).
     half = task % 2
     first = half * (2 * HIDDEN)
     h_raw = ()
     if streams.src == "":
-        for r in gl.static_range(R):
-            h_raw += (_load_row_streams(streams, r, first, 2),)
+        h_raw = (_load_row_streams(streams, row, first, 2),)
     w_raw = _load_streams(mixer.norm_w, first, 2)
     tiles, scales = mx.load_weight_tiles(
         mixer.w_down,
@@ -240,29 +241,26 @@ def _reduce_down(mb, task, streams, mixer, P: gl.constexpr, STAGE: gl.constexpr)
         SCALES="k4",
     )
     gl.amd.hint.sched_barrier()
-    RP: gl.constexpr = triton.next_power_of_2(R)
-    # Rows of 32 FP8 bytes (one MXFP8 block) and one exponent per block.
-    # The GEMV reads them as [RP, 64 k-iterations, 128] and [RP, 64, 4].
+    # 32 FP8 bytes (one MXFP8 block) and one exponent per block. The GEMV
+    # reads them as [1, 64 k-iterations, 128] and [1, 64, 4].
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    x_smem = gl.allocate_shared_memory(gl.uint8, [RP * 256, 32], flat)
+    x_smem = gl.allocate_shared_memory(gl.uint8, [256, 32], flat)
     xs_smem = gl.allocate_shared_memory(
-        gl.uint8, [RP * 256], gl.SwizzledSharedLayout(1, 1, 1, [0])
+        gl.uint8, [256], gl.SwizzledSharedLayout(1, 1, 1, [0])
     )
-    xs = _stream_rows(mb, h_raw, streams.src, first, R)
+    xs = _stream_rows(mb.row(row), h_raw, streams.src, first, 1)
     mb.stamp(STAGE, trace.READY)
-    normed = _normalize_rows(xs, w_raw)
-    for r in gl.static_range(R):
-        y, inv = normed[r]
-        if task < 2:
-            two = gl.arange(0, 2, inv.type.layout)
-            mb.row(r).put(P + "inv", half * 2 + two, inv)
-        fp8, exponent = mx.quantize_mxfp8(gl.reshape(y, [256, 32]))
-        x_smem.slice(r * 256, 256).store(fp8.to(gl.uint8, bitcast=True))
-        xs_smem.slice(r * 256, 256).store(exponent)
+    y, inv = _normalize(xs[0], w_raw)
+    if task < 2:
+        two = gl.arange(0, 2, inv.type.layout)
+        mb.row(row).put(P + "inv", half * 2 + two, inv)
+    fp8, exponent = mx.quantize_mxfp8(gl.reshape(y, [256, 32]))
+    x_smem.store(fp8.to(gl.uint8, bitcast=True))
+    xs_smem.store(exponent)
     gl.barrier()
-    rows = mx.gemv(
-        x_smem.reshape([RP, 64, 128]),
-        xs_smem.reshape([RP, 64, 4]),
+    out = mx.gemv(
+        x_smem.reshape([1, 64, 128]),
+        xs_smem.reshape([1, 64, 4]),
         tiles,
         scales,
         SPLIT=4,
@@ -270,13 +268,11 @@ def _reduce_down(mb, task, streams, mixer, P: gl.constexpr, STAGE: gl.constexpr)
         SEG=GROUPS // 4,
         SEG_STRIDE=32,
         FIRST=0,
-        ROWS=R,
+        ROWS=1,
     )
     mb.stamp(STAGE, trace.COMPUTED)
-    r = gl.arange(0, RP, gl.SliceLayout(1, rows.type.layout))
-    c = gl.arange(0, 32, gl.SliceLayout(0, rows.type.layout))
-    index = mb.row_offset(r)[:, None] + (half * LOWRANK + (task // 2) * 32 + c)[None, :]
-    mb.put(P + "lr", index, rows, mask=(r < R)[:, None])
+    c = gl.arange(0, 32, gl.SliceLayout(0, out.type.layout))
+    mb.row(row).put(P + "lr", (half * LOWRANK + (task // 2) * 32 + c)[None, :], out)
 
 
 @gluon.jit
@@ -284,7 +280,8 @@ def _reduce_inject(mb, task, streams, mixer, P: gl.constexpr, STAGE: gl.constexp
     """An inject task of :func:`reduce_stage`: one row."""
     # One row per inject task: the rows' norms run on their own
     # CTAs, not one after another.
-    req, local = (task - DOWN_TASKS) // INJ_TASKS, (task - DOWN_TASKS) % INJ_TASKS
+    first_inject = DOWN_TASKS * schedule.rows(mb.plan)
+    req, local = (task - first_inject) // INJ_TASKS, (task - first_inject) % INJ_TASKS
     half = local // 4
     row = local % 4
     first = half * (2 * HIDDEN)
@@ -344,44 +341,6 @@ def _normalize(x, w_raw):
 
 
 @gluon.jit
-def _normalize_rows(xs, w_raw):
-    """:func:`_normalize` of every row of the tuple ``xs``. The rows' sums
-    meet in one reduction across waves: one LDS round trip for all rows."""
-    partial = ()
-    for r in gl.static_range(len(xs)):
-        partial += (gl.sum(xs[r] * xs[r], axis=2),)
-    if len(xs) == 1:
-        sums = (gl.sum(partial[0], axis=1),)
-    elif len(xs) == 2:
-        sums = gl.reduce(partial, 1, _add2)
-    elif len(xs) == 3:
-        sums = gl.reduce(partial, 1, _add3)
-    else:
-        sums = gl.reduce(partial, 1, _add4)
-    out = ()
-    for r in gl.static_range(len(xs)):
-        inv = gl.rsqrt(sums[r] * (1.0 / HIDDEN) + EPS)
-        y = xs[r] * inv[:, None, None] * (1.0 + w_raw.to(gl.float32))
-        out += ((y.to(gl.bfloat16).to(gl.float32), inv),)
-    return out
-
-
-@gluon.jit
-def _add2(a0, a1, b0, b1):
-    return a0 + b0, a1 + b1
-
-
-@gluon.jit
-def _add3(a0, a1, a2, b0, b1, b2):
-    return a0 + b0, a1 + b1, a2 + b2
-
-
-@gluon.jit
-def _add4(a0, a1, a2, a3, b0, b1, b2, b3):
-    return a0 + b0, a1 + b1, a2 + b2, a3 + b3
-
-
-@gluon.jit
 def _put_scalar(mb, region: gl.constexpr, index, value):
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     one = gl.arange(0, 1, layout)
@@ -401,8 +360,10 @@ def reduce_stage(mb, task, streams, mixer, P: gl.constexpr, STAGE: gl.constexpr)
         STAGE: Plan name of this stage (for tracing).
     """
     mb.stamp(STAGE, trace.START)
-    if task < DOWN_TASKS:
-        _reduce_down(mb, task, streams, mixer, P, STAGE)
+    if task < DOWN_TASKS * schedule.rows(mb.plan):
+        _reduce_down(
+            mb, task % DOWN_TASKS, task // DOWN_TASKS, streams, mixer, P, STAGE
+        )
     else:
         _reduce_inject(mb, task, streams, mixer, P, STAGE)
     mb.stamp(STAGE, trace.END)
@@ -471,6 +432,17 @@ def mix_stage(mb, task, streams, mixer, P: gl.constexpr, out, STAGE: gl.constexp
     indices = (lowrank, columns + (n // 32)[None, :])
     if SRC != "":
         indices = indices + (columns + (col // 2)[None, :],)
+    if R > 1:
+        # With several rows, 80 CTAs that poll every pair from the start flood
+        # the memory path that the reduce tasks use. One wave first spins on
+        # the last pair that each low-rank task publishes.
+        lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
+        mb.row(R - 1).pre_poll(
+            P + "lr",
+            (lanes % 2) * LOWRANK
+            + gl.minimum(lanes // 2, DOWN_TASKS // 2 - 1) * 32
+            + 31,
+        )
     polled = mb.poll_many(_mix_regions(P, SRC), indices)
     if SRC != "":
         h_col = mx.bf16_half(polled[2], col[None, :])

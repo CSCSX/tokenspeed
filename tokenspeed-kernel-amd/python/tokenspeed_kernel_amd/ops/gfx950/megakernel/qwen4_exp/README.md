@@ -60,7 +60,7 @@ once.
 |---|---|---|---|---|
 | `p1` | `ple.py` | 200 | 0 | Hashes the token's n-gram ids, gathers the embedding row, and projects the PLE key and value (MXFP4 `kv_proj`). |
 | `p2` | `ple.py` | 80 per row | 176 | The gate, the Gemma norms and the dilated depthwise conv of 128 channels of one stream. Writes the next conv state. |
-| `a1`, `m1`, `f1` | `hc.py` | 20 + 8 per row | 0, 0, 57 | Mixer reduce: the per-stream Gemma norm, the low-rank down projection and the inject logits, for one K half of the streams. |
+| `a1`, `m1`, `f1` | `hc.py` | 28 per row | 0, 0, 57 | Mixer reduce: the per-stream Gemma norm, the low-rank down projection and the inject logits, for one K half of the streams. |
 | `a2`, `m2`, `f2` | `hc.py` | 80 | 176, 176, 0 | Mixer mix: the up projection of 32 columns of each stream. Publishes the mixed row as MXFP8 and as BF16. |
 | `b1` | `gdn.py` | 128 | 28 | 128 rows of `in_proj_qkvz`. Tasks 0 to 79 also run the causal conv. Tasks 80 to 127 also compute two `in_proj_b` / `in_proj_a` logits each. |
 | `b3` | `gdn.py` | 48 per row | 28 | The gated delta rule of one value head, then the gated RMS norm. Publishes the result as MXFP8. |
@@ -87,8 +87,8 @@ it polls. Thus the weights of a stage stream while earlier stages compute, but
 only on CTAs that finished their earlier tasks. The bases follow from the
 timeline:
 
-- `b1` and `q1` start at CTA 28, on CTAs without a mixer task. Their weights
-  stream from the start of the launch.
+- `b1` and `q1` start at CTA 28, on CTAs without a mixer task at one row.
+  Their weights stream from the start of the launch.
 - The CTAs without a mixer task wait for `HEAD_SLEEP` units at the start.
   Without this wait, their weight streams compete with the mixer's.
 - `m1` uses the CTAs of `a1`. The `a1` tasks end long before the MLP half
@@ -109,8 +109,12 @@ timeline:
 
 ## Rows and verify
 
-- The weight stages (`p1`, the mixers, `b1`, `q1`, `c1`, `m3` to `m5`) keep
-  the rows as the leading tensor dimension.
+- The weight stages (`p1`, the mixer mix stages, `b1`, `q1`, `c1`, `m3` to
+  `m5`) keep the rows as the leading tensor dimension.
+- The mixer reduce stages (`a1`, `m1`, `f1`) run 28 tasks per row. The norm
+  and the quantization of a row take about as long as the GEMV. Thus the rows
+  run on different CTAs, and a 4-row verify layer is about 11 us faster than
+  with all rows in each task.
 - The state stages (`p2`, `b3`, `q2` to `q6`) run one task per row and use
   `schedule.row_task`.
 - In a verify, each state stage carries the request's state from token to

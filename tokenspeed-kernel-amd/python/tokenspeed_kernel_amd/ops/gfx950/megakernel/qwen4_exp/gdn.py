@@ -503,8 +503,9 @@ def _recurrence_finish(
     ba_all = got_ba.to(gl.float32, bitcast=True)
     qs, ks = _token_vectors(qk_all, gl.SliceLayout(0, sl))
     vs, zs = _token_vectors(vz_all, gl.SliceLayout(1, sl))
+    outs = ()
     for t in gl.static_range(N):
-        q, k, v, z = qs[t], ks[t], vs[t], zs[t]
+        q, k, v = qs[t], ks[t], vs[t]
         ba = gl.sum(gl.where(tok2 == t, ba_all, 0.0), axis=0)
         ib = gl.arange(0, 2, ba.type.layout)
         b = gl.sum(gl.where(ib == 0, ba, 0.0), axis=0)
@@ -535,10 +536,80 @@ def _recurrence_finish(
             head = vh * (HEAD * HEAD) + r[:, None] * HEAD + c[None, :]
             new = state.ssm_state + slot_out.to(gl.int64) * state.ssm_page_stride + head
             gl.store(new, head_state, mask=(r[:, None] >= 0) & (slot_out >= 0))
-        # Gated RMS norm of the head (TokenSpeed: BF16 core output, FP32 norm).
-        o = o.to(gl.bfloat16).to(gl.float32)
-        rms = gl.rsqrt(gl.sum(o * o, axis=0) * (1.0 / HEAD) + EPS)
-        y = (o * rms * mx.sigmoid(z) * w).to(gl.bfloat16).to(gl.float32)
-        mx.put_mxfp8(mb.row(first + t), "o8", "oe", vh * 4, gl.reshape(y, [4, 32]))
+        # TokenSpeed rounds the core output to BF16 before the norm.
+        outs += (o.to(gl.bfloat16).to(gl.float32),)
     mb.stamp(STAGE, trace.COMPUTED)
+    _publish_heads(mb, first, vh, outs, zs, w)
     mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def _publish_heads(mb, first, vh, outs, zs, w):
+    """The gated RMS norm ``rms(o) * sigmoid(z) * w`` (FP32) of value head
+    ``vh`` of every token ``t`` (``outs[t]``, ``zs[t]``), published as MXFP8
+    blocks of the token's row. The tokens share one reduction across waves
+    and one quantization."""
+    N: gl.constexpr = len(outs)
+    NP: gl.constexpr = triton.next_power_of_2(N)
+    partial = ()
+    for t in gl.static_range(N):
+        partial += (outs[t] * outs[t],)
+    if N == 1:
+        sums = (gl.sum(partial[0], axis=0),)
+    elif N == 2:
+        sums = gl.reduce(partial, 0, _add2)
+    elif N == 3:
+        sums = gl.reduce(partial, 0, _add3)
+    else:
+        sums = gl.reduce(partial, 0, _add4)
+    ys = ()
+    for t in gl.static_range(NP):
+        if t < N:
+            rms = gl.rsqrt(sums[t] * (1.0 / HEAD) + EPS)
+            y = (outs[t] * rms * mx.sigmoid(zs[t]) * w).to(gl.bfloat16).to(gl.float32)
+        else:
+            y = gl.zeros_like(outs[0])
+        ys += (y,)
+    if NP == 1:
+        mx.put_mxfp8(mb.row(first), "o8", "oe", vh * 4, gl.reshape(ys[0], [4, 32]))
+    else:
+        if NP == 2:
+            # [v, t] -> [t, v]
+            stacked = gl.permute(gl.join(ys[0], ys[1]), [1, 0])
+        else:
+            # [v, i, j] holds token 2 j + i -> [j, i, v]
+            pairs = gl.join(gl.join(ys[0], ys[1]), gl.join(ys[2], ys[3]))
+            stacked = gl.permute(pairs, [2, 1, 0])
+        blocks = gl.convert_layout(
+            gl.reshape(stacked, [NP * 4, 32]), mx.block_layout(gl.num_warps())
+        )
+        fp8, exponent = mx.quantize_mxfp8(blocks)
+        packed = mx.pack_bytes(fp8)
+        stride: gl.constexpr = schedule.row_pairs(mb.plan)
+        g = gl.arange(0, NP * 4, gl.SliceLayout(1, packed.type.layout))
+        q = gl.arange(0, 8, gl.SliceLayout(0, packed.type.layout))
+        dst = mb.row(first)
+        word = (g // 4) * stride + (vh * 4 + g % 4) * 8
+        dst.put("o8", word[:, None] + q[None, :], packed, mask=(g // 4 < N)[:, None])
+        ge = gl.arange(0, NP * 4, exponent.type.layout)
+        dst.put(
+            "oe",
+            (ge // 4) * stride + vh * 4 + ge % 4,
+            exponent.to(gl.int32),
+            mask=ge // 4 < N,
+        )
+
+
+@gluon.jit
+def _add2(a0, a1, b0, b1):
+    return a0 + b0, a1 + b1
+
+
+@gluon.jit
+def _add3(a0, a1, a2, b0, b1, b2):
+    return a0 + b0, a1 + b1, a2 + b2
+
+
+@gluon.jit
+def _add4(a0, a1, a2, a3, b0, b1, b2, b3):
+    return a0 + b0, a1 + b1, a2 + b2, a3 + b3
