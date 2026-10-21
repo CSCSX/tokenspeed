@@ -149,6 +149,8 @@ class GroupTableStacks:
             :meth:`compute_decode_locations`; the router publishes per-bs
             views of it, so it is address-stable for the graph's lifetime.
         page_sizes: ``[G]`` int32 device tensor of kernel page sizes.
+        page_sizes_cpu: Immutable host tuple from the same specs; avoids
+            device scalar reads in the Torch write-location fallback.
     """
 
     def __init__(
@@ -169,6 +171,9 @@ class GroupTableStacks:
         self._index = {gid: i for i, gid in enumerate(self.group_ids)}
         self._ratios = tuple(spec.ratio for spec in groups)
         self._max_num_pages = tuple(spec.max_num_pages for spec in groups)
+        self.page_sizes_cpu = tuple(int(spec.kernel_page_size) for spec in groups)
+        if any(size <= 0 for size in self.page_sizes_cpu):
+            raise ValueError("kernel page sizes must be positive host integers")
         self.max_bs = int(max_bs)
         self.max_tokens_per_req = max(int(max_tokens_per_req), 1)
         g = len(groups)
@@ -190,7 +195,7 @@ class GroupTableStacks:
         self._forward_total = 0
         self._decode_tail: torch.Tensor | None = None
         self.page_sizes = torch.tensor(
-            [spec.kernel_page_size for spec in groups], dtype=torch.int32, device=device
+            self.page_sizes_cpu, dtype=torch.int32, device=device
         )
 
     # ------------------------------------------------------------------
@@ -338,7 +343,13 @@ class GroupTableStacks:
         """Refresh ``decode_locs[:, : bs * tokens_per_req]`` from the current
         stack and the live ``seq_lens`` (one launch for every group)."""
         decode_write_locations(
-            self.tables, self.page_sizes, seq_lens, self.decode_locs, bs, tokens_per_req
+            self.tables,
+            self.page_sizes,
+            seq_lens,
+            self.decode_locs,
+            bs,
+            tokens_per_req,
+            page_sizes_cpu=self.page_sizes_cpu,
         )
 
     def compute_window_locations(
@@ -352,6 +363,7 @@ class GroupTableStacks:
             self.decode_locs,
             bs,
             tokens_per_req,
+            page_sizes_cpu=self.page_sizes_cpu,
         )
 
     def extend_locations(
@@ -381,6 +393,7 @@ class GroupTableStacks:
             extend_seq_lens,
             total_tokens,
             out,
+            page_sizes_cpu=self.page_sizes_cpu,
         )
         self._extend_span = locs
         return {gid: locs[i] for i, gid in enumerate(self.group_ids)}

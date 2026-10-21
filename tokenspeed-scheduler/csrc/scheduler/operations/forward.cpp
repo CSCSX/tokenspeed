@@ -284,6 +284,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens,
                                                                   std::vector<PrefetchOperation>& prefetches) {
+    // A D-role admission always needs a request slot and never starts an L3
+    // prefetch. Avoid hashing/probing every queued prompt on each decode round
+    // when no slot can admit it. Keep the later check for P/fused roles, whose
+    // L3 prefetch may make progress before a request slot becomes available.
+    if (config_.role == Role::kD && req_pool_allocator_.AvailableSlots() == 0) {
+        return FirstChunkOutcome{};
+    }
     AdmissionMatch match = matchPrefixAtAdmission(request);
     // L3 objects beyond the Host hit are fetched into Host BEFORE admission:
     // the request waits (holding only the Host blocks being filled, no Device
