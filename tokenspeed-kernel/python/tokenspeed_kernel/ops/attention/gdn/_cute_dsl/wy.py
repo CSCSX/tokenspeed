@@ -116,60 +116,36 @@ def _dot_tf32(
     transpose_b: cutlass.Constexpr,
     accumulators: cutlass.Constexpr,
 ):
-    low = cute.make_rmem_tensor(4, Float32)
-    high = cute.make_rmem_tensor(4, Float32)
-    low.fill(0.0)
-    high.fill(0.0)
+    count = accumulators if reduction == 128 else 1
+    partials = cute.make_rmem_tensor((4, count), Float32)
+    partials.fill(0.0)
     row = lane // 4
-    for step in cutlass.range_constexpr(
-        reduction // 16 if reduction == 128 and accumulators == 2 else reduction // 8
-    ):
-        low_base = step * 8 + lane % 4
-        if cutlass.const_expr(transpose_b):
-            low_b0, low_b1 = Float32(b[low_base, column + row]), Float32(
-                b[low_base + 4, column + row]
-            )
-        else:
-            low_b0, low_b1 = Float32(b[column + row, low_base]), Float32(
-                b[column + row, low_base + 4]
-            )
-        low.store(
-            _mma_tf32(
-                Float32(a[row, low_base]),
-                Float32(a[row + 8, low_base]),
-                Float32(a[row, low_base + 4]),
-                Float32(a[row + 8, low_base + 4]),
-                low_b0,
-                low_b1,
-                low,
-            )
-        )
-        if cutlass.const_expr(reduction == 128 and accumulators == 2):
-            high_base = step * 8 + lane % 4 + 64
+    for step in cutlass.range_constexpr(reduction // (8 * count)):
+        for accumulator in cutlass.range_constexpr(count):
+            base = step * 8 + lane % 4 + accumulator * (reduction // count)
             if cutlass.const_expr(transpose_b):
-                high_b0, high_b1 = Float32(b[high_base, column + row]), Float32(
-                    b[high_base + 4, column + row]
+                b0, b1 = Float32(b[base, column + row]), Float32(
+                    b[base + 4, column + row]
                 )
             else:
-                high_b0, high_b1 = Float32(b[column + row, high_base]), Float32(
-                    b[column + row, high_base + 4]
+                b0, b1 = Float32(b[column + row, base]), Float32(
+                    b[column + row, base + 4]
                 )
-            high.store(
+            partials[None, accumulator].store(
                 _mma_tf32(
-                    Float32(a[row, high_base]),
-                    Float32(a[row + 8, high_base]),
-                    Float32(a[row, high_base + 4]),
-                    Float32(a[row + 8, high_base + 4]),
-                    high_b0,
-                    high_b1,
-                    high,
+                    Float32(a[row, base]),
+                    Float32(a[row + 8, base]),
+                    Float32(a[row, base + 4]),
+                    Float32(a[row + 8, base + 4]),
+                    b0,
+                    b1,
+                    partials[None, accumulator],
                 )
             )
-    if cutlass.const_expr(reduction == 128 and accumulators == 2):
-        low.store(low.load() + high.load())
-        return low.load()
-    else:
-        return low.load()
+    result = partials[None, 0].load()
+    for accumulator in cutlass.range_constexpr(1, count):
+        result += partials[None, accumulator].load()
+    return result
 
 
 @cute.jit
@@ -258,12 +234,9 @@ class GdnWYKernel:
             Float32,
             cute.make_layout((16, self.value_tile), stride=(self.value_tile + 4, 1)),
         )
-        sKK = smem.allocate_tensor(Float32, cute.make_layout((16, 16), stride=(16, 1)))
         sQK = smem.allocate_tensor(Float32, cute.make_layout((16, 16), stride=(16, 1)))
-        sD = smem.allocate_tensor(Float32, cute.make_layout((16, 16), stride=(16, 1)))
         sG = smem.allocate_tensor(Float32, cute.make_layout(16))
         sBeta = smem.allocate_tensor(Float32, cute.make_layout(16))
-        sDecay = smem.allocate_tensor(Float32, cute.make_layout(16))
         sBits = smem.allocate_tensor(Int64, cute.make_layout(16))
         width = self.heads * 128 + self.vheads * 128 + 2 * self.vheads
         # Keep raw gate reads independent of the following Q/K normalization.
@@ -277,11 +250,11 @@ class GdnWYKernel:
                 prefetched_b = b[Int64(batch) * bs[0] + tid * bs[1] + hv * bs[2]]
                 prefetched_log = A_log[hv]
                 prefetched_bias = dt_bias[hv]
-        if cutlass.const_expr(self.token_bound <= 8):
+        if cutlass.const_expr(self.token_bound == 4):
+            # Backward propagation fills four columns; MMA reads eight.
             for i in cutlass.range_constexpr(2):
                 weight_offset = tid + i * 128
                 sQK[weight_offset // 16, weight_offset % 16] = Float32(0)
-                sKK[weight_offset // 16, weight_offset % 16] = Float32(0)
         idx = Int64(indices[batch])
         source_row = Int64(0)
         if idx >= 0:
@@ -493,6 +466,13 @@ class GdnWYKernel:
                     backward_part
                 ]
         else:
+            sKK = smem.allocate_tensor(
+                Float32, cute.make_layout((16, 16), stride=(16, 1))
+            )
+            sD = smem.allocate_tensor(
+                Float32, cute.make_layout((16, 16), stride=(16, 1))
+            )
+            sDecay = smem.allocate_tensor(Float32, cute.make_layout(16))
             # Summing path segments avoids cancellation of large cumulative gates.
             for i in cutlass.range_constexpr(2):
                 offset = tid + i * 128
@@ -666,11 +646,9 @@ def launch_gdn_wy(
         Int64(initial_state.stride(0)),
     )
     pdl = pdl_enabled()
-    value_tile = 128 if B * HV >= 256 else 32
     token_bound = 4 if T <= 4 else 8 if T <= 8 else 16
-    if token_bound == 16 and (initial_state.dtype == torch.float32 or B * HV < 256):
-        value_tile = 64
-    if token_bound <= 8 and value_tile == 32:
+    value_tile = 128 if B * HV >= 256 else 64
+    if token_bound == 16 and initial_state.dtype == torch.float32:
         value_tile = 64
     accumulators = 2 if token_bound == 8 and B * HV <= 64 else 1
     key = (

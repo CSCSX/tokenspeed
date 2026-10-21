@@ -217,6 +217,7 @@ def prepare_gdn_decode_mtp(
             "value_head_dim": profile.value_head_dim,
             "verify_tokens": tokens,
             "output_only": not per_token,
+            "tree": False,
         },
     )
     inputs = _decode_inputs(request.seed, batch, tokens, profile)

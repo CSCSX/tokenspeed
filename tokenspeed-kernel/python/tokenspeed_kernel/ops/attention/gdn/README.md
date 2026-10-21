@@ -2,19 +2,23 @@
 
 ## CuTe DSL WY verification
 
-`gdn_decode_mtp(..., solution="cute_dsl")` selects the output-only TF32 MMA
-kernel for ReplaySSM. It accepts BF16/FP16 Q/K/V with K=V=128, grouped value
+`gdn_decode_mtp` selects the output-only TF32 MMA kernel for ReplaySSM through
+the normal registry. It accepts BF16/FP16 Q/K/V with K=V=128, grouped value
 heads, BF16/FP16/FP32 K-last initial states, and 1–16 tokens. Chains and trees
 share the same WY computation; the facade's existing tree workspace contract
 restricts its output-only trees to 8–16 nodes.
 
-The model's GDN ReplaySSM verify prefers this leaf for supported NVIDIA
-geometry, for both BF16 and FP32 state. `gdn_replay_verify_solution` probes the
-registration's platform, dtype and size constraints; unsupported cases keep
-the existing selection, including the BF16 padding-safe Triton path. Verify
-calls that need node states, ordinary decode, and staged state-writing verify
-retain their existing policy. Cache-pool binding uses the same choice when
-checking whether verify can read packed projection views.
+The registration constrains platform, dtype, head dimensions, token count and
+output-only execution; its specialized priority wins over general recurrence
+on supported NVIDIA geometry, for both BF16 and FP32 state. Tree support is a
+trait, so chain-only kernels are excluded without forcing a solution. Explicit
+`solution` and `override` requests still apply. Cache-pool capability queries
+use the same execution traits when checking for packed projection views.
+
+State-writing verify and ordinary decode retain the BF16 padding-safe Triton
+policy. Read-only verify uses normal selection, including fallback kernels for
+unsupported WY geometry. It may read the reserved null page for padding, but
+never writes it; padded outputs are ignored.
 
 The leaf reads the committed state once per value tile, forms the small WY
 output transform and computes every token's output without writing the state
@@ -50,6 +54,11 @@ payload stores reuse the loaded values. Four-token 64-value tiles also
 issue raw gate and parameter reads before Q/K normalization,
 then convert and consume them in the normal FP32 gate computation.
 
+TF32 products share one accumulation loop for both one- and two-accumulator
+variants, preserving their reduction order. Four-token windows allocate only
+the backward-propagation workspace; larger windows initialize the Gram tiles
+directly through MMA.
+
 Checkpoint tiles retain their source dtype in shared memory. Aligned rows use
 16-byte asynchronous copies issued before Q/K preparation and completed before
 the first checkpoint product. Row alignment is evaluated on the device, so
@@ -61,8 +70,7 @@ Release validation on SM103 covers 64 chain/tree, BF16/FP32,
 warm/cold-cache and PDL configurations, with B=1–64, T=4/8/16 and H/HV=8/24,
 16/32 or 8/32. Blackwell 13–16-token chains already use chunked verification,
 so comparisons include that path in addition to the serial Triton leaf.
-The kernel facade keeps its existing default selection; the model's
-ReplaySSM verify supplies the preferred solution explicitly.
+The facade and model's ReplaySSM verify use the same registry selection.
 
 ## FlashInfer PDL adapters
 

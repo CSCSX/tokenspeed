@@ -29,6 +29,7 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture
+from tokenspeed_kernel.registry import KernelRegistry
 
 _TEST_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_TEST_DIR))
@@ -298,6 +299,7 @@ def test_replay_prefers_wy_and_commits_the_accepted_path(
     before = case.state.clone()
     output, selected = recorded_forward(case, tmp_path / "verify.json")
     assert selected == "cute_dsl_gdn_decode_mtp"
+    assert case.backend._verify_packed_qkv_views
     torch.testing.assert_close(
         output.double(), reference.forward().double(), atol=1e-4, rtol=2**-7
     )
@@ -310,6 +312,7 @@ def test_replay_prefers_wy_and_commits_the_accepted_path(
     "tokens,head_dim,replay,tree",
     [
         (4, 64, True, False),
+        (17, 128, True, False),
         (17, 128, True, True),
         (4, 128, True, True),
         (4, 128, False, False),
@@ -326,13 +329,24 @@ def test_verify_falls_back_for_unsupported_or_state_writing_calls(
         replay=replay,
         tree=tree,
     )
-    case.refresh(actual_bs=_BATCH, read_pages=(1, 2), for_graph_replay=False)
+    case.refresh(actual_bs=1, read_pages=(1, 2), for_graph_replay=False)
+    before = case.state.clone()
     output, selected = recorded_forward(case, tmp_path / "verify.json")
-    if replay or state_dtype == torch.bfloat16:
-        assert selected == "triton_gdn_decode_mtp"
-    else:
-        assert selected != "cute_dsl_gdn_decode_mtp"
+    expected = "triton_gdn_decode_mtp"
+    if (
+        not tree
+        and head_dim == 128
+        and (state_dtype != torch.bfloat16 or replay)
+        and KernelRegistry.get().get_by_name("flashinfer_gdn_decode_mtp") is not None
+    ):
+        expected = "flashinfer_gdn_decode_mtp"
+    assert selected == expected
+    assert case.backend._verify_packed_qkv_views == (
+        selected == "triton_gdn_decode_mtp"
+    )
     assert output.isfinite().all()
+    if replay:
+        assert torch.equal(case.state, before)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])

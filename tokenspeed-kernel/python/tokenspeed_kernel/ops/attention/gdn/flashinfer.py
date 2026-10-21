@@ -350,6 +350,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "tree": frozenset({False}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),
         },
@@ -411,7 +412,7 @@ if is_decode_available():
         """
         if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError(
-                "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+                "FlashInfer GDN MTP kernels do not support trees or replay payloads"
             )
         if output_state is not None:
             raise NotImplementedError(

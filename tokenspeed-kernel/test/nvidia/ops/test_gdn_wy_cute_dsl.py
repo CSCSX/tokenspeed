@@ -457,8 +457,19 @@ def test_wy_rejects_state_writes(argument):
 
 
 @pytest.mark.parametrize("tree", [False, True])
-def test_wy_registry_selection(tree):
-    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
+@pytest.mark.parametrize("solution", [None, "cute_dsl"])
+def test_wy_registry_selection(monkeypatch, tree, solution):
+    from tokenspeed_kernel.ops.attention import gdn
+
+    selected = []
+    select = gdn.select_kernel
+
+    def record_selection(*args, **kwargs):
+        kernel = select(*args, **kwargs)
+        selected.append(kernel.name)
+        return kernel
+
+    monkeypatch.setattr(gdn, "select_kernel", record_selection)
 
     case = make_case(
         batch=2,
@@ -471,7 +482,8 @@ def test_wy_registry_selection(tree):
         vheads=6,
     )
     pool = case["initial_state"].clone()
-    output = gdn_decode_mtp(**case, solution="cute_dsl")
+    output = gdn.gdn_decode_mtp(**case, solution=solution)
+    assert selected == ["cute_dsl_gdn_decode_mtp"]
     torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
     assert torch.equal(case["initial_state"], pool)
 
@@ -552,41 +564,91 @@ def test_wy_empty_batch():
 
 
 @pytest.mark.parametrize(
-    "dtype,head_dim,value_head_dim,tokens,expected",
+    "head_dim,value_head_dim,tokens,output_only,tree,expected",
     [
-        (torch.bfloat16, 128, 128, 1, "cute_dsl"),
-        (torch.float16, 128, 128, 4, "cute_dsl"),
-        (torch.bfloat16, 128, 128, 16, "cute_dsl"),
-        (torch.bfloat16, 128, 128, 17, None),
-        (torch.bfloat16, 64, 128, 4, None),
-        (torch.bfloat16, 128, 64, 4, None),
-        (torch.float32, 128, 128, 4, None),
+        (128, 128, 1, True, False, "cute_dsl_gdn_decode_mtp"),
+        (128, 128, 16, True, True, "cute_dsl_gdn_decode_mtp"),
+        (128, 128, 17, True, False, "flashinfer_gdn_decode_mtp"),
+        (64, 128, 4, True, False, "triton_gdn_decode_mtp"),
+        (128, 64, 8, True, True, "triton_gdn_decode_mtp"),
+        (128, 128, 8, False, True, "triton_gdn_decode_mtp"),
+        (128, 128, 8, False, False, "flashinfer_gdn_decode_mtp"),
     ],
 )
-def test_wy_replay_verify_policy(dtype, head_dim, value_head_dim, tokens, expected):
-    from tokenspeed_kernel.ops.attention.gdn import gdn_replay_verify_solution
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_wy_selection_traits(
+    dtype, head_dim, value_head_dim, tokens, output_only, tree, expected
+):
+    from tokenspeed_kernel.ops.attention.gdn import _attention_format_signature
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import select_kernel
 
+    if (
+        expected == "flashinfer_gdn_decode_mtp"
+        and KernelRegistry.get().get_by_name(expected) is None
+    ):
+        expected = "triton_gdn_decode_mtp"
+    probe = torch.empty(0, dtype=dtype, device="meta")
     assert (
-        gdn_replay_verify_solution(
-            dtype,
-            head_dim=head_dim,
-            value_head_dim=value_head_dim,
-            num_tokens=tokens,
-        )
+        select_kernel(
+            "attention",
+            "gdn_decode_mtp",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            traits={
+                "head_dim": head_dim,
+                "value_head_dim": value_head_dim,
+                "verify_tokens": tokens,
+                "output_only": output_only,
+                "tree": tree,
+            },
+        ).name
         == expected
     )
 
 
-def test_wy_replay_verify_policy_on_other_vendor(monkeypatch, mi350_platform):
-    from tokenspeed_kernel.ops.attention import gdn
+def test_wy_selection_on_other_vendor(mi350_platform):
+    from tokenspeed_kernel.ops.attention.gdn import _attention_format_signature
+    from tokenspeed_kernel.selection import select_kernel
 
-    monkeypatch.setattr(gdn, "current_platform", lambda: mi350_platform)
+    probe = torch.empty(0, dtype=torch.bfloat16, device="meta")
     assert (
-        gdn.gdn_replay_verify_solution(
-            torch.bfloat16, head_dim=128, value_head_dim=128, num_tokens=4
-        )
-        is None
+        select_kernel(
+            "attention",
+            "gdn_decode_mtp",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            platform=mi350_platform,
+            traits={
+                "head_dim": 128,
+                "value_head_dim": 128,
+                "verify_tokens": 8,
+                "output_only": True,
+                "tree": True,
+            },
+        ).name
+        == "triton_gdn_decode_mtp"
     )
+
+
+def test_wy_explicit_solution_is_preserved():
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    case = make_case(
+        batch=1,
+        tokens=8,
+        dtype=torch.bfloat16,
+        state_dtype=torch.float32,
+        tree=True,
+        strided=False,
+        heads=2,
+        vheads=6,
+    )
+    # The portable kernel's state pool is packed rather than row-padded.
+    case["initial_state"] = case["initial_state"].contiguous()
+    actual = gdn_decode_mtp(**case, solution="triton")
+    torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
+    with pytest.raises(NoKernelFoundError):
+        gdn_decode_mtp(**case, solution="flashinfer")
 
 
 @pytest.mark.parametrize(

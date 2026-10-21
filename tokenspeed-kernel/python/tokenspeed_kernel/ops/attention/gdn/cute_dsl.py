@@ -51,12 +51,13 @@ if (
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.PERFORMANT,
+        priority=Priority.SPECIALIZED + 1,
         traits={
             "head_dim": frozenset({128}),
             "value_head_dim": frozenset({128}),
             "verify_tokens": frozenset(range(1, 17)),
             "output_only": frozenset({True}),
+            "tree": frozenset({False, True}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False, True}),
         },
