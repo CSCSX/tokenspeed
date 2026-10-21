@@ -355,6 +355,9 @@ perf:
 
     VERIFY = "gluon_kda_fused_paged_verify_nostore_vmajor_gfx950"
     RECOVERY = "gluon_kda_fused_replay_gfx950"
+    CONFIGURATION_ERROR_PATTERN = (
+        r"ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED|error code 16\b.*configuration"
+    )
 
 
     def run_command(arguments: list[str], log: Path, timeout: float) -> dict:
@@ -443,7 +446,39 @@ perf:
         }
 
 
-    def collect_initialization(arguments: list[str], output_dir: Path, help_text: str) -> dict:
+    def summarize_probe_trace(output_dir: Path) -> dict:
+        """Require actual kernel dispatch records before trying the larger workload."""
+        valid = []
+        invalid_count = 0
+        valid_count = 0
+        files = []
+        for path in sorted(output_dir.rglob("*kernel_trace.csv")):
+            files.append(str(path.relative_to(output_dir)))
+            with path.open(newline="") as stream:
+                for row in csv.DictReader(stream):
+                    try:
+                        valid_row = (
+                            bool((row["Kernel_Name"] or "").strip())
+                            and int(row["Dispatch_Id"]) >= 0
+                            and 0 < int(row["Start_Timestamp"]) < int(row["End_Timestamp"])
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        valid_row = False
+                    if valid_row:
+                        valid_count += 1
+                        if len(valid) < 8:
+                            valid.append(row)
+                    else:
+                        invalid_count += 1
+        return {
+            "files": files, "valid_count": valid_count, "invalid_count": invalid_count,
+            "rows": valid, "rows_truncated": valid_count > len(valid),
+        }
+
+
+    def collect_initialization(
+        arguments: list[str], output_dir: Path, help_text: str, guard: Path | None
+    ) -> dict:
         """Inspect profiler loading around a minimal Torch import and GPU operation."""
         output_dir.mkdir(parents=True, exist_ok=True)
         workload = output_dir / "torch-import.py"
@@ -489,9 +524,14 @@ perf:
         profiler_arguments = arguments[:arguments.index("--")]
         profiler_arguments[profiler_arguments.index("-d") + 1] = str(output_dir)
         profiler_arguments[profiler_arguments.index("-o") + 1] = "torch-import"
+        profiler_arguments[profiler_arguments.index("--kernel-include-regex") + 1] = ".*"
+        profiler_arguments[profiler_arguments.index("--kernel-iteration-range") + 1] = "1"
         if re.search(r"--log-level[^\n]*\binfo\b", help_text):
             profiler_arguments.extend(["--log-level", "info"])
-        profiler_arguments.extend(["--", sys.executable, str(workload)])
+        profiler_arguments.extend(["--", sys.executable])
+        if guard is not None:
+            profiler_arguments.append(str(guard))
+        profiler_arguments.append(str(workload))
         # Loader logging is scoped to this optional child after all timings.
         command = [
             "/usr/bin/env", "LD_DEBUG=libs",
@@ -516,7 +556,21 @@ perf:
                 ):
                     initializer_count += 1
                     if len(initializers) < 64:
-                        initializers.append({"file": path.name, "line": line.strip()})
+                        library = Path(line.split("calling init:", 1)[1].strip())
+                        initializers.append({
+                            "file": path.name, "line": line.strip(),
+                            "library": str(library),
+                            "resolved_path": str(library.resolve()),
+                            "exists": library.is_file(),
+                        })
+        lines = output.splitlines()
+        configuration_errors = [
+            "\n".join(lines[max(0, index - 3):index + 4])
+            for index, line in enumerate(lines)
+            if re.search(
+                CONFIGURATION_ERROR_PATTERN, line, re.IGNORECASE,
+            )
+        ]
         complete = any(stage["stage"] == "gpu_complete" for stage in stages)
         return {
             "status": "gpu_complete" if outcome["returncode"] == 0 and not outcome["timed_out"] and complete else "incomplete",
@@ -524,6 +578,15 @@ perf:
             "loader_files": loader_files, "library_initializers": initializers,
             "initializer_count": initializer_count,
             "initializers_truncated": initializer_count > len(initializers),
+            "configuration_error_pattern": CONFIGURATION_ERROR_PATTERN,
+            "configuration_error_count": len(configuration_errors),
+            "configuration_error_contexts": configuration_errors[:4],
+            "configuration_errors_truncated": len(configuration_errors) > 4,
+            "trace": summarize_probe_trace(output_dir),
+            "guard_stages": [
+                json.loads(line.split("=", 1)[1])
+                for line in lines if line.startswith("ROCPROF_GUARD_STAGE=")
+            ],
             "log": {
                 "file": log.name, "chars": len(output), "head": output[:3000],
                 "tail": output[-3000:] if len(output) > 3000 else "",
@@ -531,10 +594,153 @@ perf:
             },
             "scope": (
                 "Initialization evidence only; calling init records entry, not completion. "
-                "Search attempts are excluded. No SDK, constructor policy, or timed workload "
-                "is changed. Tiny Torch kernels do not match the KDA counter filter."
+                "Search attempts are excluded. Baseline and guarded probes use the same "
+                "tiny-kernel profiler flags. No installed libraries or timed workloads change."
             ),
         }
+
+
+
+    def sdk_guard_gate(diagnostic: dict) -> dict:
+        """Admit only the observed duplicate-SDK constructor failure in this job."""
+        reasons = []
+        command = diagnostic.get("command", {})
+        if command.get("returncode") in (None, 0) or command.get("timed_out") or command.get("error"):
+            reasons.append("baseline_probe_did_not_fail_cleanly")
+        if not diagnostic.get("configuration_error_count"):
+            reasons.append("exact_configuration_error_not_found")
+        stages = diagnostic.get("stages", [])
+        before = [stage for stage in stages if stage["stage"] == "before_torch"]
+        system_paths = set()
+        torch_paths = set()
+        if len(before) != 1 or len(stages) != 1:
+            reasons.append("failure_not_isolated_to_torch_import")
+        else:
+            stage = before[0]
+            if stage["global_sdk"] != {"returncode": 0, "initialized": 1}:
+                reasons.append("global_sdk_not_initialized")
+            if stage["constructor_flag"] != "1":
+                reasons.append("constructor_policy_not_enabled")
+            for entry in diagnostic.get("library_initializers", []):
+                path = entry["resolved_path"]
+                if not entry.get("exists") or entry["file"] != f"loader.{stage['pid']}" or not re.fullmatch(
+                    r"librocprofiler-sdk\.so(?:\.\d+)*", Path(path).name
+                ):
+                    continue
+                if path in stage["libraries"] and path.startswith("/opt/rocm"):
+                    system_paths.add(path)
+                if "/site-packages/torch/lib/" in path:
+                    torch_paths.add(path)
+            if not system_paths or not torch_paths or system_paths & torch_paths:
+                reasons.append("distinct_system_and_torch_sdk_initializers_not_proven")
+        if diagnostic.get("initializers_truncated"):
+            reasons.append("initializer_evidence_truncated")
+        return {
+            "eligible": not reasons, "reasons": reasons,
+            "system_sdk_paths": sorted(system_paths), "torch_sdk_paths": sorted(torch_paths),
+        }
+
+
+    def write_sdk_guard(path: Path) -> None:
+        """Create a child-only experiment for the upstream duplicate-SDK failure."""
+        path.write_text(textwrap.dedent("""
+            import ctypes
+            import json
+            import os
+            import runpy
+            import sys
+            from pathlib import Path
+
+            def snapshot(stage):
+                process = ctypes.CDLL(None)
+                query = process.rocprofiler_is_initialized
+                query.argtypes = [ctypes.POINTER(ctypes.c_int)]
+                query.restype = ctypes.c_int
+                getenv = process.getenv
+                getenv.argtypes = [ctypes.c_char_p]
+                getenv.restype = ctypes.c_char_p
+                state = ctypes.c_int(-1)
+                status = query(ctypes.byref(state))
+                policy = getenv(b"ROCPROFILER_LIBRARY_CTOR")
+                result = {
+                    "stage": stage, "returncode": status, "initialized": state.value,
+                    "constructor_flag": None if policy is None else policy.decode(),
+                }
+                print("ROCPROF_GUARD_STAGE=" + json.dumps(result), flush=True)
+                return result
+
+            before = snapshot("before_guard")
+            if before["returncode"] != 0 or before["initialized"] != 1 or before["constructor_flag"] != "1":
+                raise RuntimeError("Profiler constructor guard preconditions were not met")
+            # The first SDK remains initialized. Suppress only later constructors.
+            os.environ["ROCPROFILER_LIBRARY_CTOR"] = "0"
+            after = snapshot("after_guard")
+            if after["returncode"] != 0 or after["initialized"] != 1 or after["constructor_flag"] != "0":
+                raise RuntimeError("Profiler constructor guard did not preserve the active SDK")
+            sys.argv = sys.argv[1:]
+            sys.path[0] = str(Path(sys.argv[0]).resolve().parent)
+            runpy.run_path(sys.argv[0], run_name="__main__")
+        """).lstrip())
+
+
+    def collect_profile(arguments: list[str], output_dir: Path) -> dict:
+        log = output_dir / "profiler.txt"
+        command = run_command(arguments, log, 600)
+        output = log.read_text(errors="replace")
+        report = {
+            "command": command,
+            "status": "collected_requires_review" if command["returncode"] == 0 and not command["timed_out"] else "profiler_failed",
+            "log": {
+                "file": log.name, "chars": len(output), "head": output[:4000],
+                "tail": output[-4000:] if len(output) > 4000 else "",
+                "truncated": len(output) > 8000,
+            },
+            "workload_metadata": [
+                json.loads(line.split("=", 1)[1])
+                for line in output.splitlines() if line.startswith("KDA_PROFILE_WORKLOAD=")
+            ],
+            "guard_stages": [
+                json.loads(line.split("=", 1)[1])
+                for line in output.splitlines() if line.startswith("ROCPROF_GUARD_STAGE=")
+            ],
+            "csv": [], "reasons": [],
+            "attribution": "unvalidated: inspect graph API, dispatch IDs, kernel IDs and counter rows",
+        }
+        for path in sorted(output_dir.rglob("*.csv")):
+            try:
+                report["csv"].append(summarize_csv(path))
+            except (OSError, csv.Error, UnicodeError) as error:
+                report["csv"].append({"file": str(path.relative_to(output_dir)), "error": str(error)})
+        if not report["csv"]:
+            report["reasons"].append("no_CSV_output")
+        return report
+
+
+    def collect_guarded_smoke(
+        diagnostic: dict, arguments: list[str], output_dir: Path, help_text: str
+    ) -> dict:
+        gate = sdk_guard_gate(diagnostic)
+        report = {"status": "skipped", "gate": gate}
+        if not gate["eligible"]:
+            return report
+        output_dir.mkdir(parents=True, exist_ok=True)
+        guard = output_dir / "sdk-constructor-guard.py"
+        write_sdk_guard(guard)
+        probe = collect_initialization(arguments, output_dir / "torch-import", help_text, guard)
+        report["initialization_diagnostic"] = probe
+        trace = probe["trace"]
+        if probe["status"] != "gpu_complete" or not trace["valid_count"] or trace["invalid_count"]:
+            report["status"] = "guarded_probe_incomplete"
+            return report
+        # Keep the original KDA flags and workload arguments after the tiny probe passes.
+        recovery_dir = output_dir / "recovery"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        guarded_arguments = list(arguments)
+        guarded_arguments[guarded_arguments.index("-d") + 1] = str(recovery_dir)
+        guarded_arguments.insert(guarded_arguments.index("--") + 2, str(guard))
+        report["recovery"] = collect_profile(guarded_arguments, recovery_dir)
+        report["status"] = report["recovery"]["status"]
+        return report
 
 
     def collect_smoke(inventory_dir: Path, output_dir: Path, workload: Path) -> dict:
@@ -573,33 +779,21 @@ perf:
                 "-d", str(output_dir), "-o", "recovery", "-f", "csv", "--",
                 sys.executable, str(workload), "--batch", "128", "--page-relation", "distinct",
             ]
-            log = output_dir / "profiler.txt"
-            report["command"] = run_command(arguments, log, 600)
-            command = report["command"]
-            report["status"] = "collected_requires_review" if command["returncode"] == 0 and not command["timed_out"] else "profiler_failed"
-            output = log.read_text(errors="replace")
-            report["log"] = {
-                "file": log.name, "chars": len(output), "head": output[:4000],
-                "tail": output[-4000:] if len(output) > 4000 else "",
-                "truncated": len(output) > 8000,
-            }
-            report["workload_metadata"] = [
-                json.loads(line.split("=", 1)[1])
-                for line in output.splitlines() if line.startswith("KDA_PROFILE_WORKLOAD=")
-            ]
-            for path in sorted(output_dir.rglob("*.csv")):
-                try:
-                    report["csv"].append(summarize_csv(path))
-                except (OSError, csv.Error, UnicodeError) as error:
-                    report["csv"].append({"file": str(path.relative_to(output_dir)), "error": str(error)})
-            if not report["csv"]:
-                report["reasons"].append("no_CSV_output")
+            report.update(collect_profile(arguments, output_dir))
             try:
                 report["initialization_diagnostic"] = collect_initialization(
-                    arguments, output_dir / "torch-import", help_text
+                    arguments, output_dir / "torch-import", help_text, None
                 )
             except Exception as error:
                 report["initialization_diagnostic"] = {
+                    "status": "error", "error": f"{type(error).__name__}: {error}"
+                }
+            try:
+                report["guarded_sdk_experiment"] = collect_guarded_smoke(
+                    report["initialization_diagnostic"], arguments, output_dir / "guarded-sdk", help_text
+                )
+            except Exception as error:
+                report["guarded_sdk_experiment"] = {
                     "status": "error", "error": f"{type(error).__name__}: {error}"
                 }
         report["files"] = [str(p.relative_to(output_dir)) for p in sorted(output_dir.rglob("*")) if p.is_file()]
