@@ -400,8 +400,8 @@ public:
         std::size_t requested{0};
         std::size_t allocated{0};
         std::size_t unallocated{0};
-        std::size_t same_group_scans{0};
-        std::size_t cross_group_scans{0};
+        std::size_t group_scans{0};
+        std::size_t parent_scans{0};
     };
     struct HostAllocationBatch {
         std::vector<CacheBlockRef> blocks;
@@ -416,9 +416,10 @@ public:
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
     // page must be the owner of its Device page, so a copy's two ends select
-    // the same rows on every rank. Free capacity first, then the group's own
-    // least valuable entries in the needed buckets, then whole parents of
-    // any group; a shortfall leaves an empty reference.
+    // the same rows on every rank. Free capacity first, then global LRU over
+    // compatible children and fully evictable parents of any group. A parent
+    // is ranked by its newest child; equal epochs prefer one child. A
+    // shortfall leaves an empty reference.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);

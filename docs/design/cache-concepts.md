@@ -809,13 +809,19 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries. Host L2 replacement ranks eligible entries
-  only by their last access epoch; a prefix hit refreshes that epoch, and
-  earlier reuse grants no additional protection. Equal epochs use group and
-  physical location as deterministic tie-breaks. Compatible same-group slots
-  are reused first; cross-group replacement requires a fully evictable parent
-  and ranks it by its most recently accessed child. Pinned entries remain
-  ineligible for eviction. During prefill, each chunk end queues the
+  acquire/contains/pin queries. Host L2 uses free capacity first, then global
+  LRU across cache groups: a compatible child in the requested group competes
+  with fully evictable LCM parents from every group. Cross-group reuse must
+  free a whole parent, ranked by its most recently accessed child, so a cold
+  sibling cannot cause newer data to be discarded. Equal epochs prefer
+  evicting one child; group and physical location break remaining ties. A
+  prefix hit refreshes its access epoch, and earlier reuse grants no
+  additional protection. Pinned entries, partially pinned foreign parents,
+  and blocks allocated earlier in the same batch remain protected. Child
+  reuse preserves the requested placement bucket. No group has an eviction
+  preference or a fixed share of the pool; capacity follows the access
+  pattern, without guaranteeing that KV and every required state checkpoint
+  remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
   admission, or a junction cut) queues its tail and state checkpoint too;
   the candidates are merged into a batched writeback. Ordinary decode
