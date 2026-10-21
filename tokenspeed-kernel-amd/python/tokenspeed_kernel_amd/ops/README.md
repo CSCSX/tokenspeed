@@ -1156,6 +1156,8 @@ Without value splits, one-token verify keeps 64 state rows in flight after
 preparation.
 GFX950 recovery uses one 128-row panel for one-token windows with a bounded gate.
 Other windows keep 16-row panels, with two in flight for one-token softplus.
+For bounded one-token recovery, the FP32 product U*K is rounded before
+FMA computes state*decay plus that product.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against

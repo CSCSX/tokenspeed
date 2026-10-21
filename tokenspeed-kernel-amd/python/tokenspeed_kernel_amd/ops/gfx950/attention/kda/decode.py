@@ -1095,8 +1095,15 @@ def gluon_kda_fused_replay_gfx950(
                 .load(value_layout)
             )
             if token_offset < replay_steps:
-                running *= decay_values[token_offset][None, :]
-                running += delta[:, None] * k_values[token_offset][None, :]
+                if T == 1 and BOUNDED:
+                    # Match prior recovery: round U*K before the state-decay FMA.
+                    update = delta[:, None] * k_values[token_offset][None, :]
+                    running = gl.fma(
+                        running, decay_values[token_offset][None, :], update
+                    )
+                else:
+                    running *= decay_values[token_offset][None, :]
+                    running += delta[:, None] * k_values[token_offset][None, :]
         write_base = write_idx * state_stride + head_idx * D * D
         gl.store(state_pool + write_base + panel_offsets, running)
 
