@@ -1163,10 +1163,8 @@ reusing a stale window. Recovery reads the accepted prefix, recomputes key
 normalization and decay, and applies U without recomputing the prediction.
 A zero accepted count copies the checkpoint. Nonpositive source/destination
 pages are padding. Groups select independent page-table rows for each layer.
-Device assertions remain enabled for interval and generation checks. Uniform
-error branches keep their barriers off the valid recovery path and GFX950 verify
-path. Failure tests use separate processes; GFX1250 also uses a fresh emulator
-per case. The expected error text comes from the compiled assertion payload.
+Device assertions remain enabled for interval and generation checks. Isolated
+native GPU tests check invalid metadata, invalid intervals, and stale records.
 These launches disable automatic integer-overflow instrumentation to keep repeated
 address checks out of the state-update loop.
 
