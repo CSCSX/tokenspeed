@@ -50,7 +50,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSASelection,
-    decode_query_lengths,
     qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -297,36 +296,6 @@ class QSAIndexer(nn.Module):
         )
         return prepared_query
 
-    def _topk_algorithm(
-        self,
-        rows: int,
-        page_table: torch.Tensor,
-        page_size: int,
-    ) -> str:
-        """Route block top-k between the streaming and materialized paths.
-
-        ``TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH`` pins the backend
-        (``stream``/``logits``) and ``TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB``
-        caps the materialized score matrix for ``auto`` routing; both are
-        declared on the shared ``envs`` table in ``runtime.utils.env``.
-        """
-
-        path = envs.TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH.get()
-        if path not in ("auto", "stream", "logits"):
-            raise ValueError(
-                "TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH must be 'auto', 'stream', "
-                f"or 'logits', got {path!r}"
-            )
-        if path != "auto":
-            return path
-        num_blocks = page_table.shape[1] * page_size
-        budget_mb = envs.TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB.get()
-        # The materialized DSA-selection path measured 2-24x faster than the
-        # fused streaming path across decode/prefill shapes, so auto prefers
-        # it whenever the score matrix fits the configured budget; beyond
-        # the budget routing falls back to zero-materialization streaming.
-        return "logits" if rows * num_blocks * 4 <= budget_mb << 20 else "stream"
-
     def _select(
         self,
         q: torch.Tensor,
@@ -352,8 +321,6 @@ class QSAIndexer(nn.Module):
         page_size = compressed.shape[1]
         cache = compressed.view(-1, 1, self.index_head_dim)
         enable_pdl = pdl_enabled()
-        # Auto normally materializes scores for persistent radix selection;
-        # oversized matrices retain the zero-materialization streaming path.
         selected_blocks = qwen4_exp_qsa_block_topk(
             q,
             cache,
@@ -364,7 +331,10 @@ class QSAIndexer(nn.Module):
             block_topk=self.block_topk,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm=self._topk_algorithm(q.shape[0], qsa_page_table, page_size),
+            path=envs.TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH.get(),
+            max_logits_bytes=envs.TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB.get() << 20,
+            solution=None,
+            override=None,
             enable_pdl=enable_pdl,
         )
         selected_slots = qwen4_exp_qsa_selected_slots(
@@ -508,11 +478,7 @@ class QSAIndexer(nn.Module):
             compressed,
             full_page_size=layout.full_kernel_page_size,
             complete_blocks=complete_blocks,
-            queries_per_request=(
-                q.shape[0]
-                if ctx.bs == 1
-                else decode_query_lengths(ctx, q.shape[0], force_uniform=False)
-            ),
+            queries_per_request=layout.queries_per_request,
         )
         ctx.attn_backend.sparse_topk.qsa_selection = selection
         selected_slots = selection.selected_slots

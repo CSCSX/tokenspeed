@@ -304,6 +304,7 @@ def qsa_block_scores(
         traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
         solution=solution,
         override=override,
+        features=frozenset({"logits"}),
     )
     return kernel(
         query,
@@ -351,6 +352,7 @@ def qsa_block_topk_select(
         traits={"topk": topk},
         solution=solution,
         override=override,
+        features=frozenset({"logits"}),
     )
     return kernel(
         logits,
@@ -369,6 +371,7 @@ def qsa_block_topk_stream(
     *,
     page_size: int,
     block_topk: int,
+    queries_per_request: int | None,
     max_partial_bytes: int,
     enable_pdl: bool,
     override: str | None,
@@ -384,6 +387,7 @@ def qsa_block_topk_stream(
         complete_blocks: Fully compressed block count per row.
         page_size: Compressed rows per page.
         block_topk: Blocks selected per row.
+        queries_per_request: Uniform request-run width or None for ragged rows.
         max_partial_bytes: Memory budget for partial top-k buffers.
         enable_pdl: Use programmatic dependent launch where supported.
         override: Optional registered kernel name.
@@ -394,6 +398,21 @@ def qsa_block_topk_stream(
         invalid entries are ``-1``.
     """
 
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        can_use_cute_dsl_qwen4_exp_qsa_block_topk,
+    )
+
+    supported_layout = can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+    )
     kernel = select_kernel(
         "attention",
         "qsa_block_topk_stream",
@@ -401,9 +420,16 @@ def qsa_block_topk_stream(
             query=dense_tensor_format(query.dtype),
             key_cache=dense_tensor_format(key_cache.dtype),
         ),
-        traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
+        traits={
+            "num_q_heads": query.shape[1],
+            "head_dim": query.shape[2],
+            "page_size": page_size,
+            "block_topk": block_topk,
+            "supported_layout": supported_layout,
+        },
         solution=solution,
         override=override,
+        features=frozenset({"stream"}),
     )
     return kernel(
         query,
@@ -413,6 +439,7 @@ def qsa_block_topk_stream(
         complete_blocks,
         page_size=page_size,
         block_topk=block_topk,
+        queries_per_request=queries_per_request,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
     )
@@ -429,50 +456,69 @@ def qwen4_exp_qsa_block_topk(
     block_topk: int,
     queries_per_request: int | None,
     max_partial_bytes: int,
-    algorithm: str,
+    max_logits_bytes: int,
+    path: str,
     enable_pdl: bool,
+    solution: str | None,
+    override: str | None,
 ) -> torch.Tensor:
-    """Select the highest-scoring compressed blocks for each query row.
+    """Select the highest-scoring compressed blocks through kernel selection.
 
     Args:
         query: Query tensor shaped ``[rows, heads, head_dim]``.
         key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
-            with holes and padding normalized to zero; one entry per logical page.
-        request_indices: Owning request id per query row.
-        complete_blocks: Fully compressed block counts shaped ``[rows]``.
+        page_table: Physical compressed-cache pages shaped ``[requests, pages]``
+            with contiguous columns; holes and padding are zero.
+        request_indices: Contiguous owning request id per query row.
+        complete_blocks: Contiguous fully compressed block counts shaped
+            ``[rows]``, between zero and the page-table capacity.
         page_size: Compressed-cache rows covered by one logical page.
-        block_topk: Blocks selected per row; must be a power of two and at
-            least 64.
-        queries_per_request: Uniform number of consecutive query rows per
-            request, or None for ragged/mixed layouts. A positive width must
-            divide ``rows``; the caller guarantees that each width-sized run
-            has one owning request. Logits scoring shares K tiles within these
-            runs while preserving each row's complete-block frontier.
-        max_partial_bytes: Memory budget for the partial top-k buffers
-            (``stream`` algorithm only).
-        algorithm: ``"stream"`` fuses scoring and selection without
-            materializing scores; ``"logits"`` materializes the
-            ``[rows, num_blocks]`` FP32 scores with ``qsa_block_scores`` and
-            selects them with ``qsa_block_topk_select``.
-        enable_pdl: Wait for query/cache/metadata producers and release
-            successor setup early between scoring and selection on NVIDIA GPUs.
+        block_topk: Power-of-two blocks selected per row, at least 64.
+        queries_per_request: Uniform consecutive query rows per request, or
+            ``None`` for ragged/mixed runs. A positive width must divide rows;
+            callers guarantee one owner per run. Each row keeps its frontier.
+        max_partial_bytes: Global scratch budget for streaming selection,
+            excluding the output. Grouped CuTe streaming needs no scratch.
+        max_logits_bytes: Score-matrix budget for ``auto``. Exceeding it
+            selects streaming regardless of query size.
+        path: ``"logits"`` materializes FP32 scores then radix-selects;
+            ``"stream"`` fuses scoring and selection. ``"auto"`` uses the
+            query-row count, table capacity and supported layout, independently
+            of prefill/decode. Explicit paths bypass the logits budget.
+        enable_pdl: Explicit programmatic dependent launch ordering.
+        solution: Optional registered backend, such as ``"cute_dsl"`` or
+            ``"triton"``, filtered within the selected path.
+        override: Optional registered kernel name or backend override.
 
     Returns:
-        Int32 block ids shaped ``[rows, block_topk]``, in no particular order;
-        invalid entries are ``-1``.
+        Int32 logical block ids shaped ``[rows, block_topk]``, padded with
+        ``-1``. Output order and boundary tie ids are unspecified.
     """
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        can_use_cute_dsl_qwen4_exp_qsa_block_topk,
+    )
 
-    if query.ndim != 3 or key_cache.ndim != 3:
-        raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
-    if block_topk < 64 or (block_topk & (block_topk - 1)):
-        raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    if algorithm not in ("stream", "logits"):
+    if query.ndim != 3 or key_cache.ndim != 3 or page_table.ndim != 2:
+        raise ValueError("QSA block top-k expects rank-three Q/K and a rank-two table")
+    if block_topk < 64 or block_topk & (block_topk - 1):
+        raise ValueError("QSA block top-k needs a power-of-two topk >= 64")
+    if path not in ("auto", "stream", "logits"):
         raise ValueError(
-            "Qwen4-Exp QSA block top-k algorithm must be 'stream' or 'logits', "
-            f"got {algorithm!r}"
+            f"QSA top-k path must be 'auto', 'stream' or 'logits', got {path!r}"
         )
     rows = query.shape[0]
+    if key_cache.shape[1:] != (1, query.shape[2]):
+        raise ValueError("QSA keys must have one head with the query head dimension")
+    if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
+        raise ValueError("QSA block top-k metadata must have one entry per query row")
+    if (
+        page_table.stride(1) != 1
+        or not request_indices.is_contiguous()
+        or not complete_blocks.is_contiguous()
+    ):
+        raise ValueError(
+            "QSA block top-k requires contiguous table columns and row metadata"
+        )
     if queries_per_request is not None and (
         queries_per_request < 1 or rows % queries_per_request
     ):
@@ -482,7 +528,26 @@ def qwen4_exp_qsa_block_topk(
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
         )
-    if algorithm == "logits":
+
+    supported_layout = can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+    )
+    if path == "auto":
+        # Keep shape routing independent of live device frontiers.
+        min_stream_rows = 512 if num_blocks >= 16384 else 8192
+        prefer_stream = supported_layout and rows >= min_stream_rows
+        fits_logits = rows * num_blocks * 4 <= max_logits_bytes
+        path = "stream" if prefer_stream or not fits_logits else "logits"
+
+    if path == "logits":
         scores = qsa_block_scores(
             query,
             key_cache,
@@ -492,16 +557,16 @@ def qwen4_exp_qsa_block_topk(
             page_size=page_size,
             queries_per_request=queries_per_request,
             enable_pdl=enable_pdl,
-            override=None,
-            solution=None,
+            solution=solution,
+            override=override,
         )
         return qsa_block_topk_select(
             scores,
             block_topk,
             lengths=complete_blocks,
             enable_pdl=enable_pdl,
-            override=None,
-            solution=None,
+            solution=solution,
+            override=override,
         )
     return qsa_block_topk_stream(
         query,
@@ -511,10 +576,11 @@ def qwen4_exp_qsa_block_topk(
         complete_blocks,
         page_size=page_size,
         block_topk=block_topk,
+        queries_per_request=queries_per_request,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
-        override=None,
-        solution=None,
+        solution=solution,
+        override=override,
     )
 
 
