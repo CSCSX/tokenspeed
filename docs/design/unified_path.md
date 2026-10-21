@@ -1139,8 +1139,15 @@ matrix would exceed it. Explicit paths bypass that automatic budget.
 Supported Blackwell stream layouts use CuTe DSL; other layouts and vendors
 retain portable Triton. The Blackwell CuTe specializations use four
 BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
-scoring requires explicit eight-row request runs; small query grids can score
-rows independently, including ragged queries. Grouped streams keep exact
+scoring handles up to eight rows from one request. Uniform runs resolve their
+groups arithmetically, including a masked final group. Ragged runs resolve group
+ownership from device request indices at eight-row boundaries and ownership
+changes, splitting at the next boundary. Inactive ragged CTAs skip the scoring
+pipelines. This needs neither a global group table nor a device-to-host read;
+aligned uniform runs retain their original unmasked specialization. Invalid
+query rows are zero-filled, have zero complete blocks and never write output,
+but their threads participate in the same pipeline synchronization. Small query
+grids can also score rows independently. Grouped streams keep exact
 running selections in selector registers, with double-buffered score
 candidates overlapping selection and MMA across tiles. Small grids can split
 the key range into bounded global scratch. The caller's partial-workspace

@@ -62,6 +62,7 @@ class StreamConfig:
     compact_ids: bool
     linear_bins: bool
     partition_width: int
+    group_layout: str
 
 
 def _workspace_bytes(rows: int, config: StreamConfig) -> int:
@@ -92,7 +93,7 @@ def _configuration(
     if rows <= 128:
         if grouped and capacity > 8192:
             splits = 1 << (((capacity + 4095) // 4096) - 1).bit_length()
-            config = StreamConfig("split", splits, 0, False, False, 64)
+            config = StreamConfig("split", splits, 0, False, False, 64, "aligned")
         else:
             splits = 1 << (((capacity + 63) // 64) - 1).bit_length()
             keep = 0
@@ -110,19 +111,26 @@ def _configuration(
                 keep = 8
                 compact_ids = True
             config = StreamConfig(
-                "small", splits, keep, compact_ids, linear_bins, partition_width
+                "small",
+                splits,
+                keep,
+                compact_ids,
+                linear_bins,
+                partition_width,
+                "aligned",
             )
         if _workspace_bytes(rows, config) <= max_partial_bytes:
             return config
-    if not grouped:
-        return None
+    group_layout = (
+        "aligned" if grouped else "uniform" if queries_per_request else "ragged"
+    )
     if capacity <= 2048:
         algorithm = "prefill"
     elif capacity <= 4096:
         algorithm = "dense"
     else:
         algorithm = "overlap"
-    return StreamConfig(algorithm, 1, 0, False, False, 64)
+    return StreamConfig(algorithm, 1, 0, False, False, 64, group_layout)
 
 
 def _meta(tensor: torch.Tensor, leading_dim: int) -> cute.Tensor:
@@ -141,6 +149,7 @@ def _compile(
     scratch,
     config: StreamConfig,
     enable_pdl: bool,
+    queries_per_request: int | None,
 ):
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     options = "--enable-tvm-ffi --opt-level 3"
@@ -190,15 +199,15 @@ def _compile(
         )
         return score, merge
     if config.algorithm == "split":
-        op = SplitPrefillTopK(enable_pdl, config.splits)
+        op = SplitPrefillTopK(enable_pdl, config.splits, config.group_layout)
         target = scratch[0]
     else:
         if config.algorithm == "prefill":
-            op = PrefillTopK(enable_pdl)
+            op = PrefillTopK(enable_pdl, config.group_layout)
         elif config.algorithm == "dense":
-            op = DensePrefillTopK(enable_pdl, 1)
+            op = DensePrefillTopK(enable_pdl, 1, config.group_layout)
         else:
-            op = OverlapPrefillTopK(enable_pdl)
+            op = OverlapPrefillTopK(enable_pdl, config.group_layout)
         target = selected
     score = cute.compile(
         op,
@@ -210,6 +219,7 @@ def _compile(
         _meta(target, 1),
         int(query.stride(0)),
         int(query.stride(1)),
+        int(queries_per_request or 0),
         64,
         stream,
         options=options,
@@ -256,7 +266,7 @@ def kernel(
         page_size: Compressed blocks per page; must be 64.
         block_topk: Selected blocks per row; must be 512.
         queries_per_request: Uniform consecutive query-run width, or ``None``
-            for ragged rows. Above 128 rows, runs must be divisible by eight.
+            for ragged rows. Groups stop at request boundaries and mask tails.
         max_partial_bytes: Budget for global scratch, excluding the output.
             Grouped streaming needs none; split scoring respects this budget.
         enable_pdl: Explicit programmatic dependent launch ordering.
@@ -366,6 +376,7 @@ def kernel(
             scratch,
             config,
             enable_pdl,
+            queries_per_request,
         )
         _COMPILED[key] = compiled
     target = [selected] if not scratch else scratch
@@ -378,6 +389,7 @@ def kernel(
         *target,
         int(query.stride(0)),
         int(query.stride(1)),
+        *([] if config.algorithm == "small" else [int(queries_per_request or 0)]),
     )
     if len(compiled) > 1:
         compiled[1](*scratch, complete_blocks, selected, int(capacity))
