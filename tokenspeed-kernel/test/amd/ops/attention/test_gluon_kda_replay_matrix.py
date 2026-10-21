@@ -1375,7 +1375,7 @@ def _run_comparison(args, platform, timer, root):
     started = time.monotonic()
     arch = "gfx950" if platform.is_cdna4 else "gfx1250"
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "running",
         "latency_unit": "us",
         "requested_concurrency": args.concurrency,
@@ -1419,7 +1419,7 @@ def _run_comparison(args, platform, timer, root):
         "cache": args.cache,
         "state_page_bytes": _STATE_PAGE_BYTES,
         "paired_rounds": args.paired_rounds,
-        "verify_scope": "one layer; both retain payloads; candidate includes gate projection, original excludes gate GEMM; unequal work",
+        "verify_scope": "one layer; both include gate production and retained replay payloads; excludes commit; original T1 uses capture verify, not standard fused decode",
         "candidate_gate_producer": "launcher selects inline projection or GEMM from total input rows",
         "commit_scope": "all layers; includes conv history; excludes verify",
         "lifecycle_scope": {
@@ -1634,7 +1634,7 @@ def _run_comparison(args, platform, timer, root):
                             timer,
                             case.verifies[0],
                             (lambda: original.verify(0)) if baseline_valid else None,
-                            equivalent=False,
+                            equivalent=baseline_valid,
                             **measure_options,
                         )
                     verify_measurement = verify_measurements[baseline_valid]

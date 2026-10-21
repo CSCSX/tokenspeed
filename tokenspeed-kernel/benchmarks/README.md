@@ -100,10 +100,14 @@ trial reference. Each source has its own module, revision, SHA256 and labeled
 regression count. The fixed trial revision isolates the current optimization;
 it does not replace the immutable original or accepted-parent baseline.
 
-The separate one-layer verify timing includes gate production for the candidate
-but excludes it for the original, so it has no speedup ratio. Commit timing
-includes convolution-history updates and excludes verify. Neither phase is
-subtracted from the full-lifecycle timing.
+The separate one-layer verify timing includes gate production and retained replay
+payloads on both sides. The original runs its gate GEMM and capture verify in one
+timed invocation; the candidate uses its automatic gate producer and records
+verify. Comparison schema version 3 reports this complete verify time and its
+speedup ratio. Earlier versions excluded the original gate GEMM. At T1 this is a
+capture-verify comparison; the original standard fused decode remains the
+full-lifecycle baseline. Commit timing includes convolution-history updates and
+excludes verify. Neither phase is subtracted from the full-lifecycle timing.
 
 On gfx950, an auxiliary measurement compares one-layer verify with an accepted
 parent source. Both sides use the same supplied raw gate and retain QKV; gate

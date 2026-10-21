@@ -350,6 +350,7 @@ class OriginalKda:
 
     def verify(self, layer: int):
         x = self.layers[layer]
+        torch.mm(x["f_a"], x["w_fb"].t(), out=self.raw_gates[layer])
         qkv, gate, beta = self.payloads[layer]
         self.outputs[layer] = self.verify_kernel(
             x["qkv_raw"],
@@ -397,8 +398,7 @@ class OriginalKda:
         )
 
     def replay_lifecycle(self):
-        for layer, x in enumerate(self.layers):
-            torch.mm(x["f_a"], x["w_fb"].t(), out=self.raw_gates[layer])
+        for layer in range(len(self.layers)):
             self.verify(layer)
         self.commit()
 
