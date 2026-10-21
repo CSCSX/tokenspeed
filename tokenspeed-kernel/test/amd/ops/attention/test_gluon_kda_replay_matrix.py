@@ -428,6 +428,10 @@ def test_verify_checkpoint_prefetch_preserves_page_guards(batch, lower_bound, gr
     pages = 2 * batch + 2
     live = batch - 3
     x = _window(batch, t, pages=pages, seed=8931, num_heads=_HEADS)
+    # Distinct V channels catch shifts or repeats across state panels.
+    x["qkv_raw"].view(batch, t, 3, _HEADS, K)[:, :, 2].copy_(
+        (torch.arange(K, device="cuda", dtype=torch.float32) / K).to(torch.bfloat16)
+    )
     raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
     accepted = torch.ones(batch, device="cuda", dtype=torch.int32)
     reference = _reference(
