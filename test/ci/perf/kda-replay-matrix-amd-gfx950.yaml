@@ -50,5 +50,157 @@ perf:
         --output ".ci-artifacts/published/kda-replay-matrix-$page_relation.json"
     done
 
+    # Discover profiling tools only after both timing matrices complete.
+    # This optional block cannot change benchmark results or their exit status.
+    (
+      rocprof_output=.ci-artifacts/published/rocprof-capabilities
+      mkdir -p "$rocprof_output"
+      if python3 - "$rocprof_output" <<'ROCPROF_PY'
+    """Record installed ROCm profiling capabilities without collecting performance data."""
+
+    import argparse
+    import json
+    import os
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import torch
+
+
+    def read_output(log: Path, option: str) -> dict:
+        """Return bounded raw excerpts without interpreting counter support."""
+        output = log.read_text(errors="replace")
+        limit = 2000 if option == "--list-avail" else 24000
+        summary = {
+            "output_chars": len(output),
+            "raw_output_excerpt": output[:limit],
+            "output_truncated": len(output) > limit,
+        }
+        if option == "--list-avail":
+            names = (
+                "FetchSize", "WriteSize", "MemUnitStalled", "VALUUtilization",
+                "VALUBusy", "LDSBankConflict", "MeanOccupancyPerCU", "SQ_WAIT_ANY",
+                "SQ_WAVE_CYCLES", "SQ_WAVES", "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR",
+                "SQ_INSTS_LDS", "SQ_WAIT_INST_LDS", "SQ_WAIT_INST_VMEM",
+                "MemUnitBusy", "WriteUnitStalled",
+            )
+            contexts = {}
+            for name in names:
+                match = re.search(rf"\b{re.escape(name)}\b", output)
+                contexts[name] = {
+                    "matched_text": match is not None,
+                    "match_offset": None if match is None else match.start(),
+                    "raw_excerpt": None if match is None else output[
+                        max(0, match.start() - 200):match.start() + 800
+                    ],
+                }
+            summary["named_metric_contexts"] = contexts
+            summary["excerpt_scope"] = (
+                "Observed text matches only; not counter availability, complete "
+                "descriptions, or hardware behavior. Full output remains in the log file."
+            )
+        return summary
+
+
+    def discover(
+        output_dir: Path, executable_candidates: list[str | None]
+    ) -> dict:
+        """Save tool output and return capability inventory and probe outcomes."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report = {
+            "status": "unavailable",
+            "torch_version": str(torch.__version__),
+            "hip_version": torch.version.hip,
+            "gpu_architecture": None,
+            "gpu_query_error": None,
+            "executable": None,
+            "commands": [],
+            "reasons": [],
+            "libraries": {
+                name: (Path("/opt/rocm/lib") / name).is_file()
+                for name in ("librocprofiler-sdk.so", "librocprofiler-sdk-roctx.so")
+            },
+            "scope": "capability inventory only; no counter collection or timing",
+        }
+        try:
+            if torch.cuda.is_available():
+                report["gpu_architecture"] = torch.cuda.get_device_properties(0).gcnArchName
+        except (AttributeError, RuntimeError) as error:
+            report["gpu_query_error"] = str(error)
+
+        executable = next(
+            (
+                name
+                for name in executable_candidates
+                if name is not None and Path(name).is_file() and os.access(name, os.X_OK)
+            ),
+            None,
+        )
+        report["executable"] = executable
+        if executable is not None:
+            for option in ("--version", "--help", "--list-avail"):
+                log = output_dir / f"{option[2:]}.txt"
+                command = {
+                    "arguments": [executable, option],
+                    "returncode": None,
+                    "timed_out": False,
+                    "error": None,
+                    "log": log.name,
+                }
+                with log.open("w") as output:
+                    try:
+                        result = subprocess.run(
+                            [executable, option],
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                            timeout=60,
+                            check=False,
+                        )
+                        command["returncode"] = result.returncode
+                    except subprocess.TimeoutExpired:
+                        command["timed_out"] = True
+                    except OSError as error:
+                        command["error"] = str(error)
+                command.update(read_output(log, option))
+                report["commands"].append(command)
+                if command["timed_out"]:
+                    report["reasons"].append(f"{option}: timed_out")
+                elif command["error"] is not None:
+                    report["reasons"].append(f"{option}: {command['error']}")
+                elif command["returncode"] != 0:
+                    report["reasons"].append(f"{option}: exit {command['returncode']}")
+            report["status"] = (
+                "inventory_complete"
+                if all(command["returncode"] == 0 for command in report["commands"])
+                else "inventory_incomplete"
+            )
+        else:
+            report["reasons"].append("rocprofv3_not_found")
+        (output_dir / "inventory.json").write_text(json.dumps(report, indent=2) + "\n")
+        return report
+
+
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("output_dir", type=Path)
+        args = parser.parse_args()
+        candidates = [
+            shutil.which("rocprofv3"),
+            "/opt/rocm/bin/rocprofv3",
+            "/opt/rocm/rocprofiler-sdk/bin/rocprofv3",
+        ]
+        print(json.dumps(discover(args.output_dir, candidates)))
+    ROCPROF_PY
+      then
+        :
+      else
+        rocprof_status=$?
+        printf '{"status":"error","reasons":["probe_process_failed"],"returncode":%s}\n' \
+          "$rocprof_status" > "$rocprof_output/inventory.json"
+      fi
+    ) || true
+
 report:
   github_step_summary: true
