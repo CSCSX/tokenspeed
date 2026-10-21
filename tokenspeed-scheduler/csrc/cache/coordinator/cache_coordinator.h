@@ -377,6 +377,7 @@ public:
         std::size_t allocated{0};
         std::size_t unallocated{0};
         std::size_t same_group_scans{0};
+        std::size_t same_group_candidates{0};
         std::size_t cross_group_scans{0};
     };
     struct HostAllocationBatch {

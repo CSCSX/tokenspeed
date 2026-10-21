@@ -1124,51 +1124,73 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             continue;
         }
         ++batch.stats.same_group_scans;
+        const GroupAllocator& allocator = groups_[group_id].Allocator();
+        if (!GroupIsState(group_id)) {
+            std::vector<std::size_t> needed(allocator.ShardCount(), 0);
+            std::vector<std::vector<CacheBlockLocation>> victims(allocator.ShardCount());
+            for (const std::size_t index : unresolved) {
+                ++needed[buckets[index]];
+            }
+            std::size_t remaining = unresolved.size();
+            {
+                // Finish the read-only traversal before evicting from its index.
+                PrefixCacheIndex::EvictionCursor cursor;
+                std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
+                while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(*host_pool_, cursor, epoch)) {
+                    batch.stats.same_group_candidates += epoch.size();
+                    for (const auto& candidate : epoch) {
+                        const std::int32_t bucket = allocator.BucketOf(candidate.location);
+                        if (needed[bucket] > 0) {
+                            victims[bucket].push_back(candidate.location);
+                            --needed[bucket];
+                            --remaining;
+                        }
+                    }
+                    epoch.clear();
+                }
+            }
+            std::vector<std::size_t> next_victim(allocator.ShardCount(), 0);
+            std::erase_if(unresolved, [&](std::size_t index) {
+                const std::int32_t bucket = buckets[index];
+                if (next_victim[bucket] == victims[bucket].size()) {
+                    return false;
+                }
+                const CacheBlockLocation location = victims[bucket][next_victim[bucket]++];
+                _assert(evictHostCachedBlock(group_id, location, false), "selected Host child is not evictable");
+                batch.blocks[index] = acquire_in_bucket(group_id, bucket);
+                _assert(static_cast<bool>(batch.blocks[index]), "evicting a Host child did not free its bucket");
+                return true;
+            });
+            continue;
+        }
         // Checkpoint priority may change when another victim removes one of
         // its descendants. Reevaluate State candidates for each allocation.
         std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
             groups_[group_id].Index().EvictableCandidates(*host_pool_);
-        std::ranges::sort(local_victims, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
-            return value(group_id, candidate.location, candidate.metadata);
-        });
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
+        batch.stats.same_group_candidates += local_victims.size();
         std::vector<bool> consumed(local_victims.size(), false);
         std::erase_if(unresolved, [&](std::size_t index) {
             const std::int32_t bucket = buckets[index];
-            if (GroupIsState(group_id)) {
-                std::optional<std::size_t> selected;
-                for (std::size_t v = 0; v < local_victims.size(); ++v) {
-                    if (!consumed[v] && allocator.BucketOf(local_victims[v].location) == bucket &&
-                        (!selected ||
-                         value(group_id, local_victims[v].location, local_victims[v].metadata) <
-                             value(group_id, local_victims[*selected].location, local_victims[*selected].metadata))) {
-                        selected = v;
-                    }
-                }
-                if (!selected) {
-                    return false;
-                }
-                consumed[*selected] = true;
-                const bool complete = checkpointComplete(*host_pool_, local_victims[*selected].metadata.content_hash);
-                _assert(evictHostCachedBlock(group_id, local_victims[*selected].location,
-                                             demoted.contains(local_victims[*selected].metadata.content_hash)),
-                        "Host victim changed");
-                if (complete) refresh_demotions();
-                batch.blocks[index] = acquire_in_bucket(group_id, bucket);
-                return static_cast<bool>(batch.blocks[index]);
-            }
+            std::optional<std::size_t> selected;
             for (std::size_t v = 0; v < local_victims.size(); ++v) {
-                if (consumed[v] || allocator.BucketOf(local_victims[v].location) != bucket) {
-                    continue;
+                if (!consumed[v] && allocator.BucketOf(local_victims[v].location) == bucket &&
+                    (!selected ||
+                     value(group_id, local_victims[v].location, local_victims[v].metadata) <
+                         value(group_id, local_victims[*selected].location, local_victims[*selected].metadata))) {
+                    selected = v;
                 }
-                consumed[v] = true;
-                _assert(evictHostCachedBlock(group_id, local_victims[v].location, false),
-                        "selected Host child is not evictable");
-                batch.blocks[index] = acquire_in_bucket(group_id, bucket);
-                _assert(static_cast<bool>(batch.blocks[index]), "evicting a Host child did not free its bucket");
-                return true;
             }
-            return false;
+            if (!selected) {
+                return false;
+            }
+            consumed[*selected] = true;
+            const bool complete = checkpointComplete(*host_pool_, local_victims[*selected].metadata.content_hash);
+            _assert(evictHostCachedBlock(group_id, local_victims[*selected].location,
+                                         demoted.contains(local_victims[*selected].metadata.content_hash)),
+                    "Host victim changed");
+            if (complete) refresh_demotions();
+            batch.blocks[index] = acquire_in_bucket(group_id, bucket);
+            return static_cast<bool>(batch.blocks[index]);
         });
     }
     const bool has_unresolved = std::ranges::any_of(

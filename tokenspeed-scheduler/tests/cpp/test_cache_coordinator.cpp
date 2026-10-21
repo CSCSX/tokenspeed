@@ -2627,6 +2627,79 @@ TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
     EXPECT_EQ(batch.stats.cross_group_scans, 0u);
 }
 
+TEST(CacheCoordinatorHostReplacement, HistoryReplacementStopsAfterTheNeededEpochs) {
+    BlockPool device_pool(256, {1});
+    BlockPool host_pool(256, {1});
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    for (std::int32_t i = 0; i < 256; ++i) {
+        HostPut(coordinator, host_pool, "old-" + std::to_string(i), 0);
+    }
+    const std::array<std::uint32_t, 1> groups{0};
+    const std::array<std::int32_t, 1> buckets{0};
+    auto first = coordinator.AcquireHostBlocks(groups, buckets);
+    ASSERT_TRUE(first.blocks[0]);
+    EXPECT_EQ(first.stats.same_group_candidates, 1u);
+    EXPECT_EQ(first.stats.cross_group_scans, 0u);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
+
+    auto second = coordinator.AcquireHostBlocks(groups, buckets);
+    ASSERT_TRUE(second.blocks[0]);
+    EXPECT_EQ(second.stats.same_group_candidates, 1u);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-2", 0)));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 254);
+}
+
+TEST(CacheCoordinatorHostReplacement, HistoryReplacementPreservesBucketRecencyTiesAndPins) {
+    BlockPool device_pool(2, {4});
+    BlockPool host_pool(2, {4});
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 4,
+        .block_granularity = 2,
+        .shard_count = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    const std::array<std::uint64_t, 8> epochs{40, 10, 10, 10, 5, 20, 10, 30};
+    std::vector<CacheBlockLocation> locations;
+    CacheBlockRef pinned;
+    for (std::int32_t i = 0; i < 8; ++i) {
+        auto refs = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{i % 2});
+        ASSERT_EQ(refs.size(), 1u);
+        locations.push_back(refs.front()->Location());
+        coordinator.GroupPrefixIndex(0).Register(host_pool, refs.front(), Key("old-" + std::to_string(i), 0), epochs[i],
+                                                 /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                 /*newly_cached=*/nullptr);
+        if (i == 4) pinned = refs.front();
+    }
+    const std::array<std::uint32_t, 3> groups{0, 0, 0};
+    const std::array<std::int32_t, 3> buckets{1, 0, 1};
+    auto batch = coordinator.AcquireHostBlocks(groups, buckets);
+    const std::array<std::int32_t, 3> victim_indices{1, 2, 3};
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        ASSERT_TRUE(batch.blocks[i]);
+        EXPECT_EQ(batch.blocks[i]->Location(), locations[victim_indices[i]]);
+        EXPECT_EQ(coordinator.Allocator(0).BucketOf(batch.blocks[i]->Location()), buckets[i]);
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-" + std::to_string(victim_indices[i]), 0)));
+    }
+    for (const std::int32_t i : {0, 4, 5, 6, 7}) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-" + std::to_string(i), 0)));
+    }
+    EXPECT_EQ(batch.stats.same_group_candidates, 4u);
+    EXPECT_EQ(batch.stats.cross_group_scans, 0u);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 5);
+}
+
 TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) {
     BlockPool device_pool(2, {1});
     BlockPool host_pool(2, {1});

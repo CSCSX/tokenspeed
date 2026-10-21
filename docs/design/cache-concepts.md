@@ -1013,6 +1013,12 @@ erased, or re-keyed during traversal. Commit-time index mutations happen after
 the planner is destroyed. A full traversal costs O(N), including pinned entries,
 without a separate tree lookup per epoch.
 
+Host history replacement uses the same ordered cursor to collect enough
+unpinned victims for each requested owner bucket, stopping after the last
+needed epoch. Collection finishes before eviction mutates the index. Recency
+and location tie-breaks, State-checkpoint priorities, and whole-parent
+cross-group fallback are preserved.
+
 ## The cache pipeline: layers → group → pack → bind
 
 Every model family's cache is built by the same four-stage pipeline, and the
