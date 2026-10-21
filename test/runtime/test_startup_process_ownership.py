@@ -116,7 +116,10 @@ def _engine_startup_failure(signum, writer):
 def _notify_failure(start, notified, signum, writer):
     parent_pid = os.getppid()
     writer.send({"status": "ready"})
-    assert start.wait(_TIMEOUT_S)
+    # The owner triggers a worker only after every worker reported ready, and
+    # each ready read may consume a full _TIMEOUT_S on a busy runner. Budget
+    # the trigger wait so a sibling's slow readiness cannot expire it.
+    assert start.wait(_TIMEOUT_S * 2)
     for sig in (signum, signal.SIGUSR1, signal.SIGQUIT):
         os.kill(parent_pid, sig)
     notified.set()
