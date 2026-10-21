@@ -8,6 +8,14 @@ heads, BF16/FP16/FP32 K-last initial states, and 1–16 tokens. Chains and trees
 share the same WY computation; the facade's existing tree workspace contract
 restricts its output-only trees to 8–16 nodes.
 
+The model's GDN ReplaySSM verify prefers this leaf for supported NVIDIA
+geometry, for both BF16 and FP32 state. `gdn_replay_verify_solution` probes the
+registration's platform, dtype and size constraints; unsupported cases keep
+the existing selection, including the BF16 padding-safe Triton path. Verify
+calls that need node states, ordinary decode, and staged state-writing verify
+retain their existing policy. Cache-pool binding uses the same choice when
+checking whether verify can read packed projection views.
+
 The leaf reads the committed state once per value tile, forms the small WY
 output transform and computes every token's output without writing the state
 pool or materializing node states. An optional payload receives exact raw
@@ -53,9 +61,8 @@ Release validation on SM103 covers 64 chain/tree, BF16/FP32,
 warm/cold-cache and PDL configurations, with B=1–64, T=4/8/16 and H/HV=8/24,
 16/32 or 8/32. Blackwell 13–16-token chains already use chunked verification,
 so comparisons include that path in addition to the serial Triton leaf.
-Tree selection continues
-to use Triton unless CuTe DSL is explicitly requested; FlashInfer retains
-its higher priority for chains.
+The kernel facade keeps its existing default selection; the model's
+ReplaySSM verify supplies the preferred solution explicitly.
 
 ## FlashInfer PDL adapters
 

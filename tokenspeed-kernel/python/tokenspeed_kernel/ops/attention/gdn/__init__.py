@@ -603,6 +603,19 @@ def gdn_decode_mtp(
         solution=solution,
         override=override,
     )
+    ShapeCapture.get().record(
+        "attention",
+        "gdn_decode_mtp",
+        kernel.name,
+        q.dtype,
+        {
+            "batch_size": q.shape[0],
+            "seq_len": q.shape[1],
+            "num_v_heads": v.shape[-2],
+            "head_dim": head_dim,
+            "head_v_dim": v.shape[-1],
+        },
+    )
     with kernel_scope(
         "attention",
         "gdn_decode_mtp",
@@ -686,6 +699,49 @@ def validate_replay_commit_setup(
         raise ValueError(
             "replay parameters must be contiguous FP32 on the payload device"
         )
+
+
+def gdn_replay_verify_solution(
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    value_head_dim: int,
+    num_tokens: int,
+) -> str | None:
+    """Preferred solution for an output-only ReplaySSM verification.
+
+    Args:
+        dtype: Query, key and value dtype.
+        head_dim: Key head dimension.
+        value_head_dim: Value head dimension.
+        num_tokens: Number of chain tokens or output-only tree nodes.
+
+    Returns:
+        ``"cute_dsl"`` when its registered WY leaf supports this platform,
+        dtype and geometry. Otherwise ``None`` leaves the caller's existing
+        solution policy in effect, including BF16 padding protection. Call
+        only when no intermediate or destination states need to be written.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "gdn_decode_mtp",
+            signature,
+            platform=current_platform(),
+            traits={
+                "head_dim": head_dim,
+                "value_head_dim": value_head_dim,
+                "verify_tokens": num_tokens,
+                "output_only": True,
+                "separate_output_state": False,
+            },
+            solution="cute_dsl",
+        )
+    except NoKernelFoundError:
+        return None
+    return "cute_dsl"
 
 
 def gdn_decode_supports(
@@ -929,6 +985,7 @@ __all__ = [
     "gdn_decode_step",
     "gdn_decode_mtp",
     "gdn_decode_supports",
+    "gdn_replay_verify_solution",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "gdn_tree_verify_needs_node_states",

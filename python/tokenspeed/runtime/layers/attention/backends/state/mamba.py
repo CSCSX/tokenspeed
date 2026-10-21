@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_replay_commit,
+    gdn_replay_verify_solution,
     gdn_tree_verify_needs_node_states,
     validate_replay_commit_setup,
 )
@@ -2062,6 +2063,16 @@ class MambaAttnBackend(AttentionBackend):
             initial_indices,
             output_state_indices,
         )
+        if self.replay_ssm and intermediate_states is None:
+            mtp_solution = (
+                gdn_replay_verify_solution(
+                    query_b.dtype,
+                    head_dim=head_k_dim,
+                    value_head_dim=head_v_dim,
+                    num_tokens=draft_token_num,
+                )
+                or mtp_solution
+            )
         return gdn_decode_mtp(
             query_b,
             key_b,

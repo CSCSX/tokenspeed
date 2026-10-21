@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill_capturable,
     gdn_decode_supports,
+    gdn_replay_verify_solution,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
@@ -73,6 +75,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
         )
 
         self._head_k_dim = linear_attn.head_k_dim
+        self._head_v_dim = linear_attn.head_v_dim
         # Resolved when a pool binds (its state dtype picks the verify kernel).
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
@@ -87,8 +90,22 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
         solution = gdn_decode_solution(ssm_dtype)
+        verify_solution = solution
+        if self.replay_ssm and (
+            not self.draft_tree
+            or not gdn_tree_verify_needs_node_states(self.speculative_num_draft_tokens)
+        ):
+            verify_solution = (
+                gdn_replay_verify_solution(
+                    self.dtype,
+                    head_dim=self._head_k_dim,
+                    value_head_dim=self._head_v_dim,
+                    num_tokens=self.speculative_num_draft_tokens,
+                )
+                or solution
+            )
 
-        def supports(op: str, trait: str) -> bool:
+        def supports(op: str, trait: str, *, solution: str | None) -> bool:
             return gdn_decode_supports(
                 op,
                 self.dtype,
@@ -98,10 +115,14 @@ class GdnAttnBackend(CapacityPrefillBackend):
             )
 
         self._verify_reads_committed_recurrent_state = not self.replay_ssm and supports(
-            "gdn_decode_mtp", "separate_output_state"
+            "gdn_decode_mtp", "separate_output_state", solution=solution
         )
-        self._verify_packed_qkv_views = supports("gdn_decode_mtp", "strided_qkv")
-        self._decode_packed_qkv_views = supports("gdn_decode_step", "strided_qkv")
+        self._verify_packed_qkv_views = supports(
+            "gdn_decode_mtp", "strided_qkv", solution=verify_solution
+        )
+        self._decode_packed_qkv_views = supports(
+            "gdn_decode_step", "strided_qkv", solution=solution
+        )
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_capturable

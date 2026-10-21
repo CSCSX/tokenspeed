@@ -552,6 +552,44 @@ def test_wy_empty_batch():
 
 
 @pytest.mark.parametrize(
+    "dtype,head_dim,value_head_dim,tokens,expected",
+    [
+        (torch.bfloat16, 128, 128, 1, "cute_dsl"),
+        (torch.float16, 128, 128, 4, "cute_dsl"),
+        (torch.bfloat16, 128, 128, 16, "cute_dsl"),
+        (torch.bfloat16, 128, 128, 17, None),
+        (torch.bfloat16, 64, 128, 4, None),
+        (torch.bfloat16, 128, 64, 4, None),
+        (torch.float32, 128, 128, 4, None),
+    ],
+)
+def test_wy_replay_verify_policy(dtype, head_dim, value_head_dim, tokens, expected):
+    from tokenspeed_kernel.ops.attention.gdn import gdn_replay_verify_solution
+
+    assert (
+        gdn_replay_verify_solution(
+            dtype,
+            head_dim=head_dim,
+            value_head_dim=value_head_dim,
+            num_tokens=tokens,
+        )
+        == expected
+    )
+
+
+def test_wy_replay_verify_policy_on_other_vendor(monkeypatch, mi350_platform):
+    from tokenspeed_kernel.ops.attention import gdn
+
+    monkeypatch.setattr(gdn, "current_platform", lambda: mi350_platform)
+    assert (
+        gdn.gdn_replay_verify_solution(
+            torch.bfloat16, head_dim=128, value_head_dim=128, num_tokens=4
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
     "tokens,state_writes", [(8, "none"), (17, "none"), (8, "per_token")]
 )
 def test_wy_benchmark_preparation(tokens, state_writes):
