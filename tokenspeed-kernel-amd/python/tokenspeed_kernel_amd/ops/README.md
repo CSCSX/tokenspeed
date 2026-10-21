@@ -1190,6 +1190,9 @@ tests remain responsible for numerical correctness and performance.
 An optional ROCm recovery counter smoke runs after both timing matrices.
 Its graph-dispatch attribution requires review; instrumented times do not
 determine performance acceptance.
+A separate Torch import probe records loaded profiler libraries and GPU arithmetic
+completion. Its loader log helps diagnose SDK initialization failures. These
+diagnostics do not change the timed workloads or installed libraries.
 
 ## Transform
 

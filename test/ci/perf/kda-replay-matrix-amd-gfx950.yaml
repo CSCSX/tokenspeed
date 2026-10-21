@@ -348,6 +348,7 @@ perf:
     import signal
     import subprocess
     import sys
+    import textwrap
     from collections import Counter, deque
     from pathlib import Path
 
@@ -442,6 +443,100 @@ perf:
         }
 
 
+    def collect_initialization(arguments: list[str], output_dir: Path, help_text: str) -> dict:
+        """Inspect profiler loading around a minimal Torch import and GPU operation."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        workload = output_dir / "torch-import.py"
+        workload.write_text(textwrap.dedent("""
+            import ctypes
+            import json
+            import os
+            from pathlib import Path
+
+            def snapshot(stage):
+                libraries = set()
+                for line in Path("/proc/self/maps").read_text().splitlines():
+                    fields = line.split(maxsplit=5)
+                    if len(fields) == 6 and any(
+                        name in Path(fields[5]).name
+                        for name in ("rocprofiler", "roctracer", "amdhip64")
+                    ):
+                        libraries.add(str(Path(fields[5]).resolve()))
+                state = ctypes.c_int(-1)
+                try:
+                    query = ctypes.CDLL(None).rocprofiler_is_initialized
+                    query.argtypes = [ctypes.POINTER(ctypes.c_int)]
+                    query.restype = ctypes.c_int
+                    sdk = {"returncode": query(ctypes.byref(state)), "initialized": state.value}
+                except (AttributeError, OSError) as error:
+                    sdk = {"unavailable": str(error)}
+                print("ROCPROF_IMPORT_STAGE=" + json.dumps({
+                    "stage": stage, "pid": os.getpid(), "libraries": sorted(libraries),
+                    "global_sdk": sdk,
+                    "constructor_flag": os.environ.get("ROCPROFILER_LIBRARY_CTOR"),
+                }), flush=True)
+
+            snapshot("before_torch")
+            import torch
+            snapshot("after_torch")
+            values = torch.arange(8, dtype=torch.float32, device="cuda")
+            result = (values * 2 + 1).sum().item()
+            torch.cuda.synchronize()
+            if result != 64:
+                raise RuntimeError(f"Torch GPU arithmetic returned {result}, expected 64")
+            snapshot("gpu_complete")
+        """).lstrip())
+        profiler_arguments = arguments[:arguments.index("--")]
+        profiler_arguments[profiler_arguments.index("-d") + 1] = str(output_dir)
+        profiler_arguments[profiler_arguments.index("-o") + 1] = "torch-import"
+        if re.search(r"--log-level[^\n]*\binfo\b", help_text):
+            profiler_arguments.extend(["--log-level", "info"])
+        profiler_arguments.extend(["--", sys.executable, str(workload)])
+        # Loader logging is scoped to this optional child after all timings.
+        command = [
+            "/usr/bin/env", "LD_DEBUG=libs",
+            f"LD_DEBUG_OUTPUT={output_dir.resolve() / 'loader'}",
+            *profiler_arguments,
+        ]
+        log = output_dir / "profiler.txt"
+        outcome = run_command(command, log, 120)
+        output = log.read_text(errors="replace")
+        stages = [
+            json.loads(line.split("=", 1)[1])
+            for line in output.splitlines() if line.startswith("ROCPROF_IMPORT_STAGE=")
+        ]
+        initializers = []
+        initializer_count = 0
+        loader_files = []
+        for path in sorted(output_dir.glob("loader.*")):
+            loader_files.append({"file": path.name, "bytes": path.stat().st_size})
+            for line in path.read_text(errors="replace").splitlines():
+                if "calling init:" in line and any(
+                    name in line for name in ("rocprofiler", "roctracer", "amdhip64")
+                ):
+                    initializer_count += 1
+                    if len(initializers) < 64:
+                        initializers.append({"file": path.name, "line": line.strip()})
+        complete = any(stage["stage"] == "gpu_complete" for stage in stages)
+        return {
+            "status": "gpu_complete" if outcome["returncode"] == 0 and not outcome["timed_out"] and complete else "incomplete",
+            "command": outcome, "stages": stages,
+            "loader_files": loader_files, "library_initializers": initializers,
+            "initializer_count": initializer_count,
+            "initializers_truncated": initializer_count > len(initializers),
+            "log": {
+                "file": log.name, "chars": len(output), "head": output[:3000],
+                "tail": output[-3000:] if len(output) > 3000 else "",
+                "truncated": len(output) > 6000,
+            },
+            "scope": (
+                "Initialization evidence only; calling init records entry, not completion. "
+                "Search attempts are excluded. No SDK, constructor policy, or timed workload "
+                "is changed. Tiny Torch kernels do not match the KDA counter filter."
+            ),
+        }
+
+
     def collect_smoke(inventory_dir: Path, output_dir: Path, workload: Path) -> dict:
         output_dir.mkdir(parents=True, exist_ok=True)
         report = {
@@ -499,6 +594,14 @@ perf:
                     report["csv"].append({"file": str(path.relative_to(output_dir)), "error": str(error)})
             if not report["csv"]:
                 report["reasons"].append("no_CSV_output")
+            try:
+                report["initialization_diagnostic"] = collect_initialization(
+                    arguments, output_dir / "torch-import", help_text
+                )
+            except Exception as error:
+                report["initialization_diagnostic"] = {
+                    "status": "error", "error": f"{type(error).__name__}: {error}"
+                }
         report["files"] = [str(p.relative_to(output_dir)) for p in sorted(output_dir.rglob("*")) if p.is_file()]
         return report
 
