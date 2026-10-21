@@ -83,10 +83,16 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     lines = assembly.splitlines()
     cycles = _polling_cycles(assembly)
     assert cycles, "polling loop was removed"
-    assert any(
-        sum("buffer_load_dwordx4" in line and "sc0 sc1" in line for line in cycle) == 7
+    polls = [
+        cycle
         for cycle in cycles
-    ), "all seven system-cache reads must execute again on a retry"
+        if sum("buffer_load_dwordx4" in line and "sc0 sc1" in line for line in cycle)
+        == 7
+    ]
+    assert polls, "all seven system-cache reads must execute again on a retry"
+    assert all(
+        _votes_with_subgroup_mask(cycle) for cycle in polls
+    ), "a retry must branch on one subgroup lane mask, not a lane reduction"
     assert (
         sum("buffer_store_dwordx4" in line and "sc0 sc1" in line for line in lines)
         == 14
@@ -108,6 +114,19 @@ def _polling_cycles(assembly):
         if match and labels[match[1]] < index:
             cycles.append(lines[labels[match[1]] : index + 1])
     return cycles
+
+
+def _votes_with_subgroup_mask(cycle):
+    """Return whether a polling cycle exits on one v_cmp lane mask.
+
+    A cross-lane reduction (DPP steps and a lane read) or a workgroup
+    exchange (LDS and s_barrier) on every retry would delay noticing data.
+    """
+    text = "\n".join(cycle)
+    return (
+        len(re.findall(r"v_cmp_ne_u32_e64 s\[\d+:\d+\], 0, v\d+", text)) == 1
+        and re.search(r"_dpp|v_readlane|v_readfirstlane|s_barrier|\bds_", text) is None
+    )
 
 
 def test_lamport_two_shot_polling_codegen(tmp_path):
@@ -157,18 +176,26 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
     assembly = kernel.asm["amdgcn"]
     (tmp_path / "two-shot.amdgcn").write_text(assembly)
     # Group system-scope peer loads by the loop that LLVM reports for them.
-    loads = {}
+    loops = {}
     header = None
     for line in assembly.splitlines():
         if match := re.match(r"^\.L(BB\w+):", line):
             loop = re.search(r"Header=(BB\w+)|(=>This Inner Loop Header)", line)
             header = (loop[1] or match[1]) if loop else None
-        elif header and "buffer_load_dword " in line and "sc0 sc1" in line:
-            loads[header] = loads.get(header, 0) + 1
-    assert sorted(loads.values()) == [
-        7,
-        7,
-    ], "each exchange must poll all seven peers per retry"
+        elif header:
+            loops.setdefault(header, []).append(line)
+    polls = [
+        body
+        for body in loops.values()
+        if any("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
+    ]
+    assert sorted(
+        sum("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
+        for body in polls
+    ) == [7, 7], "each exchange must poll all seven peers per retry"
+    assert all(
+        _votes_with_subgroup_mask(body) for body in polls
+    ), "each exchange must branch on one subgroup lane mask per retry"
     # Readiness watches only the odd half of each BF16 pair, so every mailbox
     # push and reset must store the whole pair in one dword.
     stores = re.findall(r"^\s*(buffer_store_\w+)[^\n]*\bsc0 sc1\b", assembly, re.M)
