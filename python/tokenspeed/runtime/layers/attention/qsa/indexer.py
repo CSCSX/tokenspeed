@@ -49,6 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
+    QSASelection,
     decode_query_lengths,
     qsa_forward_layout,
 )
@@ -326,7 +327,7 @@ class QSAIndexer(nn.Module):
         # the budget routing falls back to zero-materialization streaming.
         return "logits" if rows * num_blocks * 4 <= budget_mb << 20 else "stream"
 
-    def _select_slots(
+    def _select(
         self,
         q: torch.Tensor,
         logical_positions: torch.Tensor,
@@ -338,12 +339,16 @@ class QSAIndexer(nn.Module):
         full_page_size: int,
         complete_blocks: torch.Tensor,
         queries_per_request: int | None,
-    ) -> torch.Tensor:
-        """Select logical QSA blocks and emit physical full-cache slots."""
+    ) -> QSASelection:
+        """Keep logical QSA blocks alongside their physical full-cache slots."""
 
         output_width = self.token_topk + self.compress_ratio - 1
         if q.shape[0] == 0:
-            return torch.empty((0, output_width), dtype=torch.int32, device=q.device)
+            return QSASelection(
+                torch.empty((0, output_width), dtype=torch.int32, device=q.device),
+                torch.empty((0, self.block_topk), dtype=torch.int32, device=q.device),
+                self.compress_ratio,
+            )
         page_size = compressed.shape[1]
         cache = compressed.view(-1, 1, self.index_head_dim)
         enable_pdl = pdl_enabled()
@@ -362,7 +367,7 @@ class QSAIndexer(nn.Module):
             algorithm=self._topk_algorithm(q.shape[0], qsa_page_table, page_size),
             enable_pdl=enable_pdl,
         )
-        return qwen4_exp_qsa_selected_slots(
+        selected_slots = qwen4_exp_qsa_selected_slots(
             selected_blocks,
             complete_blocks,
             logical_positions,
@@ -373,6 +378,7 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             enable_pdl=enable_pdl,
         )
+        return QSASelection(selected_slots, selected_blocks, self.compress_ratio)
 
     @break_point
     def forward(
@@ -493,7 +499,7 @@ class QSAIndexer(nn.Module):
             return shared_topk[: hidden_states.shape[0]]
         if q is None:
             raise RuntimeError("QSA fused query preparation did not return queries")
-        selected_slots = self._select_slots(
+        selection = self._select(
             q,
             logical,
             requests,
@@ -508,6 +514,8 @@ class QSAIndexer(nn.Module):
                 else decode_query_lengths(ctx, q.shape[0], force_uniform=False)
             ),
         )
+        ctx.attn_backend.sparse_topk.qsa_selection = selection
+        selected_slots = selection.selected_slots
         if self.share_topk_for_mtp_iteration:
             ctx.attn_backend.sparse_topk.decode = selected_slots
         return selected_slots
