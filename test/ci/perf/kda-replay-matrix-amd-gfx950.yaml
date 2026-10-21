@@ -45,9 +45,10 @@ perf:
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_verify_checkpoint_prefetch_preserves_page_guards \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_verify_retains_original_qkv \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_inline_gate_matches_supplied_gate \
-      tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_one_token_recovery_preserves_decay
+      tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_one_token_recovery_preserves_decay \
+      tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_reuse_consumes_committed_state
     for page_relation in distinct in-place; do
-      python3 tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
+      python3 tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py compare \
         --concurrency 1 2 4 8 16 32 64 128 \
         --window-lengths 1 4 \
         --layers 69 \
@@ -66,7 +67,23 @@ perf:
         --output ".ci-artifacts/published/kda-replay-matrix-$page_relation.json"
     done
 
-    # Discover profiling tools only after both timing matrices complete.
+    # Preserve both original timing matrices before the state-reuse diagnostic.
+    for page_relation in distinct in-place; do
+      python3 tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py reuse \
+        --concurrency 1 2 4 8 16 32 64 128 \
+        --window-lengths 1 4 \
+        --layers 69 \
+        --page-relation "$page_relation" \
+        --cache cold \
+        --measurement-blocks 30 \
+        --paired-rounds 3 \
+        --trial-reference-source "$trial_reference_source" \
+        --trial-reference-records-source "$trial_reference_records_source" \
+        --trial-reference-revision "$trial_reference_revision" \
+        --output ".ci-artifacts/published/kda-replay-reuse-$page_relation.json"
+    done
+
+    # Discover profiling tools only after all timing matrices complete.
     # This optional block cannot change benchmark results or their exit status.
     (
       rocprof_output=.ci-artifacts/published/rocprof-capabilities

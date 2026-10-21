@@ -341,6 +341,189 @@ class ReplayCase:
             )
 
 
+class ReuseCase:
+    """Two kernel lifecycles sharing state, with explicit per-step metadata."""
+
+    def __init__(self, case: ReplayCase, *, lower_bound: float | None):
+        self.case = case
+        self.lower_bound = lower_bound
+        self.accepted = (case.accepted, case.accepted.roll(1))
+        self.reads = (case.reads, case.writes.clone())
+        self.writes = (case.writes, case.reads.clone())
+        self.layers = (case.layers, [])
+        for layer, x in enumerate(case.layers):
+            second = dict(x)
+            # Keep model weights; use different, deterministic step-2 inputs.
+            for name in ("qkv_raw", "f_a", "beta"):
+                second[name] = x[name].roll(1, dims=0).neg()
+            second["read_indices"] = self.reads[1][layer % case.reads.shape[0]]
+            second["write_indices"] = self.writes[1][layer % case.reads.shape[0]]
+            second["metadata"] = x["metadata"].clone()
+            # KdaAttnBackend refreshes generation each round. Positions stay
+            # absolute; only record addressing wraps at capacity.
+            second["metadata"][:, 1] += 1
+            second["metadata"][:, 2] += case.accepted.to(torch.int64)
+            self.layers[1].append(second)
+
+    def bind(self, module) -> tuple[RecordsKda, RecordsKda]:
+        return tuple(
+            RecordsKda(
+                module,
+                layers,
+                self.case.retained_qkv,
+                self.case.descriptors,
+                self.case.groups,
+                reads,
+                writes,
+                accepted,
+                self.case.stamps,
+                self.case.t,
+                lower_bound=self.lower_bound,
+            )
+            for layers, reads, writes, accepted in zip(
+                self.layers, self.reads, self.writes, self.accepted, strict=True
+            )
+        )
+
+
+def _invoke_reuse(runners, prefix: int):
+    for runner in runners[:prefix]:
+        runner.lifecycle()
+
+
+def _check_reuse(reuse: ReuseCase, runners):
+    """Check both prefixes against a reference propagated from its own state."""
+    case = reuse.case
+    reference_pools = [(conv.clone(), state.clone()) for conv, state in case.originals]
+    previous_actual = [(conv.clone(), state.clone()) for conv, state in case.originals]
+    outputs = []
+    inputs = [
+        [(x["qkv_raw"].clone(), x["metadata"].clone()) for x in layers]
+        for layers in reuse.layers
+    ]
+    for prefix in (1, 2):
+        case.reset()
+        _invoke_reuse(runners, prefix)
+        layers = reuse.layers[prefix - 1]
+        expected_records = []
+        step_outputs = []
+        for layer, (x, (conv, state)) in enumerate(
+            zip(layers, reference_pools, strict=True)
+        ):
+            positions = x["metadata"][:, 2, None] + torch.arange(case.t, device="cuda")
+            rows = torch.arange(case.batch, device="cuda")[:, None]
+            ring = positions % case.t
+            raw_gate = (
+                x["key_gate"][rows, ring][..., K:]
+                .reshape(case.batch * case.t, _HEADS * K)
+                .contiguous()
+            )
+            check_original_gate_projection(raw_gate, x["f_a"], x["w_fb"])
+            # Step 2 uses the reference's step-1 state, never the candidate's.
+            reference_input = dict(x, conv_pool=conv, h_pool=state)
+            output, correction, kg, final_state, final_conv = _reference(
+                reference_input,
+                case.t,
+                reuse.accepted[prefix - 1],
+                rounded_conv=True,
+                lower_bound=reuse.lower_bound,
+                raw_gate=raw_gate,
+            )
+            writes = reuse.writes[prefix - 1][layer % case.reads.shape[0]].long()
+            state[writes], conv[writes] = final_state, final_conv
+            stamps = torch.stack(
+                (positions, x["metadata"][:, 1, None].expand_as(positions)), dim=-1
+            )
+            expected_records.append((rows, ring, correction, kg, stamps))
+            step_outputs.append(output)
+        outputs.append(step_outputs)
+
+        def check_results():
+            for step in range(prefix):
+                for x, expected, (qkv, metadata) in zip(
+                    reuse.layers[step], outputs[step], inputs[step], strict=True
+                ):
+                    torch.testing.assert_close(
+                        x["verify_output"].view_as(expected),
+                        expected,
+                        atol=1.6e-2,
+                        rtol=1e-2,
+                    )
+                    torch.testing.assert_close(x["qkv_raw"], qkv, atol=0, rtol=0)
+                    torch.testing.assert_close(x["metadata"], metadata, atol=0, rtol=0)
+            for layer, (x, retained, expected, pools, previous) in enumerate(
+                zip(
+                    layers,
+                    case.retained_qkv,
+                    expected_records,
+                    reference_pools,
+                    previous_actual,
+                    strict=True,
+                )
+            ):
+                rows, ring, correction, kg, stamps = expected
+                torch.testing.assert_close(
+                    x["correction"][rows, ring], correction, atol=2e-6, rtol=2e-5
+                )
+                torch.testing.assert_close(
+                    x["key_gate"][rows, ring], kg, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    x["stamps"][rows, ring], stamps, atol=0, rtol=0
+                )
+                torch.testing.assert_close(retained, x["qkv_raw"], atol=0, rtol=0)
+                torch.testing.assert_close(x["conv_pool"], pools[0], atol=0, rtol=0)
+                torch.testing.assert_close(x["h_pool"], pools[1], atol=2e-6, rtol=2e-5)
+                untouched = torch.ones(
+                    pools[1].shape[0], device="cuda", dtype=torch.bool
+                )
+                writes = reuse.writes[prefix - 1][layer % case.reads.shape[0]].long()
+                untouched[writes] = False
+                # After a distinct swap this includes step 1's destinations.
+                for name, saved in zip(("conv_pool", "h_pool"), previous, strict=True):
+                    torch.testing.assert_close(
+                        x[name][untouched], saved[untouched], atol=0, rtol=0
+                    )
+
+        check_results()
+        capture = torch.cuda.CUDAGraph()
+        case.reset()
+        with torch.cuda.graph(capture):
+            _invoke_reuse(runners, prefix)
+        case.reset()
+        for step in range(prefix):
+            for x in reuse.layers[step]:
+                x["verify_output"].fill_(float("nan"))
+        for x, retained in zip(case.layers, case.retained_qkv, strict=True):
+            x["correction"].fill_(float("nan"))
+            x["key_gate"].fill_(float("nan"))
+            x["stamps"].fill_(-1)
+            retained.fill_(float("nan"))
+        capture.replay()
+        check_results()
+        previous_actual = [
+            (x["conv_pool"].clone(), x["h_pool"].clone()) for x in layers
+        ]
+        capture.reset()
+    case.reset()
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="requires AMD gfx950")
+@pytest.mark.parametrize(
+    "window,in_place,lower_bound", [(1, False, -5.0), (4, True, -5.0), (4, True, None)]
+)
+def test_reuse_consumes_committed_state(window, in_place, lower_bound):
+    case = ReplayCase(3, window, 2, in_place=in_place, seed=8950)
+    case.accepted.copy_(
+        torch.tensor([0, max(1, window // 2), window], device="cuda", dtype=torch.int32)
+    )
+    reuse = ReuseCase(case, lower_bound=lower_bound)
+    module = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
+    )
+    _check_reuse(reuse, reuse.bind(module))
+
+
 @pytest.mark.skipif(
     not (current_platform().is_cdna4 or current_platform().is_cdna5),
     reason="requires AMD gfx950 or gfx1250",
@@ -1188,44 +1371,9 @@ def test_gluon_kda_verify_commit_matrix(batch, t, in_place):
         case.check(graph=True, runner=case)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--concurrency", type=int, nargs="+", required=True)
-    parser.add_argument(
-        "--window-lengths", type=int, nargs="+", choices=[1, 4], required=True
-    )
-    parser.add_argument("--layers", type=int, required=True)
-    parser.add_argument(
-        "--page-relation", choices=["distinct", "in-place"], required=True
-    )
-    parser.add_argument("--cache", choices=["cold", "hot"], required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--baseline-source", type=Path, required=True)
-    parser.add_argument("--baseline-revision", required=True)
-    parser.add_argument("--accepted-parent-source", type=Path, required=True)
-    parser.add_argument("--accepted-parent-records-source", type=Path, required=True)
-    parser.add_argument("--accepted-parent-revision", required=True)
-    parser.add_argument("--trial-reference-source", type=Path, required=True)
-    parser.add_argument("--trial-reference-records-source", type=Path, required=True)
-    parser.add_argument("--trial-reference-revision", required=True)
-    parser.add_argument("--measurement-blocks", type=int, default=30)
-    parser.add_argument("--paired-rounds", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=7100)
-    args = parser.parse_args()
+def _run_comparison(args, platform, timer, root):
     started = time.monotonic()
-    if (
-        min(*args.concurrency, args.layers, args.measurement_blocks, args.paired_rounds)
-        < 1
-    ):
-        parser.error("concurrency, layers and measurement counts must be positive")
-    platform = current_platform()
-    if not (platform.is_cdna4 or platform.is_cdna5):
-        parser.error("this matrix requires AMD gfx950 or gfx1250")
     arch = "gfx950" if platform.is_cdna4 else "gfx1250"
-    timer = GraphTimer(
-        GraphBenchmarkConfig(eager_warmup_iterations=5, replay_warmup_iterations=3)
-    )
-    root = Path(__file__).resolve().parents[5]
     report = {
         "schema_version": 2,
         "status": "running",
@@ -1620,6 +1768,7 @@ def main():
         ]
         section["regression_count"] = len(section["regressions"])
     report.pop("active_case")
+    report["elapsed_seconds"] = time.monotonic() - started
     publish()
     # Keep raw samples in the artifact; log only aggregates below the summary limit.
     print(
@@ -1627,6 +1776,222 @@ def main():
         flush=True,
     )
     return 0
+
+
+def _run_reuse_matrix(args, platform, timer, root):
+    """Measure complete two-step sequences after the original matrix has run."""
+    started = time.monotonic()
+    current = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
+    )
+    reference = _original_module(
+        args.trial_reference_source.resolve(),
+        "gfx950",
+        records_source=args.trial_reference_records_source,
+    )
+    elapsed = {"setup": 0.0, "correctness": 0.0, "measurement": 0.0, "total": 0.0}
+    report = {
+        "schema_version": 1,
+        "status": "running",
+        "latency_unit": "us",
+        "scope": "two complete records lifecycles; all layers and automatic gate production; no reset or cache clear between steps",
+        "measurement_note": "Whole sequence timing, not per-step latency or model E2E; does not bound serving behavior",
+        "coverage_note": "Zero acceptance and distinct page swaps are synthetic kernel-API coverage; the serving planner clamps counts to at least one",
+        "page_relation": args.page_relation,
+        "initial_cache": args.cache,
+        "page_mapping": "read2=write1; write2=read1",
+        "metadata_transition": "slot unchanged; generation2=generation1+1; absolute_start2=absolute_start1+accepted1",
+        "second_acceptance": "step 1 counts rotated by one request",
+        "requested_concurrency": args.concurrency,
+        "requested_window_lengths": args.window_lengths,
+        "layers": args.layers,
+        "heads": _HEADS,
+        "head_dim": K,
+        "state_page_bytes": _STATE_PAGE_BYTES,
+        "dtype": "bfloat16",
+        "lower_bound": LOWER_BOUND,
+        "seed": args.seed,
+        "paired_rounds": args.paired_rounds,
+        "device": platform.device_name,
+        "revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "dirty": bool(
+            subprocess.check_output(["git", "status", "--porcelain"], cwd=root)
+        ),
+        "candidate_source_sha256": hashlib.sha256(
+            Path(current.__file__).read_bytes()
+        ).hexdigest(),
+        "candidate_records_source_sha256": hashlib.sha256(
+            (
+                root
+                / "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/_kda_records.py"
+            ).read_bytes()
+        ).hexdigest(),
+        "trial_reference_revision": args.trial_reference_revision,
+        "trial_reference_source_sha256": hashlib.sha256(
+            args.trial_reference_source.read_bytes()
+        ).hexdigest(),
+        "trial_reference_records_source_sha256": hashlib.sha256(
+            args.trial_reference_records_source.read_bytes()
+        ).hexdigest(),
+        "live_dependencies": {
+            "tokenspeed_triton_version": triton.__version__,
+            "torch_version": torch.__version__,
+            "compiler_adapter_sha256": hashlib.sha256(
+                (
+                    root
+                    / "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py"
+                ).read_bytes()
+            ).hexdigest(),
+        },
+        "elapsed_seconds": elapsed,
+        "results": [],
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    def publish():
+        elapsed["total"] = time.monotonic() - started
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
+
+    publish()
+    try:
+        for batch in args.concurrency:
+            for window in args.window_lengths:
+                setup_started = time.monotonic()
+                case = ReplayCase(
+                    batch,
+                    window,
+                    args.layers,
+                    in_place=args.page_relation == "in-place",
+                    seed=args.seed,
+                )
+                elapsed["setup"] += time.monotonic() - setup_started
+                for name, accepted in _acceptance_patterns(batch, window):
+                    report["active_case"] = {
+                        "concurrency": batch,
+                        "window_length": window,
+                        "accepted_length": name,
+                    }
+                    publish()
+                    setup_started = time.monotonic()
+                    case.accepted.copy_(accepted)
+                    reuse = ReuseCase(case, lower_bound=LOWER_BOUND)
+                    candidate_runners = reuse.bind(current)
+                    reference_runners = reuse.bind(reference)
+                    elapsed["setup"] += time.monotonic() - setup_started
+                    correctness_started = time.monotonic()
+                    for runners in (candidate_runners, reference_runners):
+                        _check_reuse(reuse, runners)
+                    elapsed["correctness"] += time.monotonic() - correctness_started
+                    measurement_started = time.monotonic()
+                    measured = _paired_measurements(
+                        timer,
+                        lambda: _invoke_reuse(candidate_runners, 2),
+                        lambda: _invoke_reuse(reference_runners, 2),
+                        reset=case.reset,
+                        cold_cache=args.cache == "cold",
+                        measurement_blocks=args.measurement_blocks,
+                        rounds=args.paired_rounds,
+                        equivalent=True,
+                    )
+                    elapsed["measurement"] += time.monotonic() - measurement_started
+                    measured["trial_reference"] = measured.pop("original")
+                    measured["round_speedups"] = [
+                        before["median_us"] / after["median_us"]
+                        for before, after in zip(
+                            measured["trial_reference"]["rounds"],
+                            measured["candidate"]["rounds"],
+                            strict=True,
+                        )
+                    ]
+                    report["results"].append(
+                        {
+                            "concurrency": batch,
+                            "window_length": window,
+                            "accepted_length": name,
+                            "accepted_counts": [
+                                x.cpu().tolist() for x in reuse.accepted
+                            ],
+                            "read_pages": [x.cpu().tolist() for x in reuse.reads],
+                            "write_pages": [x.cpu().tolist() for x in reuse.writes],
+                            "layers": args.layers,
+                            "lifecycle_count": 2,
+                            "correctness": "both_prefixes_passed_eager_and_graph_for_both_sides",
+                            "measurement": measured,
+                        }
+                    )
+                    publish()
+                    print(
+                        f"REUSE C{batch} T{window} accepted={name} "
+                        f"candidate_us={measured['candidate']['median_us']:.3f} "
+                        f"reference_us={measured['trial_reference']['median_us']:.3f} "
+                        f"speedup={measured['speedup']:.4f}x "
+                        f"round_speedups={measured['round_speedups']}",
+                        flush=True,
+                    )
+                    del reuse, candidate_runners, reference_runners
+                del case
+    except Exception as error:
+        report["status"] = "failed"
+        report["error"] = f"{type(error).__name__}: {error}"
+        publish()
+        raise
+    report["status"] = "complete"
+    report.pop("active_case")
+    publish()
+    print(
+        "KDA_REUSE_REPORT=" + json.dumps(_summary_without_samples(report)), flush=True
+    )
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--concurrency", type=int, nargs="+", required=True)
+    common.add_argument(
+        "--window-lengths", type=int, nargs="+", choices=[1, 4], required=True
+    )
+    common.add_argument("--layers", type=int, required=True)
+    common.add_argument(
+        "--page-relation", choices=["distinct", "in-place"], required=True
+    )
+    common.add_argument("--cache", choices=["cold", "hot"], required=True)
+    common.add_argument("--output", type=Path, required=True)
+    common.add_argument("--trial-reference-source", type=Path, required=True)
+    common.add_argument("--trial-reference-records-source", type=Path, required=True)
+    common.add_argument("--trial-reference-revision", required=True)
+    common.add_argument("--measurement-blocks", type=int, default=30)
+    common.add_argument("--paired-rounds", type=int, default=3)
+    common.add_argument("--seed", type=int, default=7100)
+    measurements = parser.add_subparsers(dest="measurement", required=True)
+    compare = measurements.add_parser("compare", parents=[common])
+    compare.add_argument("--baseline-source", type=Path, required=True)
+    compare.add_argument("--baseline-revision", required=True)
+    compare.add_argument("--accepted-parent-source", type=Path, required=True)
+    compare.add_argument("--accepted-parent-records-source", type=Path, required=True)
+    compare.add_argument("--accepted-parent-revision", required=True)
+    measurements.add_parser("reuse", parents=[common])
+    args = parser.parse_args()
+    if (
+        min(*args.concurrency, args.layers, args.measurement_blocks, args.paired_rounds)
+        < 1
+    ):
+        parser.error("concurrency, layers and measurement counts must be positive")
+    platform = current_platform()
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        parser.error("this matrix requires AMD gfx950 or gfx1250")
+    if args.measurement == "reuse" and not platform.is_cdna4:
+        parser.error("state-reuse comparison requires AMD gfx950")
+    timer = GraphTimer(
+        GraphBenchmarkConfig(eager_warmup_iterations=5, replay_warmup_iterations=3)
+    )
+    root = Path(__file__).resolve().parents[5]
+    if args.measurement == "compare":
+        return _run_comparison(args, platform, timer, root)
+    else:
+        return _run_reuse_matrix(args, platform, timer, root)
 
 
 if __name__ == "__main__":

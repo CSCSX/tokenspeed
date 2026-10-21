@@ -43,7 +43,10 @@ source_path=tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attent
 git show "$baseline_revision:$source_path" > /tmp/original-kda.py
 git show "$accepted_parent_revision:$source_path" > /tmp/accepted-parent-kda.py
 git show "$trial_reference_revision:$source_path" > /tmp/trial-reference-kda.py
-python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py \
+records_path=tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/_kda_records.py
+git show "$accepted_parent_revision:$records_path" > /tmp/accepted-parent-kda-records.py
+git show "$trial_reference_revision:$records_path" > /tmp/trial-reference-kda-records.py
+python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py compare \
   --concurrency 1 2 4 8 16 32 64 128 \
   --window-lengths 1 4 \
   --layers 69 \
@@ -54,13 +57,38 @@ python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py 
   --baseline-source /tmp/original-kda.py \
   --baseline-revision "$baseline_revision" \
   --accepted-parent-source /tmp/accepted-parent-kda.py \
+  --accepted-parent-records-source /tmp/accepted-parent-kda-records.py \
   --accepted-parent-revision "$accepted_parent_revision" \
   --trial-reference-source /tmp/trial-reference-kda.py \
+  --trial-reference-records-source /tmp/trial-reference-kda-records.py \
   --trial-reference-revision "$trial_reference_revision" \
   --output /tmp/kda-replay-matrix.json
 ```
 
-The command checks each case eagerly and with graph replay. Full-lifecycle
+For gfx950, use the same snapshots to measure two successive records lifecycles:
+
+```bash
+python tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py reuse \
+  --concurrency 1 2 4 8 16 32 64 128 \
+  --window-lengths 1 4 \
+  --layers 69 \
+  --page-relation distinct \
+  --cache cold \
+  --measurement-blocks 30 \
+  --paired-rounds 3 \
+  --trial-reference-source /tmp/trial-reference-kda.py \
+  --trial-reference-records-source /tmp/trial-reference-kda-records.py \
+  --trial-reference-revision "$trial_reference_revision" \
+  --output /tmp/kda-replay-reuse.json
+```
+
+The second verify reads the first commit's state. No reset or cache clear runs
+between steps. The report measures the whole sequence against the trial reference;
+it does not predict model latency. Zero acceptance and explicit page swaps cover
+the kernel API, not serving scheduler or allocator policy. CI publishes both
+original comparison matrices before it runs the reuse matrices.
+
+The `compare` command checks each case eagerly and with graph replay. Full-lifecycle
 timing includes all requested layers. The candidate runs gate production,
 records verify and QKV retention, then one batched commit. The immutable
 original uses fused decode at T1, and gate GEMM, capture verify and raw-gate
@@ -100,7 +128,8 @@ The immutable original remains fixed, and its complete-operation timings remain
 the final performance target.
 
 Use `--page-relation in-place` to measure aliasing; the timer restores the
-checkpoint outside the timed interval. `--cache hot` selects hot-cache timing.
+checkpoint outside the timed interval. `--cache hot` omits the cache clear after
+that reset; it does not preserve state across measured invocations.
 JSON includes all samples, median/p90, accepted counts, layer count, device,
 revision and dirty-worktree status. Keep these settings identical when comparing
 revisions. A failed correctness check stops the command without publishing a

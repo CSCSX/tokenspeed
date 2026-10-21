@@ -1200,7 +1200,15 @@ real wrapper launches for gfx950 and gfx1250 without a GPU. Source changes can
 affect generated instructions through debug locations; compiler comparisons
 describe only the checked cases. Hardware control rows remain required for
 correctness and performance.
-An optional ROCm recovery counter smoke runs after both timing matrices.
+A separate comparison measures two complete records lifecycles. The second
+verify reads the first commit's state without a reset between them. Correctness
+checks both prefixes against an independent recurrence, including softplus.
+Generation advances each round; record positions remain absolute. Zero acceptance
+and distinct page swaps test the kernel API, not the serving page allocator.
+The report gives the whole sequence time and does not predict model latency.
+The matrix harness uses explicit `compare` and `reuse` subcommands.
+Both original timing matrices finish and publish before reuse starts.
+An optional ROCm recovery counter smoke runs after all timing matrices.
 Its graph-dispatch attribution requires review; instrumented times do not
 determine performance acceptance.
 A separate Torch import probe records loaded profiler libraries and GPU arithmetic
