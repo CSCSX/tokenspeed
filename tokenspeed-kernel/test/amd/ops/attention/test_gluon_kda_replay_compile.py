@@ -436,3 +436,20 @@ def test_reference_snapshots_keep_frozen_helpers_separate(tmp_path):
     assert live.MetadataConsumer("verify").read() == {"name": "verify"}
     again = _original_module(decoder, "gfx950", records_source=helpers[0])
     assert again.MetadataConsumer("commit").read() == {"name": "parent:commit"}
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+def test_record_guard_case_launches_compile(monkeypatch, arch):
+    from amd.ops.attention.test_gluon_kda_record_guards import _GuardCase
+
+    case = _GuardCase(arch, "cpu")
+    for name in (
+        f"gluon_kda_fused_paged_verify_nostore_vmajor_{arch}",
+        f"gluon_kda_fused_replay_{arch}",
+    ):
+        _offline_launch(monkeypatch, getattr(case.module, name), arch)
+    case.validate(verify=True, stamped=True)
+    case.verify()
+    for stamped in (True, False):
+        case.validate(verify=False, stamped=stamped)
+        case.commit(stamped=stamped)

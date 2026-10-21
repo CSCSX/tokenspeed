@@ -56,7 +56,9 @@ def kda_record_interval(
         & (steps <= MAX_STEPS)
         & (steps <= CAPACITY)
     )
-    gl.device_assert(valid, "invalid replay interval")
+    # Metadata and accepted counts are uniform across the workgroup.
+    if not valid:
+        gl.device_assert(valid, "invalid replay interval")
     if stamps is not None:
         # Mask every access when metadata is invalid, before reducing stamps.
         offsets = gl.arange(
@@ -82,7 +84,9 @@ def kda_record_interval(
             )
             == 0
         )
-        gl.device_assert(fresh, "stale replay record")
+        # The completed reduction gives every thread the same result.
+        if not fresh:
+            gl.device_assert(fresh, "stale replay record")
         valid = valid & fresh
     return slot, start, valid
 

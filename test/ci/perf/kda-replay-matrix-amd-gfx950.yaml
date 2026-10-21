@@ -35,6 +35,10 @@ perf:
     git show "$trial_reference_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/attention/kda/decode.py" > "$trial_reference_source"
     git show "$trial_reference_revision:tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/_kda_records.py" > "$trial_reference_records_source"
     export TOKENSPEED_KDA_BASELINE_DIR="$PWD/.ci-artifacts"
+    # Exact compiled assertion text; native GPU failures stay in child processes.
+    python3 -m amd.ops.attention.test_gluon_kda_record_guards \
+      --mode suite --arch gfx950 \
+      --output .ci-artifacts/published/kda-record-guards --launch-prefix
     python3 -m pytest -q --confcutdir=tokenspeed-kernel/test/amd/ops/attention \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_ignores_rejected_records \
       tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_replay_matrix.py::test_commit_wide_record_ring \

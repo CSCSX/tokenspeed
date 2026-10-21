@@ -629,8 +629,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         & (token_count >= 0)
         & (token_count <= TOKENS_PER_SEQUENCE)
     )
-    gl.device_assert(valid, "invalid replay metadata")
     if not valid:
+        # Scalar metadata gives every thread the same branch condition.
+        gl.device_assert(valid, "invalid replay metadata")
         return
 
     read_page_offset = read_idx.to(gl.int64)

@@ -18,7 +18,7 @@ jobs:
     uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: >-
-        {"include":[{"name":"kda-replay-matrix-amd-gfx950","type":"perf","config":"test/ci/perf/kda-replay-matrix-amd-gfx950.yaml","runner":"amd-mi355-1gpu","priority":"normal","optional":false,"workflow_stage":"kernel-benchmark"}]}
+        {"include":[{"name":"kda-replay-matrix-amd-gfx950","type":"perf","config":"test/ci/perf/kda-replay-matrix-amd-gfx950.yaml","runner":"amd-mi355-1gpu","priority":"normal","optional":false,"workflow_stage":"kernel-benchmark"},{"name":"ut-kda-record-guards-mi450-sim","type":"ut","config":"test/ci/ut/ut-kda-record-guards-mi450-sim.yaml","runner":"amd-mi45x-cpu-test","priority":"normal","optional":false,"workflow_stage":"unit-test"}]}
       install_tokenspeed_mla_from_source: ${{ 'false' }}
       checkout_ref: ${{ github.sha }}
       timeout_minutes: 120
