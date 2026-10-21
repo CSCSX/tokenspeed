@@ -76,9 +76,9 @@ def _kda_recurrent_step(running, key, query, value, beta, key_query):
 
 
 @gluon.jit
-def _kda_qkvd_indices(head_idx, H: gl.constexpr, D: gl.constexpr):
+def _kda_qkvd_indices(head_idx, H: gl.constexpr, D: gl.constexpr, WAVES: gl.constexpr):
     """Map Q/K/V/decay lanes to their input channels."""
-    layout: gl.constexpr = gl.BlockedLayout([2], [64], [4], [0])
+    layout: gl.constexpr = gl.BlockedLayout([2], [64], [WAVES], [0])
     offsets = gl.arange(0, 4 * D, layout=layout)
     slot_id = offsets // D
     local_offset = offsets - slot_id * D
@@ -344,7 +344,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     a_value = gl.load(a_log + head_idx)
     # Process Q/K/V together so they share convolution loads. The fourth
     # (decay) lanes use Q as an in-bounds dummy address and skip state writes.
-    qkv_channel, slot_id, _, _ = _kda_qkvd_indices(head_idx, H, D)
+    qkv_channel, slot_id, _, _ = _kda_qkvd_indices(head_idx, H, D, 4)
     qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
     qkv_weight0 = gl.load(qkv_weight_base)
     qkv_weight1 = gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
@@ -661,7 +661,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
 
     # Process Q/K/V/decay together so Q/K/V share convolution loads.
     # Decay lanes use Q as an in-bounds dummy address and skip state writes.
-    qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D)
+    qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D, 4)
 
     qkv_history0 = gl.load(
         conv_pool
@@ -993,7 +993,7 @@ def gluon_kda_fused_replay_gfx950(
     state_layout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
         [4, 16],
-        [4, 1],
+        [gl.num_warps(), 1],
         [1, 0],
     )
     key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
@@ -1011,7 +1011,7 @@ def gluon_kda_fused_replay_gfx950(
     raw_pipe = (_raw,)
 
     # One head owns its Q/K/V history, so load all taps before an in-place write.
-    qkv_channel, slot_id, _, _ = _kda_qkvd_indices(head_idx, H, D)
+    qkv_channel, slot_id, _, _ = _kda_qkvd_indices(head_idx, H, D, gl.num_warps())
     qkv_read_base = conv_pool + read_idx * conv_stride + qkv_channel * 3
     qkv_history0 = gl.load(qkv_read_base).to(gl.float32)
     qkv_history1 = gl.load(qkv_read_base + 1).to(gl.float32)
@@ -1036,7 +1036,7 @@ def gluon_kda_fused_replay_gfx950(
     a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
     bias = gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
     # Stage accepted records once for key normalization and state updates.
-    record_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    record_layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     correction_offsets = gl.arange(0, D, layout=record_layout)
     key_gate_offsets = gl.arange(0, 2 * D, layout=record_layout)
     correction_shared = gl.allocate_shared_memory(
@@ -1095,8 +1095,15 @@ def gluon_kda_fused_replay_gfx950(
                 .load(value_layout)
             )
             if token_offset < replay_steps:
-                running *= decay_values[token_offset][None, :]
-                running += delta[:, None] * k_values[token_offset][None, :]
+                if T == 1 and BOUNDED:
+                    # Round U*K before the state-decay FMA.
+                    update = delta[:, None] * k_values[token_offset][None, :]
+                    running = gl.fma(
+                        running, decay_values[token_offset][None, :], update
+                    )
+                else:
+                    running *= decay_values[token_offset][None, :]
+                    running += delta[:, None] * k_values[token_offset][None, :]
         write_base = write_idx * state_stride + head_idx * D * D
         gl.store(state_pool + write_base + panel_offsets, running)
 
@@ -1665,7 +1672,7 @@ def launch_gluon_kda_fused_replay_gfx950(
         T=draft_token_num,
         CAPACITY=capacity,
         BOUNDED=lower_bound is not None,
-        num_warps=4,
+        num_warps=8 if draft_token_num == 1 and lower_bound is not None else 4,
         num_stages=2,
         # Keep record assertions without instrumenting every integer operation.
         debug=True,
