@@ -1184,9 +1184,14 @@ references use the same GEMM as their producer. Reports list incomplete
 baseline checks and complete-operation regressions explicitly. A separate GFX950
 comparison pairs the current and accepted-parent records lifecycles in the same
 run, including gate production and commit for every acceptance pattern. Both
-pass independent correctness checks before timing. Local compile
-tests check real wrapper launches for gfx950 and gfx1250 without a GPU; device
-tests remain responsible for numerical correctness and performance.
+pass independent correctness checks before timing. One-layer verify timings either
+exclude gate projection by supplying gates or include the automatic producer.
+Automatic rows include split and softplus controls. They validate the saved raw
+gate against FP64 before using it to check recurrence. Local compile tests check
+real wrapper launches for gfx950 and gfx1250 without a GPU. Source changes can
+affect generated instructions through debug locations; compiler comparisons
+describe only the checked cases. Hardware control rows remain required for
+correctness and performance.
 An optional ROCm recovery counter smoke runs after both timing matrices.
 Its graph-dispatch attribution requires review; instrumented times do not
 determine performance acceptance.

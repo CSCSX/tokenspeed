@@ -933,27 +933,37 @@ def _paired_measurements(
     return result
 
 
-def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
-    """Compare one-layer verify using the same supplied gate on both sides."""
+def _measure_parent_verify(
+    timer,
+    case,
+    parent_module,
+    measure_options,
+    *,
+    use_supplied_gate: bool,
+    lower_bound: float | None,
+):
+    """Compare one-layer verify with equal gate production and QKV retention.
+
+    Validate the saved raw gate against FP64 before using it in the recurrence
+    reference. This checks either producer independently of the recurrence.
+    """
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_verify_gfx950,
     )
 
     case.reset()
     x, t = case.layers[0], case.t
-    raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    if use_supplied_gate:
+        raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+        original_gate = raw_gate.clone()
+    else:
+        raw_gate = None
+        original_gate = None
     original_input = x["qkv_raw"].clone()
     original_metadata = x["metadata"].clone()
-    original_gate = raw_gate.clone()
+    original_activation = x["f_a"].clone()
+    original_weight = x["w_fb"].clone()
     retained = case.retained_qkv[0]
-    reference = _reference(
-        x,
-        t,
-        case.accepted,
-        lower_bound=LOWER_BOUND,
-        rounded_conv=True,
-        raw_gate=raw_gate,
-    )
     positions = original_metadata[:, 2, None] + torch.arange(t, device="cuda")
     rows = torch.arange(case.batch, device="cuda")[:, None]
     ring = positions % t
@@ -967,7 +977,7 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
             t,
             raw_gate=raw_gate,
             original_qkv=retained,
-            lower_bound=LOWER_BOUND,
+            lower_bound=lower_bound,
         )
         for launcher in (
             gluon_kda_fused_verify_gfx950,
@@ -982,6 +992,33 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
         x["stamps"].fill_(-1)
 
     def check(output):
+        for actual, expected in (
+            (retained, original_input),
+            (x["qkv_raw"], original_input),
+            (x["metadata"], original_metadata),
+            (x["f_a"], original_activation),
+            (x["w_fb"], original_weight),
+            (x["conv_pool"], case.originals[0][0]),
+            (x["h_pool"], case.originals[0][1]),
+        ):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        saved_gate = (
+            x["key_gate"][rows, ring][..., K:]
+            .reshape(case.batch * t, _HEADS * K)
+            .contiguous()
+        )
+        check_original_gate_projection(saved_gate, original_activation, original_weight)
+        if use_supplied_gate:
+            torch.testing.assert_close(saved_gate, original_gate, atol=0, rtol=0)
+            torch.testing.assert_close(raw_gate, original_gate, atol=0, rtol=0)
+        reference = _reference(
+            x,
+            t,
+            case.accepted,
+            lower_bound=lower_bound,
+            rounded_conv=True,
+            raw_gate=saved_gate,
+        )
         expected_output, correction, kg = reference[:3]
         torch.testing.assert_close(
             output.view_as(expected_output), expected_output, atol=1.6e-2, rtol=1e-2
@@ -993,15 +1030,6 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
         torch.testing.assert_close(
             x["stamps"][rows, ring], expected_stamps, atol=0, rtol=0
         )
-        for actual, expected in (
-            (retained, original_input),
-            (x["qkv_raw"], original_input),
-            (x["metadata"], original_metadata),
-            (raw_gate, original_gate),
-            (x["conv_pool"], case.originals[0][0]),
-            (x["h_pool"], case.originals[0][1]),
-        ):
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     for invoke in invocations:
         case.reset()
@@ -1019,10 +1047,20 @@ def _measure_explicit_gate_verify(timer, case, parent_module, measure_options):
         timer, *invocations, equivalent=True, **measure_options
     )
     measured["accepted_parent"] = measured.pop("original")
+    measured["round_speedups"] = [
+        accepted["median_us"] / candidate["median_us"]
+        for accepted, candidate in zip(
+            measured["accepted_parent"]["rounds"],
+            measured["candidate"]["rounds"],
+            strict=True,
+        )
+    ]
     case.reset()
     return {
         "concurrency": case.batch,
         "window_length": t,
+        "gate_producer": "supplied" if use_supplied_gate else "automatic",
+        "lower_bound": lower_bound,
         "correctness": "both_passed_eager_and_graph",
         "measurement": measured,
     }
@@ -1198,6 +1236,16 @@ def main():
             "scope": "one layer; same supplied raw gate and retention; excludes gate projection and commit",
             "results": [],
         },
+        "accepted_parent_auto_verify": {
+            "status": "running" if arch == "gfx950" else "not_run",
+            "reason": None if arch == "gfx950" else "gfx950-only comparison",
+            "revision": args.accepted_parent_revision,
+            "source_sha256": hashlib.sha256(
+                args.accepted_parent_source.read_bytes()
+            ).hexdigest(),
+            "scope": "one layer; both include automatic gate production and QKV retention; excludes commit",
+            "results": [],
+        },
         "accepted_parent_lifecycle": {
             "status": "running" if arch == "gfx950" else "not_run",
             "reason": None if arch == "gfx950" else "gfx950-only comparison",
@@ -1279,16 +1327,35 @@ def main():
                     or (t == 4 and batch == 1)
                 ):
                     report["accepted_parent_verify"]["results"].append(
-                        _measure_explicit_gate_verify(
+                        _measure_parent_verify(
                             timer,
                             case,
                             _original_module(
                                 args.accepted_parent_source.resolve(), arch
                             ),
                             measure_options,
+                            use_supplied_gate=True,
+                            lower_bound=LOWER_BOUND,
                         )
                     )
                     publish()
+                if arch == "gfx950" and t == 1 and batch in (8, 16, 32, 64, 128):
+                    # Split-verify control at B8; unbounded-gate control at B16.
+                    bounds = (LOWER_BOUND, None) if batch == 16 else (LOWER_BOUND,)
+                    for lower_bound in bounds:
+                        report["accepted_parent_auto_verify"]["results"].append(
+                            _measure_parent_verify(
+                                timer,
+                                case,
+                                _original_module(
+                                    args.accepted_parent_source.resolve(), arch
+                                ),
+                                measure_options,
+                                use_supplied_gate=False,
+                                lower_bound=lower_bound,
+                            )
+                        )
+                        publish()
                 verify_measurements = {}
                 for name, accepted in _acceptance_patterns(batch, t):
                     report["active_case"]["accepted_length"] = name
@@ -1422,6 +1489,7 @@ def main():
     report["status"] = "complete"
     if arch == "gfx950":
         report["accepted_parent_verify"]["status"] = "complete"
+        report["accepted_parent_auto_verify"]["status"] = "complete"
         report["accepted_parent_lifecycle"]["status"] = "complete"
     report["baseline_validation_failures"] = sum(
         row["original_correctness"]["status"] == "failed" for row in report["results"]
