@@ -78,6 +78,12 @@ The FlashInfer adapter retains the upstream launch geometry and runtime ABI,
 while wrapping device bodies with PDL synchronization. Adapted functions and
 in-memory compilation caches live in private namespaces.
 
+The MTP registration declares K=V=128, the geometry supported by both its BF16
+and FP32 state paths. Other value widths use portable verification. Direct
+BF16-state calls outside that geometry are rejected before the FP32-only
+adapter. Runtime tests cover non-square states, padding and accepted-prefix
+commit; WY tests cover 4/8/16-token wide value tiles with BF16 and FP16 state.
+
 Decode and prefill explicitly select FlashInfer's CuTe backend. FlashInfer
 0.7.0's automatic backend selection can use Cake GDN for supported shapes,
 which bypasses the PDL-wrapped device bodies. Regression tests cover both

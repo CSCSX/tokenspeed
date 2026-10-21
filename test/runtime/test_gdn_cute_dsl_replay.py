@@ -70,6 +70,7 @@ class VerifyCase:
     inputs: dict[str, torch.Tensor]
     tokens: int
     head_dim: int
+    value_head_dim: int
     vheads: int
     parents: list[list[int]] | None
 
@@ -108,10 +109,10 @@ class VerifyCase:
             bias=None,
             activation="silu",
             key_dim=_HEADS * self.head_dim,
-            value_dim=self.vheads * self.head_dim,
+            value_dim=self.vheads * self.value_head_dim,
             attention_tp_size=1,
             head_k_dim=self.head_dim,
-            head_v_dim=self.head_dim,
+            head_v_dim=self.value_head_dim,
             a=self.inputs["a"],
             b=self.inputs["b"],
             A_log=self.inputs["A_log"],
@@ -121,15 +122,15 @@ class VerifyCase:
         )
 
 
-def make_case(*, tokens, head_dim, vheads, state_dtype, replay, tree):
-    width = (2 * _HEADS + vheads) * head_dim
+def make_case(*, tokens, head_dim, value_head_dim, vheads, state_dtype, replay, tree):
+    width = 2 * _HEADS * head_dim + vheads * value_head_dim
     group = one_group(
         "linear_attention",
         CacheFieldSpec("layer.0.conv", "conv", (width, 3), "bfloat16"),
         CacheFieldSpec(
             "layer.0.ssm",
             "ssm",
-            (vheads, head_dim, head_dim),
+            (vheads, value_head_dim, head_dim),
             cache_dtype_name(state_dtype),
         ),
         attn_kind="state",
@@ -173,7 +174,11 @@ def make_case(*, tokens, head_dim, vheads, state_dtype, replay, tree):
         replay_ssm=replay,
         draft_tree=tree,
     )
-    linear = replace(config.component(LinearAttnConfig), num_v_heads=vheads)
+    linear = replace(
+        config.component(LinearAttnConfig),
+        num_v_heads=vheads,
+        head_v_dim=value_head_dim,
+    )
     backend = GdnAttnBackend(replace(config, components=(spec, linear)), spec)
     backend.set_kv_pool(pool)
     backend.init_cuda_graph_state(_BATCH)
@@ -185,7 +190,9 @@ def make_case(*, tokens, head_dim, vheads, state_dtype, replay, tree):
             list(range(-1, tokens - 1)),
         ]
         backend.bind_tree_verify(_tree_verify_inputs(parents))
-    return VerifyCase(backend, pool, inputs, tokens, head_dim, vheads, parents)
+    return VerifyCase(
+        backend, pool, inputs, tokens, head_dim, value_head_dim, vheads, parents
+    )
 
 
 def recorded_forward(case, path):
@@ -216,13 +223,18 @@ def check_commit(case, before, *, actual_bs, read_pages):
         paths.append(path)
     payload = case.backend._gdn_replay.payload[0].view(_BATCH, case.tokens, -1)
     keys, values, a, b = payload.split(
-        (_HEADS * case.head_dim, case.vheads * case.head_dim, case.vheads, case.vheads),
+        (
+            _HEADS * case.head_dim,
+            case.vheads * case.value_head_dim,
+            case.vheads,
+            case.vheads,
+        ),
         dim=-1,
     )
     keys = keys.double().view(_BATCH, case.tokens, _HEADS, case.head_dim)
     keys = keys / (keys.square().sum(-1, keepdim=True) + 1e-6).sqrt()
     keys = keys.repeat_interleave(case.vheads // _HEADS, 2)
-    values = values.double().view(_BATCH, case.tokens, case.vheads, case.head_dim)
+    values = values.double().view(_BATCH, case.tokens, case.vheads, case.value_head_dim)
     decay = (
         -case.inputs["A_log"].double().exp()
         * torch.nn.functional.softplus(a.double() + case.inputs["dt_bias"].double())
@@ -264,22 +276,25 @@ def check_commit(case, before, *, actual_bs, read_pages):
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
-    "tokens,tree,vheads",
+    "tokens,tree,vheads,value_head_dim",
     [
-        (4, False, 4),
-        (8, False, 4),
-        (16, False, 4),
-        (16, False, 24),
-        (8, True, 4),
-        (16, True, 4),
+        (4, False, 4, 128),
+        (8, False, 4, 128),
+        (16, False, 4, 128),
+        (16, False, 24, 128),
+        (8, True, 4, 128),
+        (16, True, 4, 128),
+        (4, False, 4, 64),
+        (4, False, 4, 256),
     ],
 )
-def test_replay_prefers_wy_and_commits_the_accepted_path(
-    tmp_path, state_dtype, tokens, tree, vheads
+def test_replay_verifies_and_commits_the_accepted_path(
+    tmp_path, state_dtype, tokens, tree, vheads, value_head_dim
 ):
     case = make_case(
         tokens=tokens,
         head_dim=128,
+        value_head_dim=value_head_dim,
         vheads=vheads,
         state_dtype=state_dtype,
         replay=True,
@@ -288,6 +303,7 @@ def test_replay_prefers_wy_and_commits_the_accepted_path(
     reference = make_case(
         tokens=tokens,
         head_dim=128,
+        value_head_dim=value_head_dim,
         vheads=vheads,
         state_dtype=torch.float32,
         replay=False,
@@ -298,7 +314,10 @@ def test_replay_prefers_wy_and_commits_the_accepted_path(
         item.refresh(actual_bs=_BATCH, read_pages=(1, 2), for_graph_replay=False)
     before = case.state.clone()
     output, selected = recorded_forward(case, tmp_path / "verify.json")
-    assert selected == "cute_dsl_gdn_decode_mtp"
+    expected = (
+        "cute_dsl_gdn_decode_mtp" if value_head_dim == 128 else "triton_gdn_decode_mtp"
+    )
+    assert selected == expected
     assert case.backend._verify_packed_qkv_views
     torch.testing.assert_close(
         output.double(), reference.forward().double(), atol=1e-4, rtol=2**-7
@@ -309,21 +328,25 @@ def test_replay_prefers_wy_and_commits_the_accepted_path(
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
-    "tokens,head_dim,replay,tree",
+    "tokens,head_dim,value_head_dim,replay,tree",
     [
-        (4, 64, True, False),
-        (17, 128, True, False),
-        (17, 128, True, True),
-        (4, 128, True, True),
-        (4, 128, False, False),
+        (4, 64, 64, True, False),
+        (4, 128, 64, True, False),
+        (4, 128, 256, True, False),
+        (17, 128, 128, True, False),
+        (17, 128, 128, True, True),
+        (4, 128, 128, True, True),
+        (4, 128, 128, False, False),
+        (4, 128, 128, False, True),
     ],
 )
 def test_verify_falls_back_for_unsupported_or_state_writing_calls(
-    tmp_path, state_dtype, tokens, head_dim, replay, tree
+    tmp_path, state_dtype, tokens, head_dim, value_head_dim, replay, tree
 ):
     case = make_case(
         tokens=tokens,
         head_dim=head_dim,
+        value_head_dim=value_head_dim,
         vheads=4,
         state_dtype=state_dtype,
         replay=replay,
@@ -336,6 +359,7 @@ def test_verify_falls_back_for_unsupported_or_state_writing_calls(
     if (
         not tree
         and head_dim == 128
+        and value_head_dim == 128
         and (state_dtype != torch.bfloat16 or replay)
         and KernelRegistry.get().get_by_name("flashinfer_gdn_decode_mtp") is not None
     ):
@@ -343,6 +367,9 @@ def test_verify_falls_back_for_unsupported_or_state_writing_calls(
     assert selected == expected
     assert case.backend._verify_packed_qkv_views == (
         selected == "triton_gdn_decode_mtp"
+    )
+    assert case.backend._verify_reads_committed_recurrent_state == (
+        not replay and selected == "triton_gdn_decode_mtp"
     )
     assert output.isfinite().all()
     if replay:
@@ -355,6 +382,7 @@ def test_replay_graph_refreshes_inputs_and_padding(tmp_path, state_dtype, tree):
     case = make_case(
         tokens=8,
         head_dim=128,
+        value_head_dim=128,
         vheads=4,
         state_dtype=state_dtype,
         replay=True,
@@ -363,6 +391,7 @@ def test_replay_graph_refreshes_inputs_and_padding(tmp_path, state_dtype, tree):
     reference = make_case(
         tokens=8,
         head_dim=128,
+        value_head_dim=128,
         vheads=4,
         state_dtype=torch.float32,
         replay=False,

@@ -151,12 +151,14 @@ def test_wy_recurrence(dtype, state_dtype, tokens, tree, strided):
 
 
 @pytest.mark.parametrize("tree", [False, True])
-def test_wy_wide_tile_and_payload(tree):
+@pytest.mark.parametrize("tokens", [4, 8, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_wy_wide_tile_and_payload(tree, tokens, dtype):
     case = make_case(
         batch=12,
-        tokens=8,
-        dtype=torch.bfloat16,
-        state_dtype=torch.bfloat16,
+        tokens=tokens,
+        dtype=dtype,
+        state_dtype=dtype,
         tree=tree,
         strided=True,
         heads=8,
@@ -164,9 +166,10 @@ def test_wy_wide_tile_and_payload(tree):
     )
     width = 8 * 128 + 24 * 128 + 2 * 24
     backing = torch.full(
-        (12 * 8 + 2, width), float("nan"), device="cuda", dtype=torch.bfloat16
+        (12 * tokens + 2, width), float("nan"), device="cuda", dtype=dtype
     )
     case["replay_payload"] = backing[1:-1]
+    state_before = case["initial_state"].clone()
     actual = run_wy(**case)
     torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
     expected = torch.cat(
@@ -174,6 +177,7 @@ def test_wy_wide_tile_and_payload(tree):
     ).flatten(0, 1)
     assert torch.equal(case["replay_payload"], expected)
     assert backing[0].isnan().all() and backing[-1].isnan().all()
+    assert torch.equal(case["initial_state"], state_before)
 
 
 @pytest.mark.parametrize("normalize", [False, True])
@@ -571,6 +575,7 @@ def test_wy_empty_batch():
         (128, 128, 17, True, False, "flashinfer_gdn_decode_mtp"),
         (64, 128, 4, True, False, "triton_gdn_decode_mtp"),
         (128, 64, 8, True, True, "triton_gdn_decode_mtp"),
+        (128, 64, 4, True, False, "triton_gdn_decode_mtp"),
         (128, 128, 8, False, True, "triton_gdn_decode_mtp"),
         (128, 128, 8, False, False, "flashinfer_gdn_decode_mtp"),
     ],
@@ -649,6 +654,26 @@ def test_wy_explicit_solution_is_preserved():
     torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
     with pytest.raises(NoKernelFoundError):
         gdn_decode_mtp(**case, solution="flashinfer")
+
+
+def test_flashinfer_bf16_state_rejects_unsupported_value_dim(require):
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.gdn.flashinfer import flashinfer_gdn_decode_mtp
+
+    case = make_case(
+        batch=1,
+        tokens=4,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=False,
+        strided=False,
+        heads=2,
+        vheads=6,
+    )
+    case["v"] = case["v"][..., :64].contiguous()
+    case["initial_state"] = case["initial_state"][..., :64, :].contiguous()
+    with pytest.raises(NotImplementedError, match="BF16.*K=V=128"):
+        flashinfer_gdn_decode_mtp(**case)
 
 
 @pytest.mark.parametrize(
