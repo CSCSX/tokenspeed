@@ -104,7 +104,10 @@ never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 the chunked form of the delta rule, every node at once with the ancestor mask
 in place of the causal one, and keeps no node states; it also writes each
 node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
-skips the q/k/v split. In other
+skips the q/k/v split.
+The explicitly selected CuTe DSL WY leaf computes the same output-only
+operation with native TF32 MMA and can fill the same replay payload; it
+leaves state ownership and replay commit unchanged. In other
 trees the state of every branch point (a node with a child other than the next
 node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),

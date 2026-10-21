@@ -501,11 +501,13 @@ def gdn_decode_mtp(
             without it (ReplaySSM verify) the pool is left untouched, which
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
-            Runs the Triton solution; ``None`` is a chain.
+            Runs the Triton solution unless ``solution="cute_dsl"`` explicitly
+            selects output-only WY verification; ``None`` is a chain.
         replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
             num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
             the inputs' dtype, that a chunked ReplaySSM tree verify fills with
-            each token's ``[k | v | a | b]`` as read.
+            each token's ``[k | v | a | b]`` as read. The CuTe DSL solution
+            also fills this payload for a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -571,15 +573,24 @@ def gdn_decode_mtp(
                     "intermediate_states_buffer exactly when "
                     "gdn_tree_verify_needs_node_states"
                 )
-        if solution not in (None, "triton"):
+        if solution not in (None, "triton", "cute_dsl"):
             raise ValueError(
-                f"draft-tree GDN verify runs the Triton solution, got {solution}"
+                f"draft-tree GDN verify requires triton or cute_dsl, got {solution}"
             )
-        solution = "triton"
+        if solution is None:
+            solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    traits = {
+        "head_dim": head_dim,
+        "value_head_dim": v.shape[-1],
+        "verify_tokens": q.shape[1],
+        "output_only": disable_state_update
+        and intermediate_states_buffer is None
+        and output_state_indices is None
+        and output_state is None,
+    }
     if output_state is not None:
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
@@ -903,6 +914,7 @@ def gdn_replay_commit_supported(
 import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.cute_dsl  # noqa: E402,F401
 
 # isort: on
 
