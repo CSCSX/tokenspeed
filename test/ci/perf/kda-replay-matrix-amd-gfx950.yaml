@@ -202,5 +202,324 @@ perf:
       fi
     ) || true
 
+    # Counter collection runs after the uninstrumented acceptance measurements.
+    # Preserve failures as diagnostic evidence without hiding matrix failures.
+    (
+      smoke_output=.ci-artifacts/published/kda-recovery-counter-smoke
+      mkdir -p "$smoke_output"
+      cat > "$smoke_output/workload.py" <<'KDA_COUNTER_WORKLOAD'
+    # Copyright (c) 2026 LightSeek Foundation
+    #
+    # Permission is hereby granted, free of charge, to any person obtaining a copy
+    # of this software and associated documentation files (the "Software"), to deal
+    # in the Software without restriction, including without limitation the rights
+    # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    # copies of the Software, and to permit persons to whom the Software is
+    # furnished to do so, subject to the following conditions:
+    #
+    # The above copyright notice and this permission notice shall be included in
+    # all copies or substantial portions of the Software.
+    #
+    # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    # SOFTWARE.
+
+    """Run one diagnostic replay with the existing KDA benchmark fixture."""
+
+    import argparse
+    import hashlib
+    import json
+    from pathlib import Path
+
+
+    def main():
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--batch", type=int, choices=(16, 128), required=True)
+        parser.add_argument(
+            "--page-relation", choices=("distinct", "in-place"), required=True
+        )
+        args = parser.parse_args()
+
+        import torch
+        from amd.ops.attention.test_gluon_kda_replay_matrix import ReplayCase
+        from tokenspeed_kernel.benchmark.graph import (
+            GraphBenchmarkConfig,
+            GraphTimer,
+            PreparedInvocation,
+        )
+        from tokenspeed_kernel.platform import current_platform
+        from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
+
+        if torch.version.hip is None or not torch.cuda.is_available():
+            raise RuntimeError("This diagnostic requires a ROCm GPU")
+        if not current_platform().is_cdna4:
+            raise RuntimeError("This diagnostic requires gfx950")
+
+        layers = 69
+        seed = 7100
+        eager_warmups = 5
+        replay_warmups = 3
+        measured_replays = 1
+        case = ReplayCase(
+            args.batch,
+            1,
+            layers,
+            in_place=args.page_relation == "in-place",
+            seed=seed,
+        )
+        timer = GraphTimer(
+            GraphBenchmarkConfig(
+                eager_warmup_iterations=eager_warmups,
+                replay_warmup_iterations=replay_warmups,
+            )
+        )
+        timer.measure(
+            PreparedInvocation(invoke=case.lifecycle, reset=case.reset),
+            cold_cache=True,
+            measurement_blocks=measured_replays,
+        )
+        torch.cuda.synchronize()
+
+        # Construction verifies each layer once. Capture execution must be checked
+        # in the actual trace before any of these iteration positions are trusted.
+        lifecycle_calls = eager_warmups + 1 + replay_warmups + measured_replays
+        metadata = {
+            "scope": "diagnostic only; no performance acceptance from profiled timing",
+            "batch": args.batch,
+            "window_length": 1,
+            "layers": layers,
+            "seed": seed,
+            "page_relation": args.page_relation,
+            "accepted_count": 1,
+            "cache": "cold",
+            "eager_warmups": eager_warmups,
+            "replay_warmups": replay_warmups,
+            "measured_replays": measured_replays,
+            "source_sha256": hashlib.sha256(Path(decode.__file__).read_bytes()).hexdigest(),
+            "trace_hypothesis": {
+                "assumptions": "one kernel ID per family and no GPU execution during capture",
+                "verify_count": (1 + lifecycle_calls) * layers,
+                "recovery_count": lifecycle_calls,
+                "measured_verify_first": lifecycle_calls * layers + 1,
+                "measured_verify_last": (1 + lifecycle_calls) * layers,
+                "measured_recovery": lifecycle_calls,
+            },
+        }
+        print("KDA_PROFILE_WORKLOAD=" + json.dumps(metadata), flush=True)
+
+
+    if __name__ == "__main__":
+        main()
+    KDA_COUNTER_WORKLOAD
+      python3 - .ci-artifacts/published/rocprof-capabilities "$smoke_output" \
+        "$smoke_output/workload.py" <<'KDA_COUNTER_SMOKE'
+    # Copyright (c) 2026 LightSeek Foundation
+    #
+    # Permission is hereby granted, free of charge, to any person obtaining a copy
+    # of this software and associated documentation files (the "Software"), to deal
+    # in the Software without restriction, including without limitation the rights
+    # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    # copies of the Software, and to permit persons to whom the Software is
+    # furnished to do so, subject to the following conditions:
+    #
+    # The above copyright notice and this permission notice shall be included in
+    # all copies or substantial portions of the Software.
+    #
+    # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    # SOFTWARE.
+
+    """Collect a diagnostic recovery counter sample after all timing matrices."""
+
+    import argparse
+    import csv
+    import hashlib
+    import json
+    import os
+    import re
+    import signal
+    import subprocess
+    import sys
+    from collections import Counter, deque
+    from pathlib import Path
+
+
+    VERIFY = "gluon_kda_fused_paged_verify_nostore_vmajor_gfx950"
+    RECOVERY = "gluon_kda_fused_replay_gfx950"
+
+
+    def run_command(arguments: list[str], log: Path, timeout: float) -> dict:
+        result = {"arguments": arguments, "returncode": None, "timed_out": False, "error": None}
+        with log.open("w") as output:
+            try:
+                process = subprocess.Popen(
+                    arguments, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
+                )
+                try:
+                    result["returncode"] = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    result["timed_out"] = True
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # The profiler can exit before its application child exits.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    result["returncode"] = process.wait(timeout=5)
+            except OSError as error:
+                result["error"] = str(error)
+        return result
+
+
+    def summarize_csv(path: Path) -> dict:
+        counts = Counter()
+        verify_first = []
+        verify_last = deque(maxlen=4)
+        recovery = []
+        counters = []
+        graph_launches = []
+        samples = []
+        counter_count = recovery_count = graph_count = total = 0
+        with path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            fields = reader.fieldnames or []
+            for row in reader:
+                total += 1
+                if len(samples) < 2:
+                    samples.append(row)
+                name = row.get("Kernel_Name")
+                if name is not None:
+                    counts[(row.get("Kernel_Id"), name)] += 1
+                if "Counter_Name" in fields:
+                    counter_count += 1
+                    if len(counters) < 256:
+                        counters.append(row)
+                elif name is not None:
+                    if name.startswith(VERIFY):
+                        if len(verify_first) < 4:
+                            verify_first.append(row)
+                        verify_last.append(row)
+                    elif name.startswith(RECOVERY):
+                        recovery_count += 1
+                        if len(recovery) < 32:
+                            recovery.append(row)
+                if any(value and value.startswith("hipGraphLaunch") for value in row.values() if isinstance(value, str)):
+                    graph_count += 1
+                    if len(graph_launches) < 32:
+                        graph_launches.append(row)
+        return {
+            "file": path.name, "fields": fields, "row_count": total,
+            "sample_rows": samples,
+            "kernel_name_and_id_row_counts": [
+                {"kernel_id": key[0], "kernel_name": key[1], "row_count": count}
+                for key, count in counts.items()
+            ],
+            "kernel_id_column_present": "Kernel_Id" in fields,
+            "dispatch_id_column_present": "Dispatch_Id" in fields,
+            "verify_first_rows": verify_first, "verify_last_rows": list(verify_last),
+            "recovery_count": recovery_count, "recovery_rows": recovery,
+            "recovery_truncated": recovery_count > len(recovery),
+            "counter_row_count": counter_count, "counter_rows": counters,
+            "counter_rows_truncated": counter_count > len(counters),
+            "graph_launch_count": graph_count, "graph_launch_rows": graph_launches,
+            "graph_launches_truncated": graph_count > len(graph_launches),
+            "scope": "Raw CSV fields only; no dimension aggregation or dispatch-attribution claim",
+        }
+
+
+    def collect_smoke(inventory_dir: Path, output_dir: Path, workload: Path) -> dict:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report = {
+            "status": "skipped", "reasons": [], "command": None, "csv": [],
+            "scope": "Diagnostic only; instrumented timing never determines performance acceptance",
+            "attribution": "unvalidated: inspect graph API, dispatch IDs, kernel IDs and counter rows",
+            "workload_sha256": hashlib.sha256(workload.read_bytes()).hexdigest(),
+        }
+        inventory = json.loads((inventory_dir / "inventory.json").read_text())
+        report["inventory"] = {
+            key: inventory.get(key)
+            for key in ("status", "executable", "gpu_architecture", "torch_version", "hip_version")
+        }
+        report["profiler_version"] = (inventory_dir / "version.txt").read_text(errors="replace") if (inventory_dir / "version.txt").exists() else None
+        flags = ("--kernel-trace", "--hip-runtime-trace", "--pmc", "--kernel-include-regex", "--kernel-iteration-range", "--output-directory", "--output-file", "--output-format")
+        help_path = inventory_dir / "help.txt"
+        help_text = help_path.read_text(errors="replace") if help_path.exists() else ""
+        list_path = inventory_dir / "list-avail.txt"
+        counter_text = list_path.read_text(errors="replace") if list_path.exists() else ""
+        if inventory.get("status") != "inventory_complete":
+            report["reasons"].append("inventory_incomplete_or_unavailable")
+        for flag in flags:
+            if flag not in help_text:
+                report["reasons"].append(f"missing_help_flag:{flag}")
+        if re.search(r"^Counter_Name\s*:\s*SQ_WAVES\s*$", counter_text, re.MULTILINE) is None:
+            report["reasons"].append("SQ_WAVES_definition_not_found")
+        executable = inventory.get("executable")
+        if executable is None or not Path(executable).is_file() or not os.access(executable, os.X_OK):
+            report["reasons"].append("profiler_executable_unavailable")
+        if not report["reasons"]:
+            arguments = [
+                executable, "--kernel-trace", "--hip-runtime-trace", "--pmc", "SQ_WAVES",
+                "--kernel-include-regex", f"^{RECOVERY}", "--kernel-iteration-range", "10",
+                "-d", str(output_dir), "-o", "recovery", "-f", "csv", "--",
+                sys.executable, str(workload), "--batch", "128", "--page-relation", "distinct",
+            ]
+            log = output_dir / "profiler.txt"
+            report["command"] = run_command(arguments, log, 600)
+            command = report["command"]
+            report["status"] = "collected_requires_review" if command["returncode"] == 0 and not command["timed_out"] else "profiler_failed"
+            output = log.read_text(errors="replace")
+            report["log"] = {
+                "file": log.name, "chars": len(output), "head": output[:4000],
+                "tail": output[-4000:] if len(output) > 4000 else "",
+                "truncated": len(output) > 8000,
+            }
+            report["workload_metadata"] = [
+                json.loads(line.split("=", 1)[1])
+                for line in output.splitlines() if line.startswith("KDA_PROFILE_WORKLOAD=")
+            ]
+            for path in sorted(output_dir.rglob("*.csv")):
+                try:
+                    report["csv"].append(summarize_csv(path))
+                except (OSError, csv.Error, UnicodeError) as error:
+                    report["csv"].append({"file": str(path.relative_to(output_dir)), "error": str(error)})
+            if not report["csv"]:
+                report["reasons"].append("no_CSV_output")
+        report["files"] = [str(p.relative_to(output_dir)) for p in sorted(output_dir.rglob("*")) if p.is_file()]
+        return report
+
+
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("inventory_dir", type=Path)
+        parser.add_argument("output_dir", type=Path)
+        parser.add_argument("workload", type=Path)
+        args = parser.parse_args()
+        try:
+            result = collect_smoke(args.inventory_dir, args.output_dir, args.workload)
+        except Exception as error:
+            result = {"status": "error", "error": f"{type(error).__name__}: {error}"}
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
+        print("KDA_ROCPROF_SMOKE_BEGIN", flush=True)
+        print(json.dumps(result, indent=2), flush=True)
+        print("KDA_ROCPROF_SMOKE_END", flush=True)
+    KDA_COUNTER_SMOKE
+    ) || true
+
 report:
   github_step_summary: true

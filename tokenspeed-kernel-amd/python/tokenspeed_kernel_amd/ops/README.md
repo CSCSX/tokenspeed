@@ -1187,6 +1187,9 @@ run, including gate production and commit for every acceptance pattern. Both
 pass independent correctness checks before timing. Local compile
 tests check real wrapper launches for gfx950 and gfx1250 without a GPU; device
 tests remain responsible for numerical correctness and performance.
+An optional ROCm recovery counter smoke runs after both timing matrices.
+Its graph-dispatch attribution requires review; instrumented times do not
+determine performance acceptance.
 
 ## Transform
 
