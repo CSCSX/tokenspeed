@@ -1187,7 +1187,11 @@ references use the same GEMM as their producer. Reports list incomplete
 baseline checks and complete-operation regressions explicitly. A separate GFX950
 comparison pairs the current and accepted-parent records lifecycles in the same
 run, including gate production and commit for every acceptance pattern. Both
-pass independent correctness checks before timing. One-layer verify timings either
+pass independent correctness checks before timing. Each records reference loads
+its decoder and shared records helper from the same revision, in private modules.
+Reports include both source hashes and the live compiler adapter hash and versions.
+The original implementation has no records helper dependency. One-layer verify
+timings either
 exclude gate projection by supplying gates or include the automatic producer.
 Automatic rows include split and softplus controls. They validate the saved raw
 gate against FP64 before using it to check recurrence. Local compile tests check

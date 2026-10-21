@@ -62,6 +62,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
     fused_kda_verify_conv_update,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_amd._triton import triton
 from utils import assert_no_triton_compile
 
 _CONCURRENCIES = (1, 2, 4, 8, 16, 32, 64, 128)
@@ -686,7 +687,9 @@ def test_one_token_recovery_preserves_decay(lower_bound, in_place):
     if source_dir is None:
         pytest.skip("set TOKENSPEED_KDA_BASELINE_DIR to the accepted-parent source")
     parent = _original_module(
-        Path(source_dir) / "accepted-parent-kda-gfx950.py", "gfx950"
+        Path(source_dir) / "accepted-parent-kda-gfx950.py",
+        "gfx950",
+        records_source=Path(source_dir) / "accepted-parent-kda-records.py",
     )
     current = importlib.import_module(
         "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
@@ -1200,8 +1203,10 @@ def main():
     parser.add_argument("--baseline-source", type=Path, required=True)
     parser.add_argument("--baseline-revision", required=True)
     parser.add_argument("--accepted-parent-source", type=Path, required=True)
+    parser.add_argument("--accepted-parent-records-source", type=Path, required=True)
     parser.add_argument("--accepted-parent-revision", required=True)
     parser.add_argument("--trial-reference-source", type=Path, required=True)
+    parser.add_argument("--trial-reference-records-source", type=Path, required=True)
     parser.add_argument("--trial-reference-revision", required=True)
     parser.add_argument("--measurement-blocks", type=int, default=30)
     parser.add_argument("--paired-rounds", type=int, default=3)
@@ -1234,6 +1239,26 @@ def main():
             subprocess.check_output(["git", "status", "--porcelain"], cwd=root)
         ),
         "baseline_revision": args.baseline_revision,
+        "baseline_records_source_sha256": None,
+        "live_dependencies": {
+            "tokenspeed_kernel_amd._triton": {
+                "source_sha256": hashlib.sha256(
+                    (
+                        root
+                        / "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py"
+                    ).read_bytes()
+                ).hexdigest(),
+                "scope": "shared compiler adapter for original, records references and candidate",
+            },
+            "tokenspeed_triton_version": triton.__version__,
+            "torch_version": torch.__version__,
+        },
+        "candidate_records_source_sha256": hashlib.sha256(
+            (
+                root
+                / "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/_kda_records.py"
+            ).read_bytes()
+        ).hexdigest(),
         "baseline_source_sha256": hashlib.sha256(
             args.baseline_source.read_bytes()
         ).hexdigest(),
@@ -1262,6 +1287,9 @@ def main():
             "source_sha256": hashlib.sha256(
                 args.accepted_parent_source.read_bytes()
             ).hexdigest(),
+            "records_source_sha256": hashlib.sha256(
+                args.accepted_parent_records_source.read_bytes()
+            ).hexdigest(),
             "scope": "one layer; same supplied raw gate and retention; excludes gate projection and commit",
             "results": [],
         },
@@ -1271,6 +1299,9 @@ def main():
             "revision": args.accepted_parent_revision,
             "source_sha256": hashlib.sha256(
                 args.accepted_parent_source.read_bytes()
+            ).hexdigest(),
+            "records_source_sha256": hashlib.sha256(
+                args.accepted_parent_records_source.read_bytes()
             ).hexdigest(),
             "scope": "one layer; both include automatic gate production and QKV retention; excludes commit",
             "results": [],
@@ -1282,6 +1313,9 @@ def main():
             "source_sha256": hashlib.sha256(
                 args.accepted_parent_source.read_bytes()
             ).hexdigest(),
+            "records_source_sha256": hashlib.sha256(
+                args.accepted_parent_records_source.read_bytes()
+            ).hexdigest(),
             "scope": "all layers on both sides: automatic gate production, records verify and QKV retention, then one batched commit; equal work for every acceptance pattern",
             "results": [],
         },
@@ -1291,6 +1325,9 @@ def main():
             "revision": args.trial_reference_revision,
             "source_sha256": hashlib.sha256(
                 args.trial_reference_source.read_bytes()
+            ).hexdigest(),
+            "records_source_sha256": hashlib.sha256(
+                args.trial_reference_records_source.read_bytes()
             ).hexdigest(),
             "scope": "all layers on both sides: automatic gate production, records verify and QKV retention, then one batched commit; equal work for every acceptance pattern",
             "results": [],
@@ -1334,7 +1371,9 @@ def main():
                 )
                 references = {
                     name: RecordsKda(
-                        _original_module(source.resolve(), arch),
+                        _original_module(
+                            source.resolve(), arch, records_source=records_source
+                        ),
                         case.layers,
                         case.retained_qkv,
                         case.descriptors,
@@ -1346,9 +1385,17 @@ def main():
                         t,
                         lower_bound=LOWER_BOUND,
                     )
-                    for name, source in (
-                        ("accepted_parent", args.accepted_parent_source),
-                        ("trial_reference", args.trial_reference_source),
+                    for name, source, records_source in (
+                        (
+                            "accepted_parent",
+                            args.accepted_parent_source,
+                            args.accepted_parent_records_source,
+                        ),
+                        (
+                            "trial_reference",
+                            args.trial_reference_source,
+                            args.trial_reference_records_source,
+                        ),
                     )
                     if arch == "gfx950"
                 }
@@ -1373,7 +1420,9 @@ def main():
                             timer,
                             case,
                             _original_module(
-                                args.accepted_parent_source.resolve(), arch
+                                args.accepted_parent_source.resolve(),
+                                arch,
+                                records_source=args.accepted_parent_records_source,
                             ),
                             measure_options,
                             use_supplied_gate=True,
@@ -1390,7 +1439,9 @@ def main():
                                 timer,
                                 case,
                                 _original_module(
-                                    args.accepted_parent_source.resolve(), arch
+                                    args.accepted_parent_source.resolve(),
+                                    arch,
+                                    records_source=args.accepted_parent_records_source,
                                 ),
                                 measure_options,
                                 use_supplied_gate=False,

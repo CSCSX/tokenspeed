@@ -324,10 +324,14 @@ def test_kda_reference_lifecycles_launches_compile(monkeypatch, batch, window):
     if directory is None:
         pytest.skip("requires the accepted-parent and trial-reference snapshots")
     parent = _original_module(
-        Path(directory) / "accepted-parent-kda-gfx950.py", "gfx950"
+        Path(directory) / "accepted-parent-kda-gfx950.py",
+        "gfx950",
+        records_source=Path(directory) / "accepted-parent-kda-records.py",
     )
     trial = _original_module(
-        Path(directory) / "trial-reference-kda-gfx950.py", "gfx950"
+        Path(directory) / "trial-reference-kda-gfx950.py",
+        "gfx950",
+        records_source=Path(directory) / "trial-reference-kda-records.py",
     )
     current = importlib.import_module(
         "tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode"
@@ -395,3 +399,40 @@ def test_kda_reference_lifecycles_launches_compile(monkeypatch, batch, window):
         for x in layers:
             assert x["verify_output"].shape == (1, batch * window, heads, dim)
             assert x["verify_output"].dtype == x["qkv_raw"].dtype
+
+
+def test_reference_snapshots_keep_frozen_helpers_separate(tmp_path):
+    from tokenspeed_kernel_amd.ops import _kda_records
+
+    decoder = tmp_path / "decoder.py"
+    decoder.write_text(
+        "from tokenspeed_kernel_amd.ops._kda_records import ("
+        "kda_record_interval, kda_records_launch_metadata as read_metadata, "
+        "validate_kda_records_commit, validate_kda_records_verify)\n"
+        "class MetadataConsumer:\n"
+        "    metadata_callback = staticmethod(read_metadata)\n"
+        "    def __init__(self, name):\n"
+        "        self.name = name\n"
+        "    def read(self):\n"
+        "        return self.metadata_callback((1,), self, {})\n"
+    )
+    helpers = []
+    for label in ("parent", "trial"):
+        helper = tmp_path / f"{label}_records.py"
+        helper.write_text(
+            Path(_kda_records.__file__).read_text()
+            + "\ndef kda_records_launch_metadata(grid, kernel, args):\n"
+            + f"    return {{'name': '{label}:' + kernel.name}}\n"
+        )
+        helpers.append(helper)
+    parent, trial = (
+        _original_module(decoder, "gfx950", records_source=helper) for helper in helpers
+    )
+    # Execute the same consumer with two frozen dependencies and the live one.
+    # Loading the second snapshot must not replace the first or production.
+    assert parent.MetadataConsumer("verify").read() == {"name": "parent:verify"}
+    assert trial.MetadataConsumer("verify").read() == {"name": "trial:verify"}
+    live = _original_module(decoder, "gfx950", records_source=None)
+    assert live.MetadataConsumer("verify").read() == {"name": "verify"}
+    again = _original_module(decoder, "gfx950", records_source=helpers[0])
+    assert again.MetadataConsumer("commit").read() == {"name": "parent:commit"}

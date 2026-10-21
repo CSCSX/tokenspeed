@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import importlib.util
 import sys
@@ -110,11 +111,27 @@ def check_original_gate_projection(projected, f_a, f_b):
     _check_gate_rounding(projected, exact, error)
 
 
+def _original_module(source: Path, arch: str, *, records_source: Path | None):
+    """Freeze records imports before globals and decorator callbacks bind.
+
+    The compiler adapter stays live; the matrix reports its hash and versions.
+    """
+    return _load_snapshot(
+        source.resolve(),
+        arch,
+        records_source=records_source.resolve() if records_source is not None else None,
+    )
+
+
 @cache
-def _original_module(source: Path, arch: str):
-    source = source.resolve()
-    # Keep each immutable snapshot's JIT globals in a separate module.
-    identity = hashlib.sha256(str(source).encode()).hexdigest()
+def _load_snapshot(source: Path, arch: str, *, records_source: Path | None):
+    records = (
+        _original_module(records_source, "records", records_source=None)
+        if records_source is not None
+        else None
+    )
+    # Both paths identify immutable snapshots, including decorator dependencies.
+    identity = hashlib.sha256(f"{source}\0{records_source}".encode()).hexdigest()
     name = f"kda_original_{arch}_{identity}"
     spec = importlib.util.spec_from_file_location(name, source)
     if spec is None or spec.loader is None:
@@ -122,6 +139,27 @@ def _original_module(source: Path, arch: str):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     try:
+        if records is not None:
+            # Keep the builtin import protocol, scoped to this decoder only.
+            def import_records(name, globals=None, locals=None, fromlist=(), level=0):
+                if level == 0 and name == "tokenspeed_kernel_amd.ops._kda_records":
+                    if not fromlist:
+                        raise ValueError("Frozen records helpers require a from-import")
+                    return records
+                if (
+                    level == 0
+                    and name == "tokenspeed_kernel_amd.ops"
+                    and fromlist
+                    and "_kda_records" in fromlist
+                ):
+                    raise ValueError(
+                        "Import frozen helper names directly from _kda_records"
+                    )
+                return builtins.__import__(name, globals, locals, fromlist, level)
+
+            vars(module)["__builtins__"] = dict(
+                vars(builtins), __import__=import_records
+            )
         spec.loader.exec_module(module)
     except BaseException:
         del sys.modules[name]
@@ -262,7 +300,7 @@ class OriginalKda:
         accepted,
         window: int,
     ):
-        self.module = _original_module(source.resolve(), arch)
+        self.module = _original_module(source.resolve(), arch, records_source=None)
         self.verify_kernel = getattr(self.module, f"gluon_kda_fused_verify_{arch}")
         self.commit_kernel = getattr(
             self.module, f"launch_gluon_kda_fused_replay_{arch}"
