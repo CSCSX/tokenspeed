@@ -517,7 +517,10 @@ def test_idle_graph_grammar_adds_an_identity_batch():
     idle(
         executor,
         SimpleNamespace(
-            global_num_tokens=[0, 1], global_batch_size=[0, 1], all_decode_or_idle=True
+            global_num_tokens=[0, 1],
+            global_batch_size=[0, 1],
+            global_num_decodes=[0, 1],
+            all_decode_or_idle=True,
         ),
     )
     assert step.called
