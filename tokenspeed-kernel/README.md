@@ -206,6 +206,11 @@ faster iteration.
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
 
+Set `TRITON_PROTON_DISABLE=1` before importing TokenSpeed to leave the optional
+Proton profiler unloaded, for example when using an external GPU profiler.
+Proton profiling is unavailable in that process; kernel execution and shape
+capture remain available.
+
 Registration-level benchmarks combine operation-owned input and correctness
 logic with graph-replay device timing. Each operation family and mode
 contributes one benchmark generator. Suites reference them by family, mode,

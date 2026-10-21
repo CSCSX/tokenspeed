@@ -970,8 +970,9 @@ class RequestHandler:
             if not proton_available():
                 return ProfileReqOutput(
                     success=False,
-                    message="Proton is not available: the installed "
-                    "tokenspeed-triton does not provide a profiler.",
+                    message="Proton is unavailable or disabled in this process. "
+                    "Check profiler support and TRITON_PROTON_DISABLE "
+                    "before starting TokenSpeed.",
                 )
             if torch.version.hip and "HIP_VISIBLE_DEVICES" in os.environ:
                 return ProfileReqOutput(

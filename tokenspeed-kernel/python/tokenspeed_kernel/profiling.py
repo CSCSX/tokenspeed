@@ -254,9 +254,9 @@ def proton_available() -> bool:
     """Report whether the Proton profiler can be used in this process.
 
     Returns:
-        True if the vendored Triton distribution provides
-        ``tokenspeed_triton.profiler``; False otherwise (profiling calls
-        become no-ops with a warning).
+        True if the vendored Triton distribution provides Proton and it was
+        not disabled when TokenSpeed was imported. False otherwise; profiling
+        calls become no-ops with a warning.
     """
     return _HAS_PROTON
 
@@ -290,7 +290,9 @@ def start_profiling(config: ProfilingConfig | None = None) -> int | None:
         return state._session
 
     if not _HAS_PROTON:
-        warnings.warn("Proton not installed; profiling disabled", stacklevel=2)
+        warnings.warn(
+            "Proton is unavailable or disabled; profiling is inactive", stacklevel=2
+        )
         return None
 
     config = config or ProfilingConfig()

@@ -21,10 +21,15 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import tokenspeed_kernel.profiling as profiling
 import torch
+from tokenspeed_kernel._triton import _IS_NPU
 
 
 class _FakeScope:
@@ -91,6 +96,52 @@ def _reset_state():
     profiling._BOOTSTRAPPED = False
 
 
+@pytest.mark.skipif(_IS_NPU, reason="Tests the vendored GPU Triton import boundary")
+@pytest.mark.parametrize("disabled", (True, False))
+def test_disabled_proton_does_not_initialize_optional_profiler(disabled):
+    # The unit environment need not have a native profiler. Model its import-time
+    # failure while exercising the real TokenSpeed import and scope in a child.
+    code = textwrap.dedent("""
+        import importlib.abc
+        import sys
+
+        class FailingProton(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                if fullname == "tokenspeed_triton.profiler":
+                    print("PROTON_IMPORT_ATTEMPT", file=sys.stderr, flush=True)
+                    raise RuntimeError("optional native profiler initialization failed")
+                return None
+
+        sys.meta_path.insert(0, FailingProton())
+        from tokenspeed_kernel.profiling import kernel_scope
+
+        with kernel_scope("test", "unprofiled", "float32"):
+            print("SCOPED_WORKLOAD_COMPLETE", flush=True)
+    """)
+    env = dict(
+        os.environ,
+        TRITON_PROTON_DISABLE="1" if disabled else "0",
+        TOKENSPEED_KERNEL_PROFILE="0",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if disabled:
+        assert result.returncode == 0, result.stderr
+        assert "SCOPED_WORKLOAD_COMPLETE" in result.stdout
+        assert "PROTON_IMPORT_ATTEMPT" not in result.stderr
+    else:
+        assert result.returncode != 0
+        assert "PROTON_IMPORT_ATTEMPT" in result.stderr
+        assert "optional native profiler initialization failed" in result.stderr
+        assert "SCOPED_WORKLOAD_COMPLETE" not in result.stdout
+
+
 def test_start_and_stop_calls_proton(monkeypatch):
     fake = _FakeProton()
     monkeypatch.setattr(profiling, "_HAS_PROTON", True)
@@ -152,7 +203,7 @@ def test_start_warns_when_proton_missing(monkeypatch):
     monkeypatch.setattr(profiling, "_HAS_PROTON", False)
     monkeypatch.setattr(profiling, "proton", None)
 
-    with pytest.warns(UserWarning, match="Proton not installed"):
+    with pytest.warns(UserWarning, match="Proton is unavailable or disabled"):
         session = profiling.start_profiling()
 
     assert session is None

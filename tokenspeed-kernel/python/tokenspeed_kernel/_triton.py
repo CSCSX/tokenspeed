@@ -76,10 +76,14 @@ else:
     from tokenspeed_triton.language.extra import libdevice
     from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
-    try:
-        import tokenspeed_triton.profiler as proton
-    except ImportError:
+    # Proton can configure native profilers during import.
+    if triton.knobs.proton.disable:
         proton = None
+    else:
+        try:
+            import tokenspeed_triton.profiler as proton
+        except ImportError:
+            proton = None
 
 __all__ = [
     "TensorDescriptor",

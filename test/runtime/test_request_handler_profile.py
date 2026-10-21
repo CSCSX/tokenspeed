@@ -161,7 +161,7 @@ class TestRequestHandlerProtonProfile:
             result = self.handler.profile(_start_req(self.output_dir))
 
         assert not (result.success)
-        assert ("Proton is not available") in (result.message)
+        assert ("Proton is unavailable or disabled") in (result.message)
         assert not (self.handler.profile_in_progress)
 
     def test_cpu_profile_captures_a_worker_started_before_the_session(self):

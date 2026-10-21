@@ -360,6 +360,15 @@ perf:
     )
 
 
+    def failure_evidence(output: str) -> dict:
+        """Describe configuration paths visible in the complete raw failure log."""
+        return {
+            "configuration_locked": bool(re.search(CONFIGURATION_ERROR_PATTERN, output, re.IGNORECASE)),
+            "force_configure_present": "rocprofiler_force_configure" in output,
+            "proton_constructor_present": "proton::RocprofSDKProfiler" in output,
+        }
+
+
     def run_command(arguments: list[str], log: Path, timeout: float) -> dict:
         result = {"arguments": arguments, "returncode": None, "timed_out": False, "error": None}
         with log.open("w") as output:
@@ -578,6 +587,7 @@ perf:
             "loader_files": loader_files, "library_initializers": initializers,
             "initializer_count": initializer_count,
             "initializers_truncated": initializer_count > len(initializers),
+            "failure_evidence": failure_evidence(output),
             "configuration_error_pattern": CONFIGURATION_ERROR_PATTERN,
             "configuration_error_count": len(configuration_errors),
             "configuration_error_contexts": configuration_errors[:4],
@@ -662,9 +672,20 @@ perf:
                 state = ctypes.c_int(-1)
                 status = query(ctypes.byref(state))
                 policy = getenv(b"ROCPROFILER_LIBRARY_CTOR")
+                proton_disable = getenv(b"TRITON_PROTON_DISABLE")
+                libraries = set()
+                for line in Path("/proc/self/maps").read_text().splitlines():
+                    fields = line.split(maxsplit=5)
+                    if len(fields) == 6 and Path(fields[5]).name.startswith("libproton"):
+                        libraries.add(str(Path(fields[5]).resolve()))
+                boundary = sys.modules.get("tokenspeed_kernel._triton")
                 result = {
                     "stage": stage, "returncode": status, "initialized": state.value,
                     "constructor_flag": None if policy is None else policy.decode(),
+                    "proton_disable_flag": None if proton_disable is None else proton_disable.decode(),
+                    "proton_native_libraries": sorted(libraries),
+                    "tokenspeed_boundary_loaded": boundary is not None,
+                    "proton_disabled_at_boundary": None if boundary is None else boundary.proton is None,
                 }
                 print("ROCPROF_GUARD_STAGE=" + json.dumps(result), flush=True)
                 return result
@@ -674,12 +695,23 @@ perf:
                 raise RuntimeError("Profiler constructor guard preconditions were not met")
             # The first SDK remains initialized. Suppress only later constructors.
             os.environ["ROCPROFILER_LIBRARY_CTOR"] = "0"
+            # This workload uses rocprofv3; Proton must not configure another tool.
+            os.environ["TRITON_PROTON_DISABLE"] = "1"
             after = snapshot("after_guard")
-            if after["returncode"] != 0 or after["initialized"] != 1 or after["constructor_flag"] != "0":
+            if (
+                after["returncode"] != 0
+                or after["initialized"] != 1
+                or after["constructor_flag"] != "0"
+            ):
                 raise RuntimeError("Profiler constructor guard did not preserve the active SDK")
+            if after["proton_disable_flag"] != "1":
+                raise RuntimeError("Proton disable setting was not applied")
             sys.argv = sys.argv[1:]
             sys.path[0] = str(Path(sys.argv[0]).resolve().parent)
-            runpy.run_path(sys.argv[0], run_name="__main__")
+            try:
+                runpy.run_path(sys.argv[0], run_name="__main__")
+            finally:
+                snapshot("after_workload")
         """).lstrip())
 
 
@@ -689,6 +721,7 @@ perf:
         output = log.read_text(errors="replace")
         report = {
             "command": command,
+            "failure_evidence": failure_evidence(output),
             "status": "collected_requires_review" if command["returncode"] == 0 and not command["timed_out"] else "profiler_failed",
             "log": {
                 "file": log.name, "chars": len(output), "head": output[:4000],
@@ -720,7 +753,10 @@ perf:
         diagnostic: dict, arguments: list[str], output_dir: Path, help_text: str
     ) -> dict:
         gate = sdk_guard_gate(diagnostic)
-        report = {"status": "skipped", "gate": gate}
+        report = {
+            "status": "skipped", "gate": gate,
+            "scope": "Final process-map snapshots require Python cleanup; native aborts can skip them.",
+        }
         if not gate["eligible"]:
             return report
         output_dir.mkdir(parents=True, exist_ok=True)

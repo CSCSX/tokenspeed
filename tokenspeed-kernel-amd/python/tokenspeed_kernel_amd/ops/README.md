@@ -1193,8 +1193,9 @@ determine performance acceptance.
 A separate Torch import probe records loaded profiler libraries and GPU arithmetic
 completion. Its loader log helps diagnose SDK initialization failures.
 If that probe confirms duplicate SDK initialization, a separate child disables
-later SDK constructors after checking that the first SDK is active. The KDA
-retry requires a successful GPU arithmetic probe and kernel dispatch trace.
+later SDK constructors after checking that the first SDK is active. It also
+disables the unused Proton import, which can configure a second profiler.
+The KDA retry requires a successful GPU arithmetic probe and kernel dispatch trace.
 These diagnostics do not change timed workloads or installed libraries.
 
 ## Transform
