@@ -36,7 +36,9 @@ if TYPE_CHECKING:
 # Every envelope name, the default first. A model always serves ``auto``.
 # ``rl-bitwise`` is the one bitwise envelope: run and batch invariance plus
 # the trainer's operation order (``docs/design/numerics.md``).
-NUMERICS_ENVELOPES = ("auto", "rl-bitwise")
+# ``megatron-aligned`` matches a qualified fixed training recipe instead;
+# it does not inherit the batch-invariant kernel requirements below.
+NUMERICS_ENVELOPES = ("auto", "rl-bitwise", "megatron-aligned")
 
 # Envelopes that promise the bitwise contract. Selection points that pin
 # batch-invariant leaves test membership here rather than the one name, so an
@@ -119,10 +121,10 @@ def require_verified_numerics(
             logprobs fold fixed ``MEGATRON_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
-        ValueError: The envelope is not verified for this model, the
-            checkpoint is quantized (no batch-invariant quantized GEMM leaf
-            exists, so quantized linears would select shape-dependent ones),
-            or the vocabulary is not a whole number of Megatron blocks.
+        ValueError: The envelope is not verified for this model, quantization
+            is unsupported, or the RL envelope cannot partition the vocabulary
+            into its fixed log-softmax blocks. The fixed training recipe may
+            use FP8 without claiming the RL envelope's batch invariance.
     """
     if numerics == "auto":
         return
@@ -135,6 +137,16 @@ def require_verified_numerics(
             "logprob comparison against the trainer pass for it "
             "(docs/design/numerics.md, Acceptance)"
         )
+    if numerics == "megatron-aligned":
+        # This contract matches a model's fixed training recipe. It does not
+        # require batch-invariant kernels or the RL log-softmax block layout.
+        # The model still has to earn and declare this envelope above.
+        if quantization not in (None, "fp8"):
+            raise ValueError(
+                f"--numerics megatron-aligned does not support {quantization} "
+                "quantization; only unquantized and FP8 recipes are supported"
+            )
+        return
     if quantization is not None:
         raise ValueError(
             f"--numerics {numerics} serves unquantized checkpoints only: "

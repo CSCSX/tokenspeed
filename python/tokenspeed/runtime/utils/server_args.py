@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_S
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    BITWISE_ENVELOPES,
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
@@ -1741,8 +1742,10 @@ class ServerArgs:
         all-reduce that resolver auto-enables.
         """
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
-        if self.numerics != "auto":
+        if self.numerics == "rl-bitwise":
             self._resolve_rl_bitwise()
+        elif self.numerics == "megatron-aligned":
+            self._resolve_megatron_aligned()
         # Individual switches that veto a fusion resolve_communication may
         # have auto-enabled, whatever the envelope. CommManager.should_fuse
         # re-derives the veto from the switches, so the fused kernels stay off
@@ -1773,8 +1776,23 @@ class ServerArgs:
                     "performs that exchange itself and cannot be combined with it"
                 )
 
+    def _resolve_megatron_aligned(self):
+        """Preserve training rounding boundaries without promising batch invariance.
+
+        The model owns the training kernels, quantization recipe and supported
+        layouts. In particular, this does not select the RL router, slot fold,
+        sorted DSA selection, recurrent attention or vocab-block log-softmax.
+        """
+        self.disable_autotune = True
+        self.disable_tf32 = True
+        self.disable_pdl = True
+        self.enable_allreduce_fusion = False
+        self.comm_fusion_max_num_tokens = -1
+        self.mla_lora_scale = "runtime"
+        self.layer_boundary_norm = "unfused"
+
     def _resolve_rl_bitwise(self):
-        """The rl-bitwise block: every envelope beyond auto runs it."""
+        """Resolve the run, batch and trainer-order guarantees of rl-bitwise."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
         # batch-size-invariant; batch_invariant_collectives routes every
@@ -2223,7 +2241,7 @@ class ServerArgs:
                     f"ranks, but the MoE layers run with ep_size="
                     f"{self.mapping.moe.ep_size}; enable expert parallelism."
                 )
-            if self.numerics != "auto" and self.moe_combine_order != "slot":
+            if self.numerics in BITWISE_ENVELOPES and self.moe_combine_order != "slot":
                 # Under a bitwise envelope the rank-order MoE combine makes the
                 # output depend on the placement, which a rebalance changes;
                 # the slot-order combine is placement-independent. The
@@ -3849,7 +3867,9 @@ class ServerArgs:
             "trainer-operation-order switches (docs/design/numerics.md, "
             "alignment.trainer) so a teacher-forced pass reproduces the RL "
             "trainer's logprobs; a model serves it only once its profile "
-            "declares it verified.",
+            "declares it verified. megatron-aligned selects a model-qualified "
+            "fixed training recipe, including FP8, without promising batch "
+            "or prefill/decode invariance.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",

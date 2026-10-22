@@ -183,20 +183,40 @@ class TestNumericsMode:
             ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
         ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
 
-    def test_rl_bitwise_is_the_one_bitwise_envelope(self):
+    def test_numerics_modes_are_explicit(self):
         from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
-        assert (NUMERICS_ENVELOPES) == (("auto", "rl-bitwise"))
+        assert (NUMERICS_ENVELOPES) == (("auto", "rl-bitwise", "megatron-aligned"))
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="trainer-aligned")
 
-    def test_bitwise_envelopes_cover_every_pinning_envelope(self):
-        from tokenspeed.runtime.configs.numerics import (
-            BITWISE_ENVELOPES,
-            NUMERICS_ENVELOPES,
-        )
+    def test_megatron_alignment_does_not_inherit_the_rl_arithmetic(self):
+        args = ServerArgs(model="x", numerics="megatron-aligned")
+        assert args.disable_autotune
+        assert args.disable_tf32
+        assert args.disable_pdl
+        assert not args.enable_allreduce_fusion
+        assert args.comm_fusion_max_num_tokens == -1
+        assert args.mla_lora_scale == "runtime"
+        assert args.layer_boundary_norm == "unfused"
+        assert not args.batch_invariant_collectives
+        assert args.router_topk == "fused"
+        assert args.dsa_slot_order == "selection"
+        assert args.moe_combine_order == "rank"
+        assert args.logprob_order == "torch"
+        assert args.sampling_stream == "batch"
 
-        assert (BITWISE_ENVELOPES) == (set(NUMERICS_ENVELOPES) - {"auto"})
+    def test_megatron_alignment_does_not_select_a_parallel_layout(self):
+        args = ServerArgs(
+            model="x",
+            numerics="megatron-aligned",
+            world_size=8,
+            ep_size=4,
+            moe_tp_size=1,
+        )
+        assert args.mapping.moe.ep_size == 4
+        assert args.mapping.moe.tp_size == 1
+        assert args.mapping.moe.dp_size == 2
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
@@ -288,6 +308,36 @@ class TestModelVerificationGate:
             quantization="fp8",
             vocab_size=1000,
         )
+
+    def test_megatron_alignment_requires_its_own_model_verification(self):
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        for profile in (None, self._profile({"auto", "rl-bitwise"})):
+            with pytest.raises(ValueError, match="has not been verified"):
+                require_verified_numerics(
+                    "megatron-aligned",
+                    model_profile=profile,
+                    architecture="X",
+                    quantization="fp8",
+                    vocab_size=1000,
+                )
+        verified = self._profile({"auto", "megatron-aligned"})
+        for quantization in (None, "fp8"):
+            require_verified_numerics(
+                "megatron-aligned",
+                model_profile=verified,
+                architecture="X",
+                quantization=quantization,
+                vocab_size=1000,
+            )
+        with pytest.raises(ValueError, match="does not support int4"):
+            require_verified_numerics(
+                "megatron-aligned",
+                model_profile=verified,
+                architecture="X",
+                quantization="int4",
+                vocab_size=1000,
+            )
 
     def test_rl_bitwise_requires_a_verified_unquantized_model(self):
         from tokenspeed.runtime.configs.numerics import (

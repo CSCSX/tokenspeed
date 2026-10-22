@@ -8,6 +8,22 @@ invalidates the training signal.
 
 ## The contract
 
+`--numerics megatron-aligned` selects a model's fixed training arithmetic
+and quantization recipe. Its acceptance target is a frozen training forward
+under the documented hardware, shapes and parallel layout. It does not
+promise the batch, phase or topology invariance of a different deployment.
+It preserves explicit runtime MLA scaling and materialized layer-boundary
+rounding, disables autotuning and fused all-reduce/norm, and leaves router,
+attention selection, expert combination and quantization to the model's
+initialization-time capability plans. It does not select the RL router,
+slot fold, sorted DSA order or recurrent attention merely because the mode
+is non-auto. The model verification gate still applies; declaring
+`rl-bitwise` does not admit this mode. FP8 is permitted only when a model
+has independently qualified its recipe; the existing RL restrictions remain.
+
+No model is declared verified under this mode by adding the configuration
+entry. Module validation precedes registering a complete model's support.
+
 `--numerics rl-bitwise` is the one bitwise envelope. It promises, within one
 deployment (fixed world size, parallel layout, model, kernels):
 
