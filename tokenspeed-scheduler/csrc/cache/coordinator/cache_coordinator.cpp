@@ -1209,42 +1209,47 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                           const PrefixCacheIndex::CachedBlockMetadata& metadata) {
         return std::tuple{metadata.last_access_epoch, candidate_group, location.lcm_block_id, location.slot_index};
     };
-    using HostCacheValue =
-        decltype(value(std::uint32_t{}, CacheBlockLocation{}, PrefixCacheIndex::CachedBlockMetadata{}));
     struct BucketCandidates {
         std::vector<PrefixCacheIndex::EvictionCandidate> entries;
         std::size_t next{0};
     };
-    struct ParentCandidate {
-        std::optional<HostCacheValue> newest_child;
-        std::int32_t evictable_children{0};
-        bool allocated{false};
-    };
     std::vector<std::vector<BucketCandidates>> children(groups_.size());
-    std::vector<ParentCandidate> parents(static_cast<std::size_t>(host_pool_->NumLcmBlocks()) + 1);
+    auto& parents = host_parent_candidates_;
+    for (const std::int32_t parent_id : host_touched_parents_) {
+        parents[parent_id] = {};
+    }
+    host_touched_parents_.clear();
     // An eligible parent contains only unpinned cache entries. Accumulate
     // their counts and newest access while collecting each group's entries
     // once, rather than looking every child up again in a placement scan.
     for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
         ++batch.stats.group_scans;
         const GroupAllocator& allocator = groups_[group_id].Allocator();
-        // With only one requesting group, its own whole parents cannot
-        // beat its compatible children and need not enter the parent sort.
+        // The free-capacity pass exhausted every unsatisfied bucket's holes.
+        // Each fully evictable own parent therefore has a compatible child
+        // no newer than its newest child. With one requesting group the
+        // parent cannot beat that child (ties prefer one child), so omit it.
         const bool needs_parent = replacement_group_count > 1 || !needs_replacement[group_id];
         if (needs_replacement[group_id]) {
             children[group_id].resize(static_cast<std::size_t>(allocator.ShardCount()));
         }
         std::vector<PrefixCacheIndex::EvictionCandidate> entries =
             groups_[group_id].Index().EvictableCandidates(*host_pool_);
-        for (const auto& candidate : entries) {
+        if (needs_parent && !entries.empty() && parents.empty()) {
+            parents.resize(static_cast<std::size_t>(host_pool_->NumLcmBlocks()) + 1);
+        }
+        for (auto& candidate : entries) {
             if (needs_parent) {
-                ParentCandidate& parent = parents[candidate.location.lcm_block_id];
-                const HostCacheValue child_value = value(group_id, candidate.location, candidate.metadata);
+                const std::int32_t parent_id = candidate.location.lcm_block_id;
+                HostParentCandidate& parent = parents[parent_id];
+                if (parent.evictable_children == 0) {
+                    host_touched_parents_.push_back(parent_id);
+                }
                 ++parent.evictable_children;
-                parent.newest_child = parent.newest_child ? std::max(*parent.newest_child, child_value) : child_value;
+                parent.newest_access_epoch = std::max(parent.newest_access_epoch, candidate.metadata.last_access_epoch);
             }
             if (children[group_id].size() > 1) {
-                children[group_id][allocator.BucketOf(candidate.location)].entries.push_back(candidate);
+                children[group_id][allocator.BucketOf(candidate.location)].entries.push_back(std::move(candidate));
             }
         }
         if (children[group_id].size() == 1) {
@@ -1256,18 +1261,24 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             });
         }
     }
-    ++batch.stats.parent_scans;
-    std::vector<std::pair<HostCacheValue, std::int32_t>> victim_parents;
-    victim_parents.reserve(static_cast<std::size_t>(host_pool_->NumLcmBlocks()));
-    for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
-        const ParentCandidate& parent = parents[parent_id];
+    using HostParentValue = std::tuple<std::uint64_t, std::uint32_t>;
+    std::vector<std::pair<HostParentValue, std::int32_t>> victim_parents;
+    victim_parents.reserve(host_touched_parents_.size());
+    for (const std::int32_t parent_id : host_touched_parents_) {
+        ++batch.stats.parent_candidates;
+        const HostParentCandidate& parent = parents[parent_id];
         if (parent.evictable_children > 0 && parent.evictable_children == host_pool_->OccupiedCount(parent_id)) {
-            victim_parents.emplace_back(*parent.newest_child, parent_id);
+            victim_parents.emplace_back(HostParentValue{parent.newest_access_epoch, *host_pool_->BoundGroup(parent_id)},
+                                        parent_id);
         }
     }
-    std::ranges::sort(victim_parents);
-
-    std::size_t victim_index = 0;
+    // Only a batch's victims are consumed. Build a min-heap in linear time
+    // instead of sorting every eligible parent before selecting the first.
+    std::ranges::make_heap(victim_parents, std::greater{});
+    const auto discard_parent = [&] {
+        std::ranges::pop_heap(victim_parents, std::greater{});
+        victim_parents.pop_back();
+    };
     for (std::size_t i = 0; i < group_ids.size(); ++i) {
         if (batch.blocks[i]) {
             continue;
@@ -1283,11 +1294,18 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 // Another group's replacement may have rebound this parent.
                 ++candidates.next;
             }
-            while (victim_index < victim_parents.size() && parents[victim_parents[victim_index].second].allocated) {
-                ++victim_index;
+            while (!victim_parents.empty()) {
+                const auto& [parent_value, parent_id] = victim_parents.front();
+                // Candidate metadata is a snapshot: check current placement
+                // as well as destinations pinned earlier in this batch.
+                if (!parents[parent_id].allocated && host_pool_->OccupiedCount(parent_id) > 0 &&
+                    host_pool_->BoundGroup(parent_id) == std::get<1>(parent_value)) {
+                    break;
+                }
+                discard_parent();
             }
             const bool has_child = candidates.next < candidates.entries.size();
-            const bool has_parent = victim_index < victim_parents.size();
+            const bool has_parent = !victim_parents.empty();
             if (!has_child && !has_parent) {
                 continue;
             }
@@ -1295,11 +1313,14 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             // parent costs every occupied child, so its newest child sets
             // the epoch. Equal epochs prefer evicting just one child.
             if (has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
-                                                 std::get<0>(victim_parents[victim_index].first))) {
+                                                 std::get<0>(victim_parents.front().first))) {
+                // The retry above found no compatible hole. Releasing one
+                // Host child creates the only placement for its refill.
                 const CacheBlockLocation location = candidates.entries[candidates.next++].location;
                 _assert(evictHostCachedBlock(group_id, location), "selected Host child is not evictable");
             } else {
-                const auto& [parent_value, victim_parent] = victim_parents[victim_index++];
+                const auto [parent_value, victim_parent] = victim_parents.front();
+                discard_parent();
                 const std::uint32_t bound_group = std::get<1>(parent_value);
                 _assert(host_pool_->BoundGroup(victim_parent) == bound_group, "selected Host parent changed groups");
                 const std::int32_t victim_packing = groups_[bound_group].Allocator().CacheBlocksPerLcmBlock();
@@ -1316,7 +1337,14 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         }
         // The result now pins this parent; it cannot be rebound later in
         // this batch even though the new entry has not been registered yet.
-        parents[batch.blocks[i]->Location().lcm_block_id].allocated = true;
+        if (!victim_parents.empty()) {
+            const std::int32_t parent_id = batch.blocks[i]->Location().lcm_block_id;
+            HostParentCandidate& parent = parents[parent_id];
+            if (parent.evictable_children == 0 && !parent.allocated) {
+                host_touched_parents_.push_back(parent_id);
+            }
+            parent.allocated = true;
+        }
     }
     batch.stats.allocated = static_cast<std::size_t>(
         std::ranges::count_if(batch.blocks, [](const CacheBlockRef& block) { return static_cast<bool>(block); }));

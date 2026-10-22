@@ -2858,6 +2858,98 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruBatchSkipsReboundEntriesAndProtec
     EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
 }
 
+TEST(CacheCoordinatorHostReplacement, GlobalLruMixesChildAndParentVictimsAcrossBuckets) {
+    BlockPool device_pool(3, {4, 4});
+    BlockPool host_pool(3, {4, 4});
+    const std::array specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2, .shard_count = 2},
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2, .shard_count = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+    std::vector<CacheBlockRef> first_group = host_pool.AcquireBlocks(0, 8);
+    std::vector<CacheBlockRef> second_group = host_pool.AcquireBlocks(1, 4);
+    ASSERT_EQ(first_group.size(), 8u);
+    ASSERT_EQ(second_group.size(), 4u);
+    const CacheBlockLocation cold_child = first_group.front()->Location();
+    const std::int32_t cold_parent = first_group.back()->Location().lcm_block_id;
+    const std::int32_t middle_parent = second_group.front()->Location().lcm_block_id;
+    for (std::size_t i = 0; i < first_group.size(); ++i) {
+        const bool shares_cold_child = first_group[i]->Location().lcm_block_id == cold_child.lcm_block_id;
+        const std::uint64_t epoch = shares_cold_child ? (i == 0 ? 1 : 100) : 10;
+        coordinator.GroupPrefixIndex(0).Register(host_pool, first_group[i], Key("first-" + std::to_string(i), 0), epoch,
+                                                 /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                 /*newly_cached=*/nullptr);
+    }
+    for (std::size_t i = 0; i < second_group.size(); ++i) {
+        coordinator.GroupPrefixIndex(1).Register(host_pool, second_group[i], Key("second-" + std::to_string(i), 1),
+                                                 /*access_epoch=*/20, /*logical_block_index=*/-1,
+                                                 CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+    }
+    first_group.clear();
+    second_group.clear();
+
+    // Child eviction first, then whole-parent eviction opens holes in both
+    // buckets. Later requests reuse those holes and skip rebound candidates.
+    const std::array<std::uint32_t, 5> groups{0, 1, 1, 0, 0};
+    const std::array<std::int32_t, 5> buckets{0, 1, 0, 1, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    ASSERT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.blocks[0]->Location(), cold_child);
+    EXPECT_EQ(batch.blocks[1]->Location().lcm_block_id, cold_parent);
+    EXPECT_EQ(batch.blocks[2]->Location().lcm_block_id, cold_parent);
+    EXPECT_EQ(batch.blocks[3]->Location().lcm_block_id, middle_parent);
+    EXPECT_EQ(batch.blocks[4]->Location().lcm_block_id, middle_parent);
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        EXPECT_EQ(host_pool.BoundGroup(batch.blocks[i]->Location().lcm_block_id), groups[i]);
+        EXPECT_EQ(coordinator.Allocator(static_cast<std::int32_t>(groups[i])).BucketOf(batch.blocks[i]->Location()),
+                  buckets[i]);
+    }
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("first-0", 0)));
+    for (int i = 1; i < 4; ++i) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("first-" + std::to_string(i), 0)));
+    }
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 3);
+    EXPECT_EQ(batch.stats.group_scans, 2u);
+    EXPECT_EQ(batch.stats.parent_candidates, 3u);
+}
+
+TEST(CacheCoordinatorHostReplacement, GlobalLruRefreshesParentScratchBetweenBatches) {
+    for (const std::uint32_t first_group : {0u, 1u}) {
+        SCOPED_TRACE(first_group);
+        BlockPool device_pool(2, {1, 1});
+        BlockPool host_pool(2, {1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        };
+        CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+        const std::int32_t oldest_parent = HostPut(coordinator, host_pool, "oldest", 0);
+        HostPut(coordinator, host_pool, "other", 1);
+        {
+            CacheBlockRef replacement = coordinator.AcquireHostBlock(first_group, /*bucket=*/0);
+            ASSERT_TRUE(replacement);
+            ASSERT_EQ(replacement->Location().lcm_block_id, oldest_parent);
+            coordinator.GroupPrefixIndex(static_cast<std::int32_t>(first_group))
+                .Register(host_pool, replacement, Key("replacement", first_group), NextTestAccessEpoch(),
+                          /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                          /*newly_cached=*/nullptr);
+        }
+        HostHit(coordinator, host_pool, Key("other", 1), NextTestAccessEpoch());
+
+        CacheBlockRef replacement = coordinator.AcquireHostBlock(1u - first_group, /*bucket=*/0);
+
+        ASSERT_TRUE(replacement);
+        EXPECT_EQ(replacement->Location().lcm_block_id, oldest_parent);
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("replacement", first_group)));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("other", 1)));
+    }
+}
+
 TEST(CacheCoordinatorHostReplacement, GlobalLruComparesOnlyChildrenInTheRequestedBucket) {
     BlockPool device_pool(2, {2, 2});
     BlockPool host_pool(2, {2, 2});
@@ -2891,7 +2983,7 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruComparesOnlyChildrenInTheRequeste
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("other-1", 1)));
 }
 
-TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
+TEST(CacheCoordinatorHostReplacement, SingleGroupBatchUsesChildrenWithoutParentCandidates) {
     BlockPool device_pool(4, {2});
     BlockPool host_pool(2, {2});
     const std::array specs{CacheGroupSpec{
@@ -2917,7 +3009,7 @@ TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
     EXPECT_EQ(batch.stats.allocated, 3u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
-    EXPECT_EQ(batch.stats.parent_scans, 1u);
+    EXPECT_EQ(batch.stats.parent_candidates, 0u);
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) {
@@ -2946,7 +3038,7 @@ TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) 
     EXPECT_EQ(batch.stats.allocated, 1u);
     EXPECT_EQ(batch.stats.unallocated, 1u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
-    EXPECT_EQ(batch.stats.parent_scans, 1u);
+    EXPECT_EQ(batch.stats.parent_candidates, 0u);
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchGivesScarceFreeCapacityToFirstCandidateGroup) {
@@ -3024,7 +3116,7 @@ TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) 
     EXPECT_EQ(host_pool.BoundGroup(batch.blocks[2]->Location().lcm_block_id), 0u);
     EXPECT_NE(batch.blocks[0]->Location().lcm_block_id, batch.blocks[2]->Location().lcm_block_id);
     EXPECT_EQ(batch.stats.group_scans, 2u);
-    EXPECT_EQ(batch.stats.parent_scans, 1u);
+    EXPECT_EQ(batch.stats.parent_candidates, 2u);
     EXPECT_EQ(batch.stats.allocated, 3u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
 }
@@ -3049,7 +3141,7 @@ TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlace
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
 
     EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
-    EXPECT_EQ(batch.stats.parent_scans, 1u);
+    EXPECT_EQ(batch.stats.parent_candidates, 2u);
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingChoosesLowestCacheValueParent) {
@@ -3101,7 +3193,7 @@ TEST(CacheCoordinatorHostReplacement, BatchDoesNotRebindPinnedParent) {
     EXPECT_EQ(host_pool.BoundGroup(1), 0u);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
-    EXPECT_EQ(batch.stats.parent_scans, 1u);
+    EXPECT_EQ(batch.stats.parent_candidates, 1u);
     EXPECT_EQ(batch.stats.allocated, 0u);
     EXPECT_EQ(batch.stats.unallocated, 1u);
 }
