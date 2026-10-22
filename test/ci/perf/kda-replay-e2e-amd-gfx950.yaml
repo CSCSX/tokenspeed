@@ -17,7 +17,10 @@ perf:
     --baseline 3461560d467a76401ce3cb3d72742fccb05dd591
     --candidate 0737cd42c5b8b844d56c170832433da2c8240703
     --model moonshotai/Kimi-K3
-    --modes t1
+    --model-revision f831ab66814297da540d832a5235f8e904f29d06
+    --draft-model lightseekorg/kimi-k3-eagle3-mla
+    --draft-revision 4c48d2bb72134094340067e3012ebe0e822fac37
+    --modes eagle3
     --output .ci-artifacts/published/kda-replay-e2e
 report:
   github_step_summary: true

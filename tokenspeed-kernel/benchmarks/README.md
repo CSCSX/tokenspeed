@@ -157,15 +157,20 @@ and a scheduler built from that revision. It serves Kimi-K3 with BF16 activation
 TP8/EP1 and the same pinned model snapshot. The report records the actual GPU
 properties and package versions.
 
-Select modes explicitly with `--modes`. T1 and MTP3 cover concurrency 32, 64
-and 128. Native MTP3 requires a checkpoint that declares and contains MTP
-weights; the pinned public Kimi-K3 snapshot has none, so the CI task selects T1.
-MTP3 uses greedy sampling with synthetic accepted length 3.7. Each request has
-4096 input tokens and 371 output tokens; prefix caching is disabled. Both modes use main/current/current/main
-server starts, with two warmup and three measured waves per concurrency per
-start. Both arms receive identical text prompts, checked to encode to exactly 4096
-tokens, and launch from one client barrier;
-HTTP arrival and scheduler batch identity are not guaranteed.
+Select modes explicitly with `--modes t1`, `--modes mtp3` or `--modes eagle3`.
+All modes cover concurrency 32, 64 and 128. Native MTP3 requires a checkpoint
+that declares and contains MTP weights; the pinned public Kimi-K3 snapshot has
+none. The CI task selects EAGLE3 with `lightseekorg/kimi-k3-eagle3-mla`, using
+three draft steps, verify width T=4, top-k=1, greedy sampling and synthetic
+accepted length 3.7. The target revision is explicit; EAGLE3 also requires an
+explicit draft model and revision. Both arms load the same local draft snapshot,
+with unquantized draft weights and hidden-state capture at layers 2, 46 and 90.
+
+Each request has 4096 input tokens and 371 output tokens; prefix caching is
+disabled. All modes use main/current/current/main server starts, with two warmup
+and three measured waves per concurrency per start. Both arms receive identical
+text prompts, checked to encode to exactly 4096 tokens, and launch from one
+client barrier; HTTP arrival and scheduler batch identity are not guaranteed.
 
 Reported request E2E includes prefill. The report also records TTFT, output-token
 latency, throughput and observed acceptance counters from the engine metrics

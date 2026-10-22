@@ -310,7 +310,7 @@ def wait_ready(process, url, timeout):
     raise TimeoutError("Server readiness timeout")
 
 
-def serve_command(arm, args, model_revision, mode):
+def serve_command(arm, args, model_revision, draft_path, mode):
     command = [
         str(arm["python"]),
         "-m",
@@ -383,11 +383,11 @@ def serve_command(arm, args, model_revision, mode):
         "--metrics-host",
         "127.0.0.1",
     ]
-    if mode == "mtp3":
+    if mode != "t1":
         command.extend(
             [
                 "--speculative-algorithm",
-                "MTP",
+                "EAGLE3" if mode == "eagle3" else "MTP",
                 "--speculative-num-steps",
                 "3",
                 "--speculative-num-draft-tokens",
@@ -400,6 +400,17 @@ def serve_command(arm, args, model_revision, mode):
                 "gluon",
             ]
         )
+    if mode == "eagle3":
+        command.extend(
+            [
+                "--speculative-draft-model-path",
+                str(draft_path),
+                "--speculative-draft-model-quantization",
+                "unquant",
+                "--eagle3-layers-to-capture",
+                "2,46,90",
+            ]
+        )
     return command
 
 
@@ -408,9 +419,19 @@ def main():
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--modes", nargs="+", choices=("t1", "mtp3"), required=True)
+    parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--draft-model")
+    parser.add_argument("--draft-revision")
+    parser.add_argument(
+        "--modes", nargs="+", choices=("t1", "mtp3", "eagle3"), required=True
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if "eagle3" in args.modes:
+        if not args.draft_model or not args.draft_revision:
+            parser.error("EAGLE3 requires --draft-model and --draft-revision")
+    elif args.draft_model or args.draft_revision:
+        parser.error("Draft checkpoint arguments require --modes eagle3")
     root = Path.cwd()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -437,7 +458,7 @@ def main():
     }
     write_json(args.output / "report.json", report)
     import torch
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, snapshot_download
     from transformers import AutoTokenizer
 
     if torch.version.hip is None or torch.cuda.device_count() != 8:
@@ -446,18 +467,34 @@ def main():
     report["torch_version"] = torch.__version__
     report["hip_version"] = torch.version.hip
     write_json(args.output / "report.json", report)
-    config = Path(hf_hub_download(args.model, "config.json"))
+    config = Path(
+        hf_hub_download(args.model, "config.json", revision=args.model_revision)
+    )
     model_revision = config.parent.name
     report["model"] = args.model
     report["model_revision"] = model_revision
     report["model_config"] = json.loads(config.read_text())
     text_config = report["model_config"].get("text_config", report["model_config"])
+    draft_path = None
+    report["draft"] = None
+    if "eagle3" in args.modes:
+        # The serving CLI has one shared revision argument. Pass a pinned local
+        # draft snapshot so it cannot resolve against the target model's revision.
+        draft_path = Path(
+            snapshot_download(args.draft_model, revision=args.draft_revision)
+        )
+        report["draft"] = {
+            "model": args.draft_model,
+            "revision": draft_path.name,
+            "config": json.loads((draft_path / "config.json").read_text()),
+        }
     print(
         "KDA_E2E_ENV="
         + json.dumps(
             {
                 "hardware": report["hardware"],
                 "model_revision": model_revision,
+                "draft": report["draft"],
                 "num_nextn_predict_layers": text_config.get("num_nextn_predict_layers"),
                 "architectures": report["model_config"].get("architectures"),
                 "num_hidden_layers": text_config.get("num_hidden_layers"),
@@ -497,7 +534,7 @@ def main():
                 continue
             arm = arms[name]
             label = f"{mode}-{start_index}-{name}"
-            command = serve_command(arm, args, model_revision, mode)
+            command = serve_command(arm, args, model_revision, draft_path, mode)
             run = {
                 "label": label,
                 "mode": mode,
@@ -536,9 +573,9 @@ def main():
                                     raise RuntimeError(
                                         f"Unexpected prompt length: {r['usage']}"
                                     )
-                            if mode == "mtp3" and result["accepted_length"] is None:
+                            if mode != "t1" and result["accepted_length"] is None:
                                 raise RuntimeError(
-                                    "MTP acceptance counters were not exported"
+                                    "Speculative acceptance counters were not exported"
                                 )
                             filename = f"{label}-c{concurrency}-r{repetition}.json"
                             write_json(args.output / filename, result)
@@ -600,7 +637,7 @@ def main():
                         "tpot_mean_s",
                     ):
                         row[name][key] = statistics.median(w[key] for w in samples)
-                    if mode == "mtp3":
+                    if mode != "t1":
                         row[name]["accepted_length"] = statistics.mean(
                             w["accepted_length"] for w in samples
                         )
