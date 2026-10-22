@@ -1607,6 +1607,10 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
+The convolution reads row-strided fused projection slices directly and writes
+packed token rows. Consumers can split that output without another layout copy;
+the model does not compact the projection before the attention break.
+
 Prefill state staging fuses resumed conv-window copying, recurrent-state
 gather/zero, and history flags in one kernel. It preserves scheduler-owned
 block ids and arbitrary cache strides. Fresh rows never read null or stale
