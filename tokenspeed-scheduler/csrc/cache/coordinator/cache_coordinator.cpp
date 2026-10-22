@@ -33,6 +33,7 @@
 #include <iterator>
 #include <utility>
 
+#include "cache/coordinator/cache_eviction.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_matcher.h"
 #include "utils.h"
@@ -1073,216 +1074,57 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         return refs.empty() ? CacheBlockRef{} : std::move(refs.front());
     };
 
-    std::vector<std::uint32_t> group_order;
-    group_order.reserve(groups_.size());
-    std::vector<bool> seen_group(groups_.size(), false);
-    std::vector<std::vector<std::size_t>> unresolved_by_group(groups_.size());
+    std::vector<std::size_t> unresolved;
     for (std::size_t i = 0; i < group_ids.size(); ++i) {
         _assert(group_ids[i] < groups_.size(), "Host block group id out of range");
         _assert(buckets[i] >= 0 && buckets[i] < groups_[group_ids[i]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
-        if (!seen_group[group_ids[i]]) {
-            seen_group[group_ids[i]] = true;
-            group_order.push_back(group_ids[i]);
-        }
-        // Free capacity first, in candidate order.
         batch.blocks[i] = acquire_in_bucket(group_ids[i], buckets[i]);
-        if (!batch.blocks[i]) {
-            unresolved_by_group[group_ids[i]].push_back(i);
-        }
+        if (!batch.blocks[i]) unresolved.push_back(i);
     }
-
-    std::unordered_set<ContentHash> demoted;
-    std::uint64_t host_priority_version = 0;
-    const auto refresh_demotions = [&] {
-        auto current =
-            checkpoints_.DemotedHashes([&](const ContentHash& hash) { return checkpointComplete(*host_pool_, hash); });
-        if (current != demoted) {
-            demoted = std::move(current);
-            ++host_priority_version;
+    if (!unresolved.empty()) {
+        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
+        std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> demoted;
+        std::vector<std::size_t> accepted;
+        {
+            CacheEvictionPlan plan{groups_, *host_pool_, checkpoints_, /*history_eviction_drops_checkpoint=*/false};
+            std::vector<std::vector<std::int64_t>> needed(groups_.size());
+            std::vector<std::int64_t> dense(groups_.size(), 0);
+            for (std::size_t g = 0; g < groups_.size(); ++g) needed[g].assign(groups_[g].Allocator().ShardCount(), 0);
+            for (const auto index : unresolved) {
+                ++needed[group_ids[index]][buckets[index]];
+                while (!plan.Fits(needed, dense)) {
+                    const auto candidate = plan.Next();
+                    if (!candidate) break;
+                    if (plan.IsDemoted(*candidate)) demoted.insert(candidate->location);
+                    plan.Remove(candidate->group_id, candidate->location);
+                    victims.emplace_back(candidate->group_id, candidate->location);
+                }
+                if (plan.Fits(needed, dense))
+                    accepted.push_back(index);
+                else
+                    --needed[group_ids[index]][buckets[index]];
+            }
+            // Failed rows must not cause eviction, and holes in unrelated
+            // buckets must not cost useful cache when a parent cannot move.
+            std::vector<std::pair<std::uint32_t, CacheBlockLocation>> required;
+            for (auto it = victims.rbegin(); it != victims.rend(); ++it) {
+                plan.Restore(it->first, it->second);
+                if (!plan.Fits(needed, dense)) {
+                    plan.Remove(it->first, it->second);
+                    required.push_back(*it);
+                }
+            }
+            victims.assign(required.rbegin(), required.rend());
+            batch.stats.group_scans = plan.GroupScans();
+            batch.stats.candidates = plan.Candidates();
         }
-    };
-    if (std::ranges::any_of(unresolved_by_group, [](const auto& pending) { return !pending.empty(); })) {
-        refresh_demotions();
-    }
-    const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location,
-                           const PrefixCacheIndex::CachedBlockMetadata& metadata) {
-        const bool is_demoted = GroupIsState(candidate_group) && demoted.contains(metadata.content_hash);
-        return std::tuple{!is_demoted, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
-                          location.slot_index};
-    };
-    const auto lookup_value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
-        const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
-        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
-        return value(candidate_group, location, *metadata);
-    };
-    using HostCacheValue = decltype(lookup_value(std::uint32_t{}, CacheBlockLocation{}));
-
-    for (std::uint32_t group_id : group_order) {
-        std::vector<std::size_t>& unresolved = unresolved_by_group[group_id];
-        if (unresolved.empty()) {
-            continue;
-        }
-        ++batch.stats.same_group_scans;
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        if (!GroupIsState(group_id)) {
-            std::vector<std::size_t> needed(allocator.ShardCount(), 0);
-            std::vector<std::vector<CacheBlockLocation>> victims(allocator.ShardCount());
-            for (const std::size_t index : unresolved) {
-                ++needed[buckets[index]];
-            }
-            std::size_t remaining = unresolved.size();
-            {
-                // Finish the read-only traversal before evicting from its index.
-                PrefixCacheIndex::EvictionCursor cursor;
-                std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
-                while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(*host_pool_, cursor, epoch)) {
-                    batch.stats.same_group_candidates += epoch.size();
-                    for (const auto& candidate : epoch) {
-                        const std::int32_t bucket = allocator.BucketOf(candidate.location);
-                        if (needed[bucket] > 0) {
-                            victims[bucket].push_back(candidate.location);
-                            --needed[bucket];
-                            --remaining;
-                        }
-                    }
-                    epoch.clear();
-                }
-            }
-            std::vector<std::size_t> next_victim(allocator.ShardCount(), 0);
-            std::erase_if(unresolved, [&](std::size_t index) {
-                const std::int32_t bucket = buckets[index];
-                if (next_victim[bucket] == victims[bucket].size()) {
-                    return false;
-                }
-                const CacheBlockLocation location = victims[bucket][next_victim[bucket]++];
-                _assert(evictHostCachedBlock(group_id, location, false), "selected Host child is not evictable");
-                batch.blocks[index] = acquire_in_bucket(group_id, bucket);
-                _assert(static_cast<bool>(batch.blocks[index]), "evicting a Host child did not free its bucket");
-                return true;
-            });
-            continue;
-        }
-        // Checkpoint priority may change when another victim removes one of
-        // its descendants. Reevaluate State candidates for each allocation.
-        std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
-            groups_[group_id].Index().EvictableCandidates(*host_pool_);
-        batch.stats.same_group_candidates += local_victims.size();
-        std::vector<bool> consumed(local_victims.size(), false);
-        std::erase_if(unresolved, [&](std::size_t index) {
-            const std::int32_t bucket = buckets[index];
-            std::optional<std::size_t> selected;
-            for (std::size_t v = 0; v < local_victims.size(); ++v) {
-                if (!consumed[v] && allocator.BucketOf(local_victims[v].location) == bucket &&
-                    (!selected ||
-                     value(group_id, local_victims[v].location, local_victims[v].metadata) <
-                         value(group_id, local_victims[*selected].location, local_victims[*selected].metadata))) {
-                    selected = v;
-                }
-            }
-            if (!selected) {
-                return false;
-            }
-            consumed[*selected] = true;
-            const bool complete = checkpointComplete(*host_pool_, local_victims[*selected].metadata.content_hash);
-            _assert(evictHostCachedBlock(group_id, local_victims[*selected].location,
-                                         demoted.contains(local_victims[*selected].metadata.content_hash)),
-                    "Host victim changed");
-            if (complete) refresh_demotions();
-            batch.blocks[index] = acquire_in_bucket(group_id, bucket);
-            return static_cast<bool>(batch.blocks[index]);
-        });
-    }
-    const bool has_unresolved = std::ranges::any_of(
-        unresolved_by_group, [](const std::vector<std::size_t>& unresolved) { return !unresolved.empty(); });
-    if (has_unresolved) {
-        ++batch.stats.cross_group_scans;
-        std::vector<std::pair<HostCacheValue, std::int32_t>> victim_parents;
-        victim_parents.reserve(static_cast<std::size_t>(host_pool_->NumLcmBlocks()));
-        for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
-            const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(parent_id);
-            if (!bound_group ||
-                !groups_[*bound_group].Index().ParentIsFullyEvictable(
-                    *host_pool_, parent_id, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
-                continue;
-            }
-            std::optional<HostCacheValue> parent_value;
-            for (std::int32_t slot = 0; slot < groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock(); ++slot) {
-                const CacheBlockLocation location{.lcm_block_id = parent_id, .slot_index = slot};
-                if (!host_pool_->IsOccupied(location)) {
-                    continue;
-                }
-                const auto child_value = lookup_value(*bound_group, location);
-                parent_value = parent_value ? std::max(*parent_value, child_value) : child_value;
-            }
-            _assert(parent_value.has_value(), "evictable Host parent has no children");
-            victim_parents.emplace_back(*parent_value, parent_id);
-        }
-        std::ranges::sort(victim_parents);
-
-        std::size_t victim_index = 0;
-        std::uint64_t parent_priority_version = host_priority_version;
-        for (std::size_t result_index = 0; result_index < group_ids.size() && victim_index < victim_parents.size();
-             ++result_index) {
-            if (batch.blocks[result_index]) {
-                continue;
-            }
-            const std::uint32_t target_group = group_ids[result_index];
-            std::vector<std::size_t>& unresolved = unresolved_by_group[target_group];
-            while (!unresolved.empty() && victim_index < victim_parents.size()) {
-                // A previously selected parent may have removed a descendant
-                // checkpoint, changing the remaining parents' retention value.
-                if (parent_priority_version != host_priority_version) {
-                    for (std::size_t v = victim_index; v < victim_parents.size(); ++v) {
-                        const auto parent = victim_parents[v].second;
-                        const auto group = host_pool_->BoundGroup(parent);
-                        if (!group || !GroupIsState(*group)) {
-                            continue;
-                        }
-                        std::optional<HostCacheValue> current_value;
-                        for (std::int32_t slot = 0; slot < groups_[*group].Allocator().CacheBlocksPerLcmBlock();
-                             ++slot) {
-                            const CacheBlockLocation location{.lcm_block_id = parent, .slot_index = slot};
-                            if (host_pool_->IsOccupied(location)) {
-                                const auto child_value = lookup_value(*group, location);
-                                current_value = current_value ? std::max(*current_value, child_value) : child_value;
-                            }
-                        }
-                        if (current_value) {
-                            victim_parents[v].first = *current_value;
-                        }
-                    }
-                    std::sort(victim_parents.begin() + victim_index, victim_parents.end());
-                    parent_priority_version = host_priority_version;
-                }
-                const std::int32_t victim_parent = victim_parents[victim_index++].second;
-                const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(victim_parent);
-                if (!bound_group ||
-                    !groups_[*bound_group].Index().ParentIsFullyEvictable(
-                        *host_pool_, victim_parent, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
-                    continue;
-                }
-                const std::int32_t victim_packing = groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock();
-                for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
-                    const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
-                    if (host_pool_->IsOccupied(location)) {
-                        _assert(evictHostCachedBlock(
-                                    *bound_group, location,
-                                    GroupIsState(*bound_group) && !std::get<0>(lookup_value(*bound_group, location))),
-                                "selected Host parent changed before eviction");
-                    }
-                }
-                if (GroupIsState(*bound_group)) refresh_demotions();
-                // The freed parent is the pool's only empty one, so each
-                // bucket may take its share of it; the rest stay unresolved.
-                const std::size_t before = unresolved.size();
-                std::erase_if(unresolved, [&](std::size_t index) {
-                    batch.blocks[index] = acquire_in_bucket(target_group, buckets[index]);
-                    return static_cast<bool>(batch.blocks[index]);
-                });
-                _assert(unresolved.size() < before, "evicting a Host parent did not free a placement");
-                break;
-            }
+        for (const auto& [group, location] : victims)
+            FatalCheck(evictHostCachedBlock(group, location, demoted.contains(location)),
+                       "selected Host victim changed");
+        for (const auto index : accepted) {
+            batch.blocks[index] = acquire_in_bucket(group_ids[index], buckets[index]);
+            FatalCheck(static_cast<bool>(batch.blocks[index]), "planned Host placement failed");
         }
     }
     batch.stats.allocated = static_cast<std::size_t>(

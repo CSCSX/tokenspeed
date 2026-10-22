@@ -1001,8 +1001,13 @@ comparators. The rule is an eviction-time preference, not a reservation: a
 subsequent allocation may also evict the retained descendants. Complete means
 all State groups at that checkpoint; ordinary hybrid prefix matching still
 requires the associated history coverage and remains the authority on reuse.
-Current-prefix claims and pins remain protected. Host replacement uses the same checkpoint demotion
-and recency ordering, retaining its same-group-first allocation. Device hits
+Current-prefix claims and pins remain protected. Host allocation and Device
+admission share candidate ordering, checkpoint demotion, owner-bucket capacity,
+and reverse minimization through `CacheEvictionPlan`. Host allocations compare
+across groups from the first victim, so old State entries cannot reserve capacity
+while newer KV entries replace one another. Host preserves candidate order and
+partial allocation: an impossible row stays empty, and its unsatisfied demand
+never causes cache eviction. Device hits
 refresh existing Host copies without pinning or allocating them; a lifetime
 `was_acquired` bit does not outweigh recency on Host. Successful flushes
 report demoted victim selections and ancestry metadata sizes for the preceding
@@ -1019,11 +1024,12 @@ erased, or re-keyed during traversal. Commit-time index mutations happen after
 the planner is destroyed. A full traversal costs O(N), including pinned entries,
 without a separate tree lookup per epoch.
 
-Host history replacement uses the same ordered cursor to collect enough
-unpinned victims for each requested owner bucket, stopping after the last
-needed epoch. Collection finishes before eviction mutates the index. Recency
-and location tie-breaks, State-checkpoint priorities, and whole-parent
-cross-group fallback are preserved.
+Host history selection uses the same ordered cursors and shadow occupancy.
+It stops once the accepted rows fit, then restores every unnecessary victim
+before committing. Only an empty parent can move between groups. Selection
+finishes before eviction mutates an index; no whole-pool parent scan is needed.
+Host-only entries without a Device position retain an unknown position; they
+still participate in the same recency and deterministic location ordering.
 
 ## The cache pipeline: layers → group → pack → bind
 
