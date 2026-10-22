@@ -301,6 +301,8 @@ def serve_command(arm, args, model_revision, mode):
         "--trust-remote-code",
         "--sampling-backend",
         "greedy",
+        "--seed",
+        "1",
         "--disable-kvstore",
         "--kvstore-ratio",
         "0.0",
