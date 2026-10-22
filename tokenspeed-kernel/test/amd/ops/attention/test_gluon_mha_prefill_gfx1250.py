@@ -25,7 +25,7 @@ import math
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
-from utils import is_cdna5
+from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
     pytest.skip(
@@ -70,124 +70,60 @@ def _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left=-1)
 @pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
 @pytest.mark.parametrize("window_left", [-1, 64], ids=["full", "sliding"])
 def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
-    """Compile and check both prefill tile shapes.
-
-    get_config() picks between these by shape, and the wide tile only triggers
-    on a grid large enough to fill the device, which is more work than a compute
-    simulator can run. So force each configuration on a small shape instead: the
-    point is to exercise the distinct WMMA and store layouts and the launch
-    arguments, which is where a layout regression would show up.
-    """
-    device, dtype = "cuda", torch.bfloat16
-    n_q_heads, n_kv_heads = 4, 1
-    # D=128 full attention crosses the max-ILP scheduler's minimum sequence
-    # length, so this matrix compiles both scheduler policies as well.
-    seqlen = 512 if head_dim == 128 and window_left < 0 else 320
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        [seqlen], n_q_heads, n_kv_heads, head_dim, device, dtype
+    """Both WMMA layouts produce correct causal and windowed attention."""
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [513, 129], 4, 1, head_dim, "cuda", torch.bfloat16
     )
-
-    original = prefill.get_config
-    used = []
-
-    def forced(**kwargs):
-        cfg = original(**kwargs)
-        forced_cfg = cfg._replace(
-            block_m=block_m,
-            num_warps=num_warps,
-            grid=(
-                cfg.batch_size,
-                cfg.n_heads,
-                (cfg.max_seqlen + block_m - 1) // block_m,
-            ),
-        )
-        used.append(forced_cfg)
-        return forced_cfg
-
-    prefill.get_config = forced
-    try:
-        out = prefill.launch_gluon_mha_prefill_gfx1250(
-            q, k, v, cu, cu_cpu, max_seqlen, window_left=window_left
-        )
-    finally:
-        prefill.get_config = original
-
-    # Without this the test would still pass if the override silently missed and
-    # the kernel ran the other tile, reporting coverage it does not have.
-    assert used, "get_config was not called; the tile override did not take effect"
-    assert (used[-1].block_m, used[-1].num_warps) == (block_m, num_warps)
-
-    assert out.shape == q.shape
-    assert not torch.isnan(out).any()
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    out = _launch_tile(
+        q,
+        k,
+        v,
+        cu,
+        cu_cpu,
+        maximum,
+        block_m=block_m,
+        num_warps=num_warps,
+        window_left=window_left,
+        packed_gqa=False,
+        tdm_warp_hint=False,
+        reverse_q_blocks=False,
+    )
+    expected = _reference(q, k, v, cu_cpu, 4, 1, head_dim, window_left)
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
-    """Check that a full, sufficiently occupied launch selects the deep path."""
-    device = "cuda"
+    """Long prefill remains correct through automatic launch selection."""
     seqlens = [2048] * 4 if head_dim == 64 else [1024] * 8
-    n_q_heads, n_kv_heads = 8, 2
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
-    )
-
-    original_selector = prefill._select_deep_pipeline
-    selected = []
-
-    def capture_selection(**kwargs):
-        result = original_selector(**kwargs)
-        selected.append(result)
-        return result
-
-    prefill._select_deep_pipeline = capture_selection
-    try:
-        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
-    finally:
-        prefill._select_deep_pipeline = original_selector
-
-    assert selected == [True]
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    q, k, v, cu, cu_cpu, maximum = _inputs(seqlens, 8, 2, head_dim, "cuda", dtype)
+    out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8, 32])
 def test_mha_prefill_packed_gqa(dtype, group_size):
-    """Check packed (sequence, query-head) rows across GQA group sizes."""
-    device = "cuda"
-    seqlens = [257, 129]
-    n_q_heads, n_kv_heads, head_dim = group_size, 1, 128
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    """Packed query rows preserve attention across all supported group sizes."""
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [257, 129], group_size, 1, 128, "cuda", dtype
     )
-
-    original_config = prefill.get_config
-
-    def packed_config(**kwargs):
-        cfg = original_config(**kwargs)
-        block_m, num_warps = 128, 4
-        return cfg._replace(
-            block_m=block_m,
-            num_warps=num_warps,
-            packed_gqa=True,
-            grid=(
-                cfg.batch_size,
-                cfg.n_kv_heads,
-                prefill.triton_cdiv(cfg.max_seqlen * group_size, block_m),
-            ),
-        )
-
-    prefill.get_config = packed_config
-    try:
-        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
-    finally:
-        prefill.get_config = original_config
-
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    out = _launch_tile(
+        q,
+        k,
+        v,
+        cu,
+        cu_cpu,
+        maximum,
+        block_m=128,
+        num_warps=4,
+        window_left=-1,
+        packed_gqa=True,
+        tdm_warp_hint=False,
+        reverse_q_blocks=False,
+    )
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
 @pytest.mark.parametrize(
@@ -201,7 +137,8 @@ def test_mha_prefill_packed_gqa(dtype, group_size):
     ],
     ids=["full-tiles", "guarded-rows", "compact-ragged", "five-ragged", "window512"],
 )
-def test_mha_prefill_selected_packed_gqa(seqlens, window_left):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mha_prefill_selected_packed_gqa(seqlens, window_left, dtype):
     """Run the packed GQA schedule that _select_packed_gqa enables.
 
     Selection only accepts multi-thousand-token batches, so force it on small
@@ -209,7 +146,7 @@ def test_mha_prefill_selected_packed_gqa(seqlens, window_left):
     reversed query blocks, the deep pipeline for causal attention, the 32-wide
     KV tile for the 512 window, and guarded query rows for ragged lengths.
     """
-    device, dtype = "cuda", torch.bfloat16
+    device = "cuda"
     n_q_heads, n_kv_heads, head_dim = 8, 1, 128
     q, k, v, cu, cu_cpu, max_seqlen = _inputs(
         seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
@@ -380,6 +317,11 @@ def test_mha_prefill_addresses_past_four_gib():
         QK_DS_GROUP_STRIDE=0,
         NUM_WARPS=4,
         NUM_BUFFERS=2,
+        ONE_KV_TILE=True,
+        TWO_KV_TILES=True,
+        USE_TDM_Q=False,
+        uniform_seqlen=1,
+        UNIFORM_SEQLENS=False,
         num_warps=4,
         waves_per_eu=1,
         llvm_fn_attrs="",
@@ -430,6 +372,9 @@ def test_select_deep_pipeline():
         "min_positive_seqlen": 129,
         "seqlens": [4096] * 4,
         "max_seqlen": 4096,
+        "has_sink": False,
+        "has_lse": False,
+        "wide_addressing": False,
     }
     assert prefill._select_deep_pipeline(**kwargs)
     assert prefill._select_deep_pipeline(
@@ -448,10 +393,18 @@ def test_select_deep_pipeline():
         {"block_m": 128},
         {"window_left": 64},
         {"workgroups": 255},
+    ):
+        assert not prefill._select_deep_pipeline(**(kwargs | override))
+    for override in (
         {"seqlens": [4096, 3840]},
         {"seqlens": [4097] * 4, "max_seqlen": 4097},
     ):
-        assert not prefill._select_deep_pipeline(**(kwargs | override))
+        guarded_kwargs = kwargs | override
+        assert prefill._select_deep_pipeline(**guarded_kwargs)
+        for excluded in ("has_sink", "has_lse", "wide_addressing"):
+            assert not prefill._select_deep_pipeline(
+                **(guarded_kwargs | {excluded: True})
+            )
 
 
 def test_select_packed_gqa():
@@ -493,15 +446,20 @@ def test_select_packed_gqa():
     assert prefill._select_packed_gqa(
         **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
     )
+    assert prefill._select_packed_gqa(
+        **(
+            kwargs
+            | {
+                "dtype": torch.float16,
+                "seqlens": [4096] * 4,
+                "max_seqlen": 4096,
+            }
+        )
+    )
     for override in (
         {"dtype": torch.float8_e4m3fn},
         {"head_dim": 64},
         {"n_heads": 32, "n_kv_heads": 8},
-        {
-            "dtype": torch.float16,
-            "seqlens": [4096] * 4,
-            "max_seqlen": 4096,
-        },
         {"has_sink": True},
         {"packed_q_block_bytes": 2**32 + 1},
     ):
@@ -565,112 +523,58 @@ def test_select_reverse_q_blocks():
 
 
 def test_mha_prefill_reverse_counts_live_ragged_workgroups():
-    device, dtype = "cuda", torch.bfloat16
-    seqlens = [4096] + [1] * 31
-    n_q_heads, n_kv_heads, head_dim = 1, 1, 64
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    """A long request alongside one-token requests preserves each boundary."""
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [4096] + [1] * 31, 1, 1, 64, "cuda", torch.bfloat16
     )
-    assert len(seqlens) * n_q_heads * prefill.triton_cdiv(max_seqlen, 256) == 512
-
-    original_order = prefill._select_reverse_q_blocks
-    observed_workgroups = []
-
-    def capture_workgroups(**kwargs):
-        observed_workgroups.append(kwargs["workgroups"])
-        return False
-
-    prefill._select_reverse_q_blocks = capture_workgroups
-    try:
-        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
-    finally:
-        prefill._select_reverse_q_blocks = original_order
-
-    assert observed_workgroups == [47]
-    assert out.shape == q.shape
-    assert not torch.isnan(out).any()
+    out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
 # The two-head case is the same schedule at a size the MI450 simulator affords.
 @pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 2), (2, 1)], ids=["gqa4", "sim"])
 def test_mha_prefill_tdm_warp_hint_remainder(n_q_heads, n_kv_heads):
-    device, dtype = "cuda", torch.bfloat16
-    head_dim = 128
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
+    """Changing scheduling preserves outputs on partial query blocks."""
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [300, 513], n_q_heads, n_kv_heads, 128, "cuda", torch.bfloat16
     )
-
-    original_config = prefill.get_config
-    original_hint = prefill._select_tdm_warp_hint
-
-    def forced_config(**kwargs):
-        cfg = original_config(**kwargs)
-        return cfg._replace(
-            block_m=256,
-            num_warps=8,
-            grid=(
-                cfg.batch_size,
-                cfg.n_heads,
-                (cfg.max_seqlen + 255) // 256,
-            ),
-        )
-
-    prefill.get_config = forced_config
-    try:
-        prefill._select_tdm_warp_hint = lambda **_kwargs: False
-        control = prefill.launch_gluon_mha_prefill_gfx1250(
-            q, k, v, cu, cu_cpu, max_seqlen
-        )
-        prefill._select_tdm_warp_hint = lambda **_kwargs: True
-        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
-    finally:
-        prefill.get_config = original_config
-        prefill._select_tdm_warp_hint = original_hint
-
-    assert torch.equal(out, control)
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    options = dict(
+        block_m=256,
+        num_warps=8,
+        window_left=-1,
+        packed_gqa=False,
+        tdm_warp_hint=False,
+        reverse_q_blocks=False,
+    )
+    control = _launch_tile(q, k, v, cu, cu_cpu, maximum, **options)
+    out = _launch_tile(
+        q, k, v, cu, cu_cpu, maximum, **(options | {"tdm_warp_hint": True})
+    )
+    torch.testing.assert_close(out, control, rtol=0, atol=0)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
 # The two-head case is the same schedule at a size the MI450 simulator affords.
 @pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 2), (2, 1)], ids=["gqa4", "sim"])
 def test_mha_prefill_reverse_q_blocks_ragged(n_q_heads, n_kv_heads):
-    device, dtype = "cuda", torch.bfloat16
-    head_dim = 128
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
+    """Changing scheduling preserves outputs on partial query blocks."""
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [300, 513], n_q_heads, n_kv_heads, 128, "cuda", torch.bfloat16
     )
-
-    original_config = prefill.get_config
-    original_order = prefill._select_reverse_q_blocks
-
-    def forced_config(**kwargs):
-        cfg = original_config(**kwargs)
-        return cfg._replace(
-            block_m=256,
-            num_warps=8,
-            grid=(
-                cfg.batch_size,
-                cfg.n_heads,
-                (cfg.max_seqlen + 255) // 256,
-            ),
-        )
-
-    prefill.get_config = forced_config
-    try:
-        prefill._select_reverse_q_blocks = lambda **_kwargs: False
-        control = prefill.launch_gluon_mha_prefill_gfx1250(
-            q, k, v, cu, cu_cpu, max_seqlen
-        )
-        prefill._select_reverse_q_blocks = lambda **_kwargs: True
-        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
-    finally:
-        prefill.get_config = original_config
-        prefill._select_reverse_q_blocks = original_order
-
-    assert torch.equal(out, control)
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    options = dict(
+        block_m=256,
+        num_warps=8,
+        window_left=-1,
+        packed_gqa=False,
+        tdm_warp_hint=False,
+        reverse_q_blocks=False,
+    )
+    control = _launch_tile(q, k, v, cu, cu_cpu, maximum, **options)
+    out = _launch_tile(
+        q, k, v, cu, cu_cpu, maximum, **(options | {"reverse_q_blocks": True})
+    )
+    torch.testing.assert_close(out, control, rtol=0, atol=0)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
 def test_select_m_tile_gates():
@@ -691,3 +595,619 @@ def test_select_m_tile_gates():
 
     # Both satisfied.
     assert prefill._select_m_tile(batch_size=4, n_heads=32, max_seqlen=4096) == wide
+
+
+def _check_sampled_fp64(out, q, k, v, cu_cpu):
+    # Sample complete chunks at causal/tile boundaries without materializing a
+    # quadratic FP64 score tensor for every query in a long prefill.
+    assert torch.isfinite(out).all()
+    tolerance = 2e-2 if q.dtype == torch.bfloat16 else 3e-3
+    for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
+        length = end - start
+        if length == 0:
+            continue
+        for row in sorted(
+            {0, min(63, length - 1), min(127, length - 1), max(0, length - 33)}
+        ):
+            stop = min(length, row + 33)
+            expected, _ = torch_dense_attention(
+                q[start + row : start + stop].double(),
+                k[start:end].double(),
+                v[start:end].double(),
+                scale=1.0 / math.sqrt(q.shape[-1]),
+                causal_offset=row,
+                window_left=None,
+                sinks=None,
+            )
+            actual = out[start + row : start + stop].double()
+            torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+            rms_tolerance = 4e-3 if q.dtype == torch.bfloat16 else 8e-4
+            error_norm = torch.linalg.vector_norm(actual - expected)
+            reference_norm = torch.linalg.vector_norm(expected)
+            assert error_norm <= rms_tolerance * reference_norm + 1e-12
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "n_q_heads,n_kv_heads,tails",
+    [
+        (8, 8, [31, 32, 33]),
+        (32, 8, [7, 8, 9, 31, 32, 33]),
+        (8, 1, [3, 4, 5, 31, 32, 33]),
+        (32, 1, [1, 2, 31, 32, 33]),
+        (12, 4, [1, 31, 32, 33]),
+    ],
+    ids=["mha", "gqa4", "gqa8", "mqa32", "gqa3"],
+)
+def test_mha_prefill_small_query_tails(dtype, n_q_heads, n_kv_heads, tails):
+    """All heads must be written at both small-tail routing boundaries."""
+    torch.manual_seed(47)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [4096 + tail for tail in tails] + [0],
+        n_q_heads,
+        n_kv_heads,
+        128,
+        "cuda",
+        dtype,
+    )
+
+    def shifted(tensor):
+        storage = torch.empty(tensor.numel() + 1, dtype=dtype, device="cuda")
+        return storage[1:].view_as(tensor).copy_(tensor)
+
+    q, k, v = (shifted(tensor) for tensor in (q, k, v))
+    saved = [tensor.clone() for tensor in (q, k, v)]
+    prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+
+    # Retry decisions and the packed tail's head ownership must remain correct
+    # when values change in the same capture, including a return to normal data.
+    for scale in (1, 8, 1):
+        for tensor, original in zip((q, k, v), saved):
+            tensor.copy_(original)
+        q.mul_(scale)
+        k.mul_(scale)
+        output.fill_(float("nan"))
+        graph.replay()
+        _check_sampled_fp64(output, q, k, v, cu_cpu)
+        expected = output.clone()
+        for _ in range(20):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mha_prefill_query_tail_lengths_do_not_recompile(dtype):
+    """Length changes select full, small, or packed tiles within one binary."""
+    torch.manual_seed(48)
+    shapes = [
+        [4097, 3500, 3000],
+        [4104, 3501, 3001, 0],
+        [4105, 3503, 3003],
+        [4128, 3499, 2999],
+        [4129, 3498, 2998],
+    ]
+    for index, seqlens in enumerate(shapes):
+        q, k, v, cu, cu_cpu, maximum = _inputs(seqlens, 32, 8, 128, "cuda", dtype)
+        if index == 0:
+            out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                out = prefill.launch_gluon_mha_prefill_gfx1250(
+                    q, k, v, cu, cu_cpu, maximum
+                )
+        _check_sampled_fp64(out, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 1), (8, 8), (32, 8), (32, 1)])
+@pytest.mark.parametrize("input_scale", [1.0, 8.0])
+def test_mha_prefill_fp16_full_tiles(n_q_heads, n_kv_heads, input_scale):
+    # Exercise automatic selection, including the different packed group sizes.
+    torch.manual_seed(42)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [4096] * 4, n_q_heads, n_kv_heads, 128, "cuda", torch.float16
+    )
+    q.mul_(input_scale)
+    k.mul_(input_scale)
+    out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "seqlens",
+    [[851, 914, 1053], [1053] * 4, [1152, 1025, 1, 0], [1153, 1025, 1]],
+    ids=["ragged", "uniform-tail", "cutoff-empty", "above-cutoff"],
+)
+def test_mha_prefill_short_partial_tiles(dtype, seqlens):
+    torch.manual_seed(43)
+    q, k, v, cu, cu_cpu, maximum = _inputs(seqlens, 32, 8, 128, "cuda", dtype)
+    out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("input_scale", [1.0, 8.0])
+@pytest.mark.parametrize(
+    "seqlens,n_q_heads,n_kv_heads",
+    [
+        ([0, 1, 63, 64, 65, 127, 128, 513], 8, 1),
+        ([511, 385, 129], 32, 8),
+        ([512, 385, 129], 32, 8),
+        ([1536, 1200, 1000], 32, 8),
+        ([4096, 3500, 3000], 32, 8),
+        ([8193, 4097, 17, 0], 8, 1),
+        ([16384, 12289, 8193], 32, 8),
+    ],
+    ids=[
+        "short-tail-empty",
+        "below-minimum",
+        "minimum",
+        "medium",
+        "long",
+        "long-tail",
+        "16k-ragged",
+    ],
+)
+def test_mha_prefill_guarded_pipeline(
+    dtype, input_scale, seqlens, n_q_heads, n_kv_heads
+):
+    # Cover the one/two-tile fallback and the steady-state loop with independent
+    # FP64 rows, including sharp softmax distributions and both query tile sizes.
+    torch.manual_seed(45)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        seqlens, n_q_heads, n_kv_heads, 128, "cuda", dtype
+    )
+    q.mul_(input_scale)
+    k.mul_(input_scale)
+    out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize(
+    "seqlens,n_q_heads,n_kv_heads,dtype",
+    [
+        ([2048] * 4, 8, 1, torch.float16),
+        ([4096] * 4, 8, 1, torch.float16),
+        ([8192] * 2, 8, 1, torch.float16),
+        ([4096] * 4, 8, 8, torch.float16),
+        ([4096] * 4, 32, 8, torch.float16),
+        ([4096] * 4, 32, 1, torch.float16),
+        ([851, 914, 1053], 32, 8, torch.float16),
+        ([4096, 3500, 3000], 32, 8, torch.float16),
+        ([4096, 3500, 3000], 32, 8, torch.bfloat16),
+        ([0, 1, 63, 64, 65, 127, 128, 513], 8, 1, torch.float16),
+        ([0, 1, 63, 64, 65, 127, 128, 513], 8, 1, torch.bfloat16),
+    ],
+    ids=[
+        "medium",
+        "dense",
+        "long",
+        "mha",
+        "gqa4",
+        "mqa",
+        "ragged",
+        "guarded-long-fp16",
+        "guarded-long-bf16",
+        "guarded-short-fp16",
+        "guarded-short-bf16",
+    ],
+)
+def test_mha_prefill_storage_offset_repeated(seqlens, n_q_heads, n_kv_heads, dtype):
+    torch.manual_seed(44)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        seqlens, n_q_heads, n_kv_heads, 128, "cuda", dtype
+    )
+
+    def shifted(tensor):
+        result = torch.empty(
+            tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device
+        )[1:].view(tensor.shape)
+        return result.copy_(tensor)
+
+    q, k, v = (shifted(tensor) for tensor in (q, k, v))
+    expected = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    _check_sampled_fp64(expected, q, k, v, cu_cpu)
+    for _ in range(100):
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, maximum
+        )
+    # Replay with new values to detect stale data and synchronization defects.
+    q.mul_(0.5)
+    k.mul_(2.0)
+    v.neg_()
+    for _ in range(20):
+        graph.replay()
+    _check_sampled_fp64(captured, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seqlen", [8192, 8193], ids=["full", "tail"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_mha_prefill_fixed_shift_retry_graph(dtype, seqlen, head_dim):
+    """Changing logits must select a safe numerical path on every replay."""
+    torch.manual_seed(46)
+    q, k, v, cu, cu_cpu, maximum = _inputs([seqlen], 8, 1, head_dim, "cuda", dtype)
+
+    def shifted(tensor):
+        storage = torch.empty(tensor.numel() + 1, dtype=dtype, device=tensor.device)
+        return storage[1:].view_as(tensor).copy_(tensor)
+
+    q, k, v = (shifted(tensor) for tensor in (q, k, v))
+    original = [tensor.clone() for tensor in (q, k, v)]
+    prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+
+    for case in ("normal", "sharp", "large_denominator", "zero_v", "normal"):
+        for tensor, saved in zip((q, k, v), original):
+            tensor.copy_(saved)
+        if case == "sharp":
+            q.mul_(8)
+            k.mul_(8)
+        elif case in ("large_denominator", "zero_v"):
+            # The first KV tile has zero logits; later keys invalidate that
+            # shift. BF16 can underflow the reciprocal without overflowing P.
+            q.fill_(1)
+            k.zero_()
+            late_logit = (
+                (10 if head_dim == 64 else 7) if case == "large_denominator" else 16
+            )
+            k[256:].fill_(late_logit)
+            if case == "zero_v":
+                # Overflowed probabilities times zero must not leak NaNs.
+                v.zero_()
+
+        output.fill_(float("nan"))
+        graph.replay()
+        _check_sampled_fp64(output, q, k, v, cu_cpu)
+        expected = output.clone()
+        for _ in range(20):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def _launch_tile(
+    q,
+    k,
+    v,
+    cu,
+    cu_cpu,
+    maximum,
+    *,
+    block_m,
+    num_warps,
+    window_left,
+    packed_gqa,
+    tdm_warp_hint,
+    reverse_q_blocks,
+):
+    """Exercise an explicit kernel tile without replacing production selectors."""
+    output = torch.empty_like(q)
+    heads, kv_heads, dim = q.shape[1], k.shape[1], q.shape[2]
+    group = heads // kv_heads if packed_gqa else 1
+    grid = (
+        len(cu_cpu) - 1,
+        kv_heads if packed_gqa else heads,
+        prefill.triton_cdiv(maximum * group, block_m),
+    )
+    if not packed_gqa and block_m == 256:
+        grid = (grid[1], grid[2], grid[0])
+    prefill.gluon_mha_prefill_gfx1250[grid](
+        q,
+        k,
+        v,
+        cu,
+        output,
+        q,
+        q,
+        Q_STRIDE_T=q.stride(0),
+        Q_STRIDE_H=q.stride(1),
+        Q_STRIDE_D=q.stride(2),
+        K_STRIDE_T=k.stride(0),
+        K_STRIDE_H=k.stride(1),
+        K_STRIDE_D=k.stride(2),
+        V_STRIDE_T=v.stride(0),
+        V_STRIDE_H=v.stride(1),
+        V_STRIDE_D=v.stride(2),
+        N_HEADS=heads,
+        N_KV_HEADS=kv_heads,
+        HEAD_DIM=dim,
+        SM_SCALE=math.log2(math.e) / math.sqrt(dim),
+        BLOCK_M=block_m,
+        BLOCK_N=64,
+        NUM_WARPS=num_warps,
+        NUM_BUFFERS=2,
+        IS_FP8=False,
+        HAS_SINK=False,
+        HAS_LSE=False,
+        WINDOW_LEFT=window_left,
+        PACKED_GQA=packed_gqa,
+        TDM_WARP_HINT=tdm_warp_hint,
+        REVERSE_Q_BLOCKS=reverse_q_blocks,
+        DEEP_PIPELINE=False,
+        GUARDED_QUERY_ROWS=True,
+        COMPACT_RAGGED=False,
+        WIDE_ADDRESSING=False,
+        QK_VALU_GROUP_SIZE=0,
+        QK_DS_GROUP_STRIDE=0,
+        ONE_KV_TILE=maximum <= 64,
+        TWO_KV_TILES=maximum <= 128,
+        USE_TDM_Q=False,
+        uniform_seqlen=maximum,
+        UNIFORM_SEQLENS=False,
+        num_warps=num_warps,
+        waves_per_eu=1,
+        llvm_fn_attrs="amdgpu-sched-strategy=coexec",
+        enable_fp_fusion=True,
+        **prefill.sched_compile_options(),
+    )
+    return output
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "seqlens,n_q_heads,n_kv_heads,head_dim",
+    [
+        ([64] * 32, 32, 8, 128),
+        ([128] * 32, 32, 8, 128),
+        ([128] * 32, 8, 1, 128),
+        ([128] * 32, 8, 8, 128),
+        ([128] * 32, 8, 8, 64),
+        ([256] * 32, 8, 8, 128),
+        ([129, 127, 0], 32, 8, 128),
+        ([257, 65, 1, 0], 8, 1, 64),
+        ([512], 32, 8, 128),
+        ([1025, 1000, 900], 8, 8, 128),
+    ],
+    ids=[
+        "one_tile",
+        "gqa_two_tiles",
+        "mqa",
+        "mha",
+        "mha_d64",
+        "two_tiles",
+        "ragged",
+        "ragged_d64",
+        "medium_gqa",
+        "medium_ragged_mha",
+    ],
+)
+def test_mha_prefill_short_replay(dtype, seqlens, n_q_heads, n_kv_heads, head_dim):
+    """Short-prefill loads and masked stores stay correct on unaligned replay."""
+    torch.manual_seed(49)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, "cuda", dtype
+    )
+
+    def shifted(tensor):
+        storage = torch.empty(tensor.numel() + 1, dtype=dtype, device="cuda")
+        return storage[1:].view_as(tensor).copy_(tensor)
+
+    q, k, v = (shifted(tensor) for tensor in (q, k, v))
+    saved = [tensor.clone() for tensor in (q, k, v)]
+    prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    for scale in (1, 8, 1):
+        for tensor, original in zip((q, k, v), saved):
+            tensor.copy_(original)
+        q.mul_(scale)
+        k.mul_(scale)
+        output.fill_(float("nan"))
+        graph.replay()
+        _check_sampled_fp64(output, q, k, v, cu_cpu)
+        expected = output.clone()
+        for _ in range(100):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 1), (8, 8)])
+def test_mha_prefill_uniform_lengths_do_not_recompile(dtype, n_q_heads, n_kv_heads):
+    """Different uniform lengths in one tile bucket share a compiled kernel."""
+    torch.manual_seed(50)
+    for index, length in enumerate((73, 77, 81, 85)):
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            [length], n_q_heads, n_kv_heads, 128, "cuda", dtype
+        )
+        if index == 0:
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                output = prefill.launch_gluon_mha_prefill_gfx1250(
+                    q, k, v, cu, cu_cpu, maximum
+                )
+        _check_sampled_fp64(output, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("seqlen", [129, 4097])
+def test_mha_prefill_large_finite_scores(dtype, head_dim, seqlen):
+    """Large finite logits retain a unit maximum weight before normalization."""
+    torch.manual_seed(51)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [seqlen, 1, 0], 8, 1, head_dim, "cuda", dtype
+    )
+
+    def shifted(tensor):
+        storage = torch.empty(tensor.numel() + 1, dtype=dtype, device="cuda")
+        return storage[1:].view_as(tensor).copy_(tensor)
+
+    q, k, v = (shifted(tensor) for tensor in (q, k, v))
+    prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    # Equal finite scores have uniform attention over the causal prefix.
+    # Non-power-of-two mantissas expose cancellation from scaling before shift.
+    values = (
+        [
+            (-1 * 2.0**100, 1),
+            (-3 * 2.0**100, 1),
+            (3 * 2.0**100, 1),
+            (-5 * 2.0**100, 1),
+            (5 * 2.0**100, 1),
+        ]
+        if dtype == torch.bfloat16
+        else [(2047, 2047), (-2047, 2047)]
+    )
+    for q_value, k_value in values:
+        q.fill_(q_value)
+        k.fill_(k_value)
+        output.fill_(float("nan"))
+        graph.replay()
+        _check_sampled_fp64(output, q, k, v, cu_cpu)
+        expected = output.clone()
+        for _ in range(20):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 1), (8, 8), (32, 8)])
+def test_mha_prefill_compact_batch_counts_do_not_recompile(
+    dtype, n_q_heads, n_kv_heads
+):
+    """Changing request counts preserves compact mapping and its compiled binary."""
+    torch.manual_seed(52)
+    for index, batch_size in enumerate((3, 6, 7, 17)):
+        # Counts include extra grid workgroups, one-token requests and an empty
+        # request; none may overwrite a different request's query rows.
+        seqlens = [4097] + [1] * (batch_size - 2) + [0]
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            seqlens, n_q_heads, n_kv_heads, 128, "cuda", dtype
+        )
+        if index == 0:
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                output = prefill.launch_gluon_mha_prefill_gfx1250(
+                    q, k, v, cu, cu_cpu, maximum
+                )
+        _check_sampled_fp64(output, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mha_prefill_nonzero_sequence_base(dtype):
+    """Uniform requests may start after an unused prefix of the input storage."""
+    torch.manual_seed(53)
+    q, k, v, cu, cu_cpu, maximum = _inputs([11, 129, 129], 8, 1, 128, "cuda", dtype)
+    cu_cpu = cu_cpu[1:]
+    cu = cu[1:]
+    output = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    # Only the rows named by the cumulative boundaries belong to this launch.
+    expected, _ = torch_dense_attention(
+        q[11:140].double(),
+        k[11:140].double(),
+        v[11:140].double(),
+        scale=1.0 / math.sqrt(128),
+        causal_offset=0,
+        window_left=None,
+        sinks=None,
+    )
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(
+        output[11:140].double(), expected, rtol=tolerance, atol=tolerance
+    )
+    expected, _ = torch_dense_attention(
+        q[140:].double(),
+        k[140:].double(),
+        v[140:].double(),
+        scale=1.0 / math.sqrt(128),
+        causal_offset=0,
+        window_left=None,
+        sinks=None,
+    )
+    torch.testing.assert_close(
+        output[140:].double(), expected, rtol=tolerance, atol=tolerance
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "n_q_heads,n_kv_heads,lengths",
+    [
+        (16, 4, (80, 96, 112, 128)),
+        (32, 8, (80, 96, 112, 128)),
+        (64, 16, (80, 96, 112, 128)),
+        (32, 16, (96, 128)),
+        (32, 1, (80, 96, 112, 128)),
+        (32, 32, (128,)),
+    ],
+)
+def test_mha_prefill_aligned_short_queries(dtype, n_q_heads, n_kv_heads, lengths):
+    torch.manual_seed(71)
+    for index, length in enumerate(lengths):
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            [length], n_q_heads, n_kv_heads, 128, "cuda", dtype
+        )
+
+        def shifted(tensor):
+            storage = torch.empty(tensor.numel() + 1, device="cuda", dtype=dtype)
+            return storage[1:].view_as(tensor).copy_(tensor)
+
+        q, k, v = (shifted(tensor) for tensor in (q, k, v))
+        saved = [tensor.clone() for tensor in (q, k, v)]
+        if index == 0:
+            prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        for scale in (1, 8, 1):
+            for tensor, original in zip((q, k, v), saved):
+                tensor.copy_(original)
+            q.mul_(scale)
+            k.mul_(scale)
+            output.fill_(float("nan"))
+            graph.replay()
+            _check_sampled_fp64(output, q, k, v, cu_cpu)
+            expected = output.clone()
+            for _ in range(100):
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mha_prefill_medium_ragged_lengths_do_not_recompile(dtype):
+    """Neighboring ragged lengths in one geometry bucket share the same kernel."""
+    torch.manual_seed(72)
+    for index, length in enumerate((1023, 1024, 1025)):
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            [length, 1000, 900], 8, 8, 128, "cuda", dtype
+        )
+        if index == 0:
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                output = prefill.launch_gluon_mha_prefill_gfx1250(
+                    q, k, v, cu, cu_cpu, maximum
+                )
+        _check_sampled_fp64(output, q, k, v, cu_cpu)

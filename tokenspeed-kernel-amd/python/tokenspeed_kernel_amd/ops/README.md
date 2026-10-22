@@ -1109,6 +1109,65 @@ When the grid leaves CUs idle, the launcher splits the KV stream and
 most one wave of CTAs and stream at least four pages each, since every split
 pays a fixed prologue and an FP32 partial store.
 
+### gfx1250 MHA prefill
+
+The MHA prefill kernel computes causal attention over packed sequences with
+cumulative sequence boundaries. Sequence lengths may be equal or ragged. It
+supports BF16, FP16, and FP8 inputs with head dimension 64 or 128, grouped
+query heads, optional sliding windows and sinks, and natural-log LSE output.
+
+QK and PV accumulate in FP32. Probabilities round to the input dtype before
+PV. The numerical contract assumes the dot products are finite in FP32;
+FP32 softmax state preserves large finite scores by subtracting the maximum
+before scaling. The running maximum stays in unscaled score units, including
+when sinks and LSE are enabled.
+
+BF16 and FP16 share a finite set of query/key tiles and wave counts. Short
+sequences use one- and two-key-tile schedules with TDM query loads and fused
+K/V loads. Larger batches use wider query tiles to amortize the K/V stream;
+smaller batches use more workgroups to occupy the device. Power-of-two GQA
+groups of up to 32 heads can share a workgroup, packing token/head pairs into
+the matrix rows. Other groups retain separate query-head workgroups.
+Aligned short single-sequence requests can use 64-row tiles instead of
+32-row tiles, reducing workgroup overhead while retaining masked tail handling.
+Short schedules that preload Q with K/V complete all TDM transfers before
+reading Q, so subsequent shared-memory reads omit redundant TDM waits. Medium
+ragged MHA batches and small batches up to 512 tokens can use 64-row query
+and key tiles to expose more workgroups.
+
+Long sequences use the K-ahead/V-behind pipeline. It finishes the previous
+tile's probability sum and conversion before computing the next QK tile.
+Separate-head launches with 256-row tiles advance heads first, then query
+tiles, then sequences. Other launches retain batch/head/query order. Full
+query tiles omit row bounds; short tails can use a smaller 32-row matrix.
+These decisions use device sequence lengths within the same launch.
+Full four-wave, 128-row pipelines alternate row blocks in the WMMA register
+layout. QK and PV share that row order so their softmax state needs no extra
+layout conversion. Short schedules retain their original register layout.
+
+Strongly imbalanced ragged batches compact their live query tiles onto the
+launch grid. The kernel obtains the request count from the grid at runtime,
+walks cumulative sequence boundaries, and skips the rounded grid's empty
+slots. Uniform lengths are also runtime scalars. Neither a new request count
+nor a new length alone introduces a JIT specialization; tile and feature
+choices remain finite compile-time classes.
+
+Four-wave causal pipelines with 64- or 128-key tiles can hold the first
+maximum fixed, avoiding later maximum reductions and accumulator rescaling.
+This changes probability rounding, so results are tolerance-equivalent to
+online softmax rather than bitwise identical.
+
+| Numerical mode | Prerequisites | State and retry contract |
+| --- | --- | --- |
+| Online softmax | General path, including short schedules | Update the unscaled maximum per key tile; subtract it before scaling, rescale FP32 state, and round probabilities before PV. |
+| Fixed first-tile shift | BF16/FP16, four waves, head dimension 64 or 128, no sliding window, at least three key tiles | Use online softmax on the first tile and its fixed shift thereafter. Accept only rows with absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. The shift bound limits cancellation in fused scale-minus-shift arithmetic. |
+| Online retry | Any valid row in a fixed-shift workgroup fails a guard | Recompute that workgroup with subtract-before-scale online softmax in the same launch and buffers, then overwrite its provisional output. NaN-propagating reductions detect invalid output; the denominator bound prevents reciprocal underflow. |
+
+Sinks and natural-log LSE retain their semantics. Masked tail rows start at
+the most negative finite FP32 value and do not participate in retry decisions.
+Selection uses current tensor values on every graph replay; high-range
+inputs can pay for both passes.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
