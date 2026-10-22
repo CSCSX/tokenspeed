@@ -200,12 +200,12 @@ def counters(text):
     return result
 
 
-async def wave(url, payloads, output_tokens):
+async def wave(url, metrics_url, payloads, output_tokens):
     timeout = aiohttp.ClientTimeout(total=1800)
     async with aiohttp.ClientSession(
         timeout=timeout, connector=aiohttp.TCPConnector(limit=len(payloads))
     ) as session:
-        async with session.get(f"{url}/metrics") as response:
+        async with session.get(metrics_url) as response:
             response.raise_for_status()
             before = await response.text()
         gate = asyncio.Event()
@@ -221,7 +221,7 @@ async def wave(url, payloads, output_tokens):
         gate.set()
         requests = await asyncio.gather(*tasks)
         elapsed = time.perf_counter() - started
-        async with session.get(f"{url}/metrics") as response:
+        async with session.get(metrics_url) as response:
             response.raise_for_status()
             after = await response.text()
     initial, final = counters(before), counters(after)
@@ -338,6 +338,10 @@ def serve_command(arm, args, model_revision, mode):
         "--gateway-startup-timeout",
         "600",
         "--enable-metrics",
+        "--metrics-port",
+        "21001",
+        "--metrics-host",
+        "127.0.0.1",
     ]
     if mode == "mtp3":
         command.extend(
@@ -364,6 +368,7 @@ def main():
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--modes", nargs="+", choices=("t1", "mtp3"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     root = Path.cwd()
@@ -380,7 +385,7 @@ def main():
         "concurrency": [32, 64, 128],
         "tp": 8,
         "ep": 1,
-        "modes": ["t1", "mtp3"],
+        "modes": args.modes,
         "synthetic_acceptance_length": 3.7,
         "warmup_waves": 2,
         "measured_waves_per_start": 3,
@@ -406,21 +411,24 @@ def main():
     report["model"] = args.model
     report["model_revision"] = model_revision
     report["model_config"] = json.loads(config.read_text())
+    text_config = report["model_config"].get("text_config", report["model_config"])
     print(
         "KDA_E2E_ENV="
         + json.dumps(
             {
                 "hardware": report["hardware"],
                 "model_revision": model_revision,
-                "num_nextn_predict_layers": report["model_config"].get(
-                    "num_nextn_predict_layers"
-                ),
+                "num_nextn_predict_layers": text_config.get("num_nextn_predict_layers"),
                 "architectures": report["model_config"].get("architectures"),
+                "num_hidden_layers": text_config.get("num_hidden_layers"),
+                "linear_attn_config": text_config.get("linear_attn_config"),
             }
         ),
         flush=True,
     )
     write_json(args.output / "report.json", report)
+    if "mtp3" in args.modes and not text_config.get("num_nextn_predict_layers", 0):
+        raise ValueError("The model checkpoint declares no native MTP layers")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, revision=model_revision, trust_remote_code=True
     )
@@ -456,6 +464,8 @@ def main():
     report["status"] = "running"
     write_json(args.output / "report.json", report)
     url = "http://127.0.0.1:21000"
+    metrics_url = "http://127.0.0.1:21001/metrics"
+    report["metrics_url"] = metrics_url
     failed_arms = set()
     for mode in report["modes"]:
         for start_index, name in enumerate(report["server_order"]):
@@ -489,7 +499,9 @@ def main():
                     run["status"] = "measuring"
                     for concurrency in report["concurrency"]:
                         for repetition in range(5):
-                            result = asyncio.run(wave(url, payloads[:concurrency], 371))
+                            result = asyncio.run(
+                                wave(url, metrics_url, payloads[:concurrency], 371)
+                            )
                             result.update(
                                 concurrency=concurrency,
                                 repetition=repetition,

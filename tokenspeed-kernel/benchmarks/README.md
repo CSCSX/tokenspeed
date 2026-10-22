@@ -157,15 +157,18 @@ and a scheduler built from that revision. It serves Kimi-K3 with BF16 activation
 TP8/EP1 and the same pinned model snapshot. The report records the actual GPU
 properties and package versions.
 
-Both T1 and MTP3 cover concurrency 32, 64 and 128. MTP3 uses greedy sampling
-with synthetic accepted length 3.7. Each request has 4096 input tokens and 371
-output tokens; prefix caching is disabled. Both modes use main/current/current/main
+Select modes explicitly with `--modes`. T1 and MTP3 cover concurrency 32, 64
+and 128. Native MTP3 requires a checkpoint that declares and contains MTP
+weights; the pinned public Kimi-K3 snapshot has none, so the CI task selects T1.
+MTP3 uses greedy sampling with synthetic accepted length 3.7. Each request has
+4096 input tokens and 371 output tokens; prefix caching is disabled. Both modes use main/current/current/main
 server starts, with two warmup and three measured waves per concurrency per
 start. Requests have identical token IDs and launch from one client barrier;
 HTTP arrival and scheduler batch identity are not guaranteed.
 
 Reported request E2E includes prefill. The report also records TTFT, output-token
-latency, throughput and observed acceptance counters. This is a comparison of
+latency, throughput and observed acceptance counters from the engine metrics
+port, separately from the HTTP gateway. This is a comparison of
 complete branches, including their scheduler differences, rather than an isolated
 KDA attribution or natural-acceptance accuracy test. Startup failures and
 incomplete waves remain failures; they do not produce speedup claims.
