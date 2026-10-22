@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.conv import (
     inkling_ring_sconv,
     seq_idx_from_cu_seqlens,
 )
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="sconv tests require a CUDA GPU."
@@ -860,8 +861,6 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
     split a stream's channels, a second field dtype takes its own table, ring
     rows wrap, positions before 0 are zeros, and padded rows and hole live
     blocks write nothing."""
-    from unittest.mock import patch
-
     from tokenspeed_kernel.ops.conv.triton import _inkling_ring_commit_kernel
 
     torch.manual_seed(9)
@@ -920,10 +919,7 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
             verify_width=k,
         )
 
-    compile_ = _inkling_ring_commit_kernel._do_compile
-    with patch.object(
-        _inkling_ring_commit_kernel, "_do_compile", wraps=compile_
-    ) as compiled:
+    with assert_no_triton_compile(_inkling_ring_commit_kernel):
         for bs in (1, 2, 16):
             inkling_ring_commit(
                 ring,
@@ -934,7 +930,6 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
                 torch.ones(bs, device=device, dtype=torch.int32),
                 verify_width=k,
             )
-    assert compiled.call_count == 0
 
 
 def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
