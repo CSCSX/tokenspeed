@@ -402,10 +402,11 @@ def inkling_ring_commit(
         tables: :func:`inkling_commit_tables` of ``ring``.
         live_pages: Int32 ``[G, >= B]`` live block per group and request,
             request-contiguous; entries ``<= 0`` are holes and store nothing.
-        cache_indices: Int32 ``[B]`` ring slot per request; ``PAD_SLOT_ID``
-            rows store nothing.
-        seq_lens: Integer ``[B]`` lengths through the verify chunk.
-        accepted_lengths: Integer ``[B]`` accepted tokens per request.
+        cache_indices: Contiguous int32 ``[B]`` ring slot per request;
+            ``PAD_SLOT_ID`` rows store nothing.
+        seq_lens: Contiguous integer ``[B]`` lengths through the verify chunk.
+        accepted_lengths: Contiguous integer ``[B]`` accepted tokens per
+            request.
         verify_width: Tokens per request in the verify chunk.
     """
     num_reqs = accepted_lengths.shape[0]
@@ -413,6 +414,10 @@ def inkling_ring_commit(
         return
     if live_pages.stride(-1) != 1:
         raise ValueError("live_pages must be request-contiguous")
+    if not all(v.is_contiguous() for v in (cache_indices, seq_lens, accepted_lengths)):
+        raise ValueError(
+            "cache_indices, seq_lens and accepted_lengths must be contiguous"
+        )
     enable_pdl = pdl_enabled()
     for table in tables:
         block_c = min(1024, _triton_lang.next_power_of_2(table.max_width))

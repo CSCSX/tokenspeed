@@ -908,6 +908,17 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
     # Every written page changed; the others kept the sentinel.
     assert not torch.equal(k_planes[7], torch.full_like(k_planes[7], 7.0))
     assert torch.equal(k_planes[3], torch.full_like(k_planes[3], 7.0))
+    # The kernel indexes request vectors by row, so a strided one is refused.
+    with pytest.raises(ValueError, match="contiguous"):
+        inkling_ring_commit(
+            ring,
+            tables,
+            live_pages,
+            cache_indices,
+            seq_lens,
+            accepted.repeat_interleave(2)[::2],
+            verify_width=k,
+        )
 
     compile_ = _inkling_ring_commit_kernel._do_compile
     with patch.object(
