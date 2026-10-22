@@ -189,6 +189,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         layer_id: int,
         layer_count: int,
         replicate_for_owned_rows: bool,
+        gather_single_rows: bool,
     ) -> None:
         # Replicate pre-/post-expert weights to avoid gathers and project owned rows.
         mapping = global_server_args_dict.get("mapping")
@@ -225,7 +226,14 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         )
         self.rank = tp_rank
         self.group = tp_group
+        if gather_single_rows and replicate_for_owned_rows:
+            raise ValueError(
+                "gather_single_rows applies only to projections without a column view"
+            )
         self.gather_column_view = replicated and replicate_for_owned_rows
+        # One row measured faster projecting this rank's columns through the
+        # all-reduce than streaming the replicated weight; two or more slower.
+        self.gather_single_rows = replicated and gather_single_rows
         self.workspace = None
         self.multicast = None
         if tp_size > 1 and (not replicated or self.gather_column_view):
@@ -291,9 +299,23 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         return self.weight[self.rank * width : (self.rank + 1) * width]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the projection and return complete full-width rows."""
+        """Apply the projection and return complete full-width rows.
+
+        One-row and gathered results may borrow Iris storage that the group's
+        next collective overwrites, so consume them first.
+        """
         weight = self._local_weight()
         if self.workspace is None:
+            rows = (
+                _acquire_all_reduce_output((1, self.output_size), x, self.group)
+                if self.gather_single_rows and x.shape[0] == 1
+                else None
+            )
+            if rows is not None:
+                width = self.output_size // len(self.group)
+                return self._gather_through_all_reduce(
+                    x, weight[self.rank * width : (self.rank + 1) * width], rows
+                )
             return (
                 self._project(x, weight, None)
                 if current_platform().is_cdna4 or self.gather_column_view
@@ -345,15 +367,11 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             if current_platform().is_cdna4
             else None
         )
-        direct = rows is not None
-        if rows is None:
-            rows = self.workspace[:tokens]
-        else:
-            rows.zero_()
+        if rows is not None:
+            return self._gather_through_all_reduce(x, weight, rows)
+        rows = self.workspace[:tokens]
         local = rows[:, self.rank * local_width : (self.rank + 1) * local_width]
         self._project(x, weight, local)
-        if direct:
-            return _muse_all_reduce(self.iris_state, (rows,), self.group)[0]
 
         # Allocate before the collective so a failure cannot strand peer blocks.
         owned = torch.empty_like(rows)
@@ -367,6 +385,21 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             rows.zero_()
             return owned
         return gathered
+
+    def _gather_through_all_reduce(
+        self, x: torch.Tensor, weight: torch.Tensor, rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Project this rank's columns into zeroed all-reduce ``rows``; the sum is the gather.
+
+        Each output column keeps the dot product of the full projection, and
+        adding zeros is exact, so the rows equal the replicated projection
+        (negative zeros come back as zero) while both GEMV shapes share one
+        kernel geometry.
+        """
+        width = weight.shape[0]
+        rows.zero_()
+        self._project(x, weight, rows[:, self.rank * width : (self.rank + 1) * width])
+        return _muse_all_reduce(self.iris_state, (rows,), self.group)[0]
 
     def forward_owned_rows(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Project complete owned rows through an already replicated weight."""
@@ -1054,6 +1087,7 @@ class MuseSparkMoE(nn.Module):
             layer_id=layer_id,
             layer_count=config.num_hidden_layers,
             replicate_for_owned_rows=True,
+            gather_single_rows=False,
         )
         self.pre_expert_norm = MuseSparkRMSNorm(
             hidden_size=compressed_size,
@@ -1130,6 +1164,7 @@ class MuseSparkMoE(nn.Module):
             layer_id=layer_id,
             layer_count=config.num_hidden_layers,
             replicate_for_owned_rows=False,
+            gather_single_rows=True,
         )
         # Decode-sized batches route in the top-k kernel; each token count keeps its own GEMM workspace.
         self.prepared_routing: dict[int, PreparedNvfp4Routing] = {}

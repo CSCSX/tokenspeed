@@ -1399,6 +1399,7 @@ def _shard_linear(
     linear.workspace = None
     linear.multicast = None
     linear.gather_column_view = False
+    linear.gather_single_rows = False
     return linear
 
 
@@ -1559,6 +1560,105 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
         dist.destroy_process_group()
 
 
+def _single_row_gather_worker(rank: int, port: int, world_size: int) -> None:
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        device = torch.device("cuda", rank)
+        state = prepare_muse_communication(
+            enable_lamport=True,
+            owned_route_max_rows=0,
+            all_reduce=None,
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=128 * 4096,
+            producer_direct_max_numel=128 * 4096,
+            device=device,
+        )
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device(device):
+            linear = module._MuseGatheredLinear(
+                input_size=4096,
+                output_size=8192,
+                prefix="model.layers.0.mlp.post_expert_proj",
+                tp_rank=rank,
+                tp_size=world_size,
+                tp_group=tuple(range(world_size)),
+                layer_id=0,
+                layer_count=1,
+                replicate_for_owned_rows=False,
+                gather_single_rows=True,
+            )
+        assert linear.gather_single_rows and linear.weight.shape == (8192, 4096)
+        linear.iris_state = state
+        generator = torch.Generator(device=device).manual_seed(20261022)
+        linear.weight.data.copy_(
+            torch.randn(8192, 4096, device=device, generator=generator) / 64
+        )
+        x = torch.empty(1, 4096, device=device)
+        with pytest.MonkeyPatch.context() as patch:
+            # The serving backend lends these producer views to the projection.
+            patch.setattr(
+                module,
+                "_acquire_all_reduce_output",
+                lambda shape, like, group: state.all_reduce.acquire_outputs((shape,))[
+                    0
+                ],
+            )
+
+            def check(run) -> None:
+                # Four calls wrap the three-stage Lamport counters; the NaN
+                # poison catches a slot the projection did not clear or write.
+                for step in range(4):
+                    x.copy_(torch.randn(1, 4096, device=device, generator=generator))
+                    expected = linear._project(x, linear.weight, None)
+                    state.all_reduce.producer.data.fill_(torch.nan)
+                    assert torch.equal(run(), expected), step
+
+            check(lambda: linear(x))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = linear(x)
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            def replay() -> torch.Tensor:
+                graph.replay()
+                return captured
+
+            check(replay)
+            torch.cuda.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+@requires_gpu
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_post_expert_single_row_gather_matches_replicated_projection(
+    world_size,
+) -> None:
+    if not current_platform().is_cdna4 or torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CDNA4 GPUs")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    mp.spawn(
+        _single_row_gather_worker,
+        args=(port, world_size),
+        nprocs=world_size,
+        join=True,
+    )
+
+
 @requires_gpu
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(world_size) -> None:
@@ -1602,6 +1702,7 @@ def test_replicated_pool_preserves_column_projection_after_reload(
         pre_expert = pre_expert.cuda()
         pre_expert.rank, pre_expert.group = rank, tuple(range(world_size))
         pre_expert.gather_column_view = True
+        pre_expert.gather_single_rows = False
         pre_expert.workspace = None
         pre_expert.multicast = None
         reference = _shard_linear(4096, 8192, rank, world_size).cuda()
@@ -1650,6 +1751,7 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
             layer_id=0,
             layer_count=2,
             replicate_for_owned_rows=True,
+            gather_single_rows=False,
         )
     with torch.no_grad():
         linear.weight.normal_(std=hidden**-0.5)
