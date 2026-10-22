@@ -1,0 +1,21 @@
+name: AMD KDA E2E Measurement
+on:
+  push:
+    branches: [amd_replay_ssm_e2e_verify_gate]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: amd-kda-e2e-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  e2e:
+    if: github.ref_name == 'amd_replay_ssm_e2e_verify_gate'
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    with:
+      matrix: >-
+        {"include":[{"name":"perf-kda-replay-e2e-amd-gfx950","type":"perf","config":"test/ci/perf/kda-replay-e2e-amd-gfx950.yaml","runner":"amd-mi350-8gpu-bench","priority":"normal","optional":false,"workflow_stage":"model-test"}]}
+      checkout_ref: ${{ github.sha }}
+      timeout_minutes: 240

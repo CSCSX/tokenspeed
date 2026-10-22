@@ -149,6 +149,27 @@ this task. Other branches retain their existing conditions. Repository automatio
 that GitHub loads from the default branch follows that branch's configuration.
 Simulator timings are not GPU performance measurements.
 
+## AMD KDA serving comparison
+
+The manual `kda-replay-e2e-amd-gfx950` task compares pinned main and records
+revisions on one eight-GPU AMD runner. Each revision uses its own source tree
+and a scheduler built from that revision. It serves Kimi-K3 with BF16 activations,
+TP8/EP1 and the same pinned model snapshot. The report records the actual GPU
+properties and package versions.
+
+Both T1 and MTP3 cover concurrency 32, 64 and 128. MTP3 uses greedy sampling
+with synthetic accepted length 3.7. Each request has 4096 input tokens and 371
+output tokens; prefix caching is disabled. Both modes use main/current/current/main
+server starts, with two warmup and three measured waves per concurrency per
+start. Requests have identical token IDs and launch from one client barrier;
+HTTP arrival and scheduler batch identity are not guaranteed.
+
+Reported request E2E includes prefill. The report also records TTFT, output-token
+latency, throughput and observed acceptance counters. This is a comparison of
+complete branches, including their scheduler differences, rather than an isolated
+KDA attribution or natural-acceptance accuracy test. Startup failures and
+incomplete waves remain failures; they do not produce speedup claims.
+
 ## Benchmark requests
 
 Each request identifies an operation family and mode, supplies parameters for
