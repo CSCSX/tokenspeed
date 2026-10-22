@@ -29,6 +29,7 @@ import json
 import os
 import random
 import signal
+import site
 import statistics
 import subprocess
 import sys
@@ -72,6 +73,23 @@ def prepare_arm(root, work, output, name, revision):
         [sys.executable, "-m", "venv", "--system-site-packages", str(venv)], check=True
     )
     python = venv / "bin/python"
+    # A nested venv inherits the base interpreter, not its parent's packages.
+    # Add the prepared CI environment after this venv's own site-packages so
+    # each arm still imports its separately installed scheduler first.
+    site_path = Path(
+        subprocess.check_output(
+            [str(python), "-c", "import site; print(site.getsitepackages()[0])"],
+            text=True,
+        ).strip()
+    )
+    parent_sites = [
+        p for p in site.getsitepackages() if Path(p).is_relative_to(sys.prefix)
+    ]
+    (site_path / "kda_ci_dependencies.pth").write_text(
+        "import site; "
+        + "; ".join(f"site.addsitedir({p!r})" for p in parent_sites)
+        + "\n"
+    )
     env = os.environ.copy()
     env["VIRTUAL_ENV"] = str(venv)
     env["PATH"] = f"{venv / 'bin'}{os.pathsep}{env['PATH']}"
@@ -388,6 +406,20 @@ def main():
     report["model"] = args.model
     report["model_revision"] = model_revision
     report["model_config"] = json.loads(config.read_text())
+    print(
+        "KDA_E2E_ENV="
+        + json.dumps(
+            {
+                "hardware": report["hardware"],
+                "model_revision": model_revision,
+                "num_nextn_predict_layers": report["model_config"].get(
+                    "num_nextn_predict_layers"
+                ),
+                "architectures": report["model_config"].get("architectures"),
+            }
+        ),
+        flush=True,
+    )
     write_json(args.output / "report.json", report)
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, revision=model_revision, trust_remote_code=True
@@ -498,6 +530,13 @@ def main():
                     run["error"] = f"{type(error).__name__}: {error}"
                     report["errors"].append({"run": label, "error": run["error"]})
                     print(f"KDA_E2E_ERROR {label} {run['error']}", flush=True)
+                    log.flush()
+                    tail = (
+                        (args.output / f"{label}-server.log")
+                        .read_text(errors="replace")
+                        .splitlines()[-100:]
+                    )
+                    print("\n".join(tail), flush=True)
                 finally:
                     stop_server(process)
                     write_json(args.output / "report.json", report)
