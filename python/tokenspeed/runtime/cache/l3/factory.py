@@ -170,8 +170,10 @@ def create_l3_executor(
                         f"{field_id} is head-partitioned"
                     )
 
+    from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
+
     eagle3_layers_to_capture: tuple[int, ...] = ()
-    if server_args.speculative_algorithm == "EAGLE3":
+    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
         configured_layers = server_args.eagle3_layers_to_capture
         if configured_layers:
             eagle3_layers_to_capture = tuple(int(layer) for layer in configured_layers)
