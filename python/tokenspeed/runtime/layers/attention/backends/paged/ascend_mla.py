@@ -109,8 +109,30 @@ class AscendMLABackend(MLAAttnBackend):
         return False
 
     def _should_use_absorbed_cached_extend(self, **kwargs):
-        # The generic model's gathered-prefix path handles sharded history.
+        # Expanded prefill reads sharded history through read_prefix_history.
         return False
+
+    def read_prefix_history(self, pool, layer, chunk_kv_indices_list, *, dst_dtype):
+        if not chunk_kv_indices_list:
+            return iter(())
+        if self._dcp.degree == 1:
+            return super().read_prefix_history(
+                pool, layer, chunk_kv_indices_list, dst_dtype=dst_dtype
+            )
+        placement = self.cache_placement(layer)
+        rows = self._dcp.gather_cache_rows(
+            pool.get_key_buffer(layer.layer_id),
+            chunk_kv_indices_list,
+            block_granularity=placement.block_granularity,
+            virtual_block_count=placement.virtual_block_count,
+        )
+        return (
+            (
+                kv[..., : self.kv_lora_rank].to(dst_dtype).contiguous(),
+                kv[..., self.kv_lora_rank :].to(dst_dtype).contiguous(),
+            )
+            for kv in rows
+        )
 
     def refresh_decode_metadata(
         self,
