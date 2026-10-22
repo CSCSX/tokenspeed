@@ -18,19 +18,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib.util
+
 from tokenspeed_kernel.platform import current_platform
 
-if current_platform().is_hopper_plus:
-    from flash_mla import (
-        flash_mla_sparse_fwd,
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
 
-    __all__ = [
-        "flash_mla_sparse_fwd",
-        "flash_mla_with_kvcache",
-        "get_mla_metadata",
-    ]
-else:
-    __all__ = []
+def _flash_mla_function(name):
+    if (
+        not current_platform().is_hopper_plus
+        or importlib.util.find_spec("flash_mla") is None
+    ):
+        raise RuntimeError(
+            "This attention implementation requires the optional flash_mla package"
+        )
+    import flash_mla
+
+    return getattr(flash_mla, name)
+
+
+def flash_mla_sparse_fwd(*args, **kwargs):
+    return _flash_mla_function("flash_mla_sparse_fwd")(*args, **kwargs)
+
+
+def flash_mla_with_kvcache(*args, **kwargs):
+    return _flash_mla_function("flash_mla_with_kvcache")(*args, **kwargs)
+
+
+def get_mla_metadata(*args, **kwargs):
+    return _flash_mla_function("get_mla_metadata")(*args, **kwargs)
+
+
+__all__ = ["flash_mla_sparse_fwd", "flash_mla_with_kvcache", "get_mla_metadata"]

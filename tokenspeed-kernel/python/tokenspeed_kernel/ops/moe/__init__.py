@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -1899,8 +1900,11 @@ def moe_apply(
 # isort: off
 import tokenspeed_kernel.ops.moe.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
-import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
-import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
+
+if importlib.util.find_spec("deep_gemm") is not None:
+    if importlib.util.find_spec("deep_ep") is not None:
+        import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
+    import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401

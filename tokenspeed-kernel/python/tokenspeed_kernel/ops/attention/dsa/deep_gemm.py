@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 
 import torch
@@ -177,7 +178,10 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-if platform.is_hopper_plus:
+if platform.is_hopper_plus and all(
+    importlib.util.find_spec(name) is not None
+    for name in ("deep_ep", "deep_gemm", "trtllm_kernel")
+):
     prepare_cuda_toolkit_env()
     import deep_ep  # noqa: F401
     import deep_gemm

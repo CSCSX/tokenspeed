@@ -515,7 +515,11 @@ if platform.is_nvidia and platform.is_blackwell:
             )
             return out.to(torch.bfloat16)
 
-elif platform.is_nvidia and platform.is_hopper:
+elif (
+    platform.is_nvidia
+    and platform.is_hopper
+    and importlib.util.find_spec("flash_attn_interface") is not None
+):
     from flash_attn_interface import (
         flash_attn_func,
         flash_attn_varlen_func,
