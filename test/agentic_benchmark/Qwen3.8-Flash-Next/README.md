@@ -66,7 +66,9 @@ EvalScope's `--multi-turn` replay. The server configuration lives in
 length, at most 32 sequences, and 16,384-token prefill budgets and chunks.
 CUDA graph padding uses the server default.
 The shared server config sets `TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB=2048`
-for the QSA logits workspace budget.
+for the QSA logits workspace budget. In auto mode, oversized score matrices
+are split along query rows; each query still sees its full causal history.
+The budget covers FP32 scores, with output indices and selection workspace additional.
 
 The launch config leaves reasoning and tool-call parser flags unset. For this
 model, `ts serve` defaults the gateway's reasoning parser to `passthrough`,

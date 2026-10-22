@@ -210,6 +210,7 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             max_partial_bytes=32 * 1024 * 1024,
             algorithm=algorithm,
             enable_pdl=enable_pdl,
+            max_logits_bytes=None,
         )
         slots = qwen4_exp_qsa_selected_slots(
             selected,
@@ -344,7 +345,8 @@ def test_qsa_attention_waits_for_slots_and_kv(
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("topk", [64, 512])
-def test_qsa_selection_refreshes_block_frontiers(enabled, topk, restore_pdl):
+@pytest.mark.parametrize("algorithm", ["logits", "auto"])
+def test_qsa_selection_refreshes_block_frontiers(enabled, topk, algorithm, restore_pdl):
     batch, width, heads, dim, page_size, blocks = 3, 4, 4, 128, 64, 17408
     rows = batch * width
     query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
@@ -371,16 +373,21 @@ def test_qsa_selection_refreshes_block_frontiers(enabled, topk, restore_pdl):
             block_topk=topk,
             queries_per_request=width,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm="logits",
+            algorithm=algorithm,
             enable_pdl=enable_pdl,
+            max_logits_bytes=5 * blocks * 4 if algorithm == "auto" else None,
         )
 
     forward(enabled)
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph):
         actual = forward(enabled)
-    _check_graph_edges(graph, enabled)
+    # Tiled selection also contains ordinary PyTorch output-copy dependencies.
+    if algorithm == "logits":
+        _check_graph_edges(graph, enabled)
     for frontiers in ((0, 511, blocks), (1, 8193, 16384), (512, 513, blocks)):
+        table.copy_(table.flip(1))
+        requests.copy_((requests + 1) % batch)
         complete.copy_(
             torch.tensor(frontiers, device="cuda", dtype=torch.int32).repeat_interleave(
                 width

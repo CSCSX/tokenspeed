@@ -392,6 +392,7 @@ def qwen4_exp_qsa_block_topk(
     block_topk: int,
     queries_per_request: int | None,
     max_partial_bytes: int,
+    max_logits_bytes: int | None,
     algorithm: str,
     enable_pdl: bool,
 ) -> torch.Tensor:
@@ -414,7 +415,12 @@ def qwen4_exp_qsa_block_topk(
             runs while preserving each row's complete-block frontier.
         max_partial_bytes: Memory budget for the partial top-k buffers
             (``stream`` algorithm only).
-        algorithm: ``"stream"`` fuses scoring and selection without
+        max_logits_bytes: FP32 score budget for ``"auto"``. Output indices
+            and selection workspace are additional. Required for auto; ignored
+            by explicitly pinned algorithms, which may pass None.
+        algorithm: ``"auto"`` bounds logits by splitting query rows, or uses
+            streaming when even one score row exceeds the budget.
+            ``"stream"`` fuses scoring and selection without
             materializing scores; ``"logits"`` materializes the
             ``[rows, num_blocks]`` FP32 scores with ``qsa_block_scores`` and
             selects them with ``qsa_block_topk_select``.
@@ -430,11 +436,13 @@ def qwen4_exp_qsa_block_topk(
         raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
     if block_topk < 64 or (block_topk & (block_topk - 1)):
         raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    if algorithm not in ("stream", "logits"):
+    if algorithm not in ("auto", "stream", "logits"):
         raise ValueError(
-            "Qwen4-Exp QSA block top-k algorithm must be 'stream' or 'logits', "
+            "Qwen4-Exp QSA block top-k algorithm must be 'auto', 'stream' or 'logits', "
             f"got {algorithm!r}"
         )
+    if algorithm == "auto" and (max_logits_bytes is None or max_logits_bytes < 0):
+        raise ValueError("QSA auto top-k requires a nonnegative max_logits_bytes")
     rows = query.shape[0]
     if queries_per_request is not None and (
         queries_per_request < 1 or rows % queries_per_request
@@ -445,6 +453,44 @@ def qwen4_exp_qsa_block_topk(
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
         )
+    if algorithm == "auto":
+        rows_per_tile = max_logits_bytes // (num_blocks * 4)
+        if rows_per_tile == 0:
+            algorithm = "stream"
+        else:
+            algorithm = "logits"
+            if rows > rows_per_tile:
+                # Power-of-two tiles retain uniform query grouping where possible.
+                rows_per_tile = 1 << (rows_per_tile.bit_length() - 1)
+                selected = torch.empty(
+                    (rows, block_topk), dtype=torch.int32, device=query.device
+                )
+                for start in range(0, rows, rows_per_tile):
+                    end = min(start + rows_per_tile, rows)
+                    # Groups must align with both request runs and tile boundaries.
+                    group = (
+                        math.gcd(queries_per_request, math.gcd(start, end - start))
+                        if queries_per_request is not None
+                        else None
+                    )
+                    # Slice only queries: each row keeps its full causal history.
+                    part = qwen4_exp_qsa_block_topk(
+                        query[start:end],
+                        key_cache,
+                        page_table,
+                        request_indices[start:end],
+                        complete_blocks[start:end],
+                        page_size=page_size,
+                        block_topk=block_topk,
+                        queries_per_request=group,
+                        max_partial_bytes=max_partial_bytes,
+                        max_logits_bytes=None,
+                        algorithm="logits",
+                        enable_pdl=enable_pdl,
+                    )
+                    selected[start:end].copy_(part)
+                    del part
+                return selected
     if algorithm == "logits":
         scores = qsa_block_scores(
             query,

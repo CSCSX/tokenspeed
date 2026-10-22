@@ -296,36 +296,6 @@ class QSAIndexer(nn.Module):
         )
         return prepared_query
 
-    def _topk_algorithm(
-        self,
-        rows: int,
-        page_table: torch.Tensor,
-        page_size: int,
-    ) -> str:
-        """Route block top-k between the streaming and materialized paths.
-
-        ``TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH`` pins the backend
-        (``stream``/``logits``) and ``TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB``
-        caps the materialized score matrix for ``auto`` routing; both are
-        declared on the shared ``envs`` table in ``runtime.utils.env``.
-        """
-
-        path = envs.TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH.get()
-        if path not in ("auto", "stream", "logits"):
-            raise ValueError(
-                "TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH must be 'auto', 'stream', "
-                f"or 'logits', got {path!r}"
-            )
-        if path != "auto":
-            return path
-        num_blocks = page_table.shape[1] * page_size
-        budget_mb = envs.TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB.get()
-        # The materialized DSA-selection path measured 2-24x faster than the
-        # fused streaming path across decode/prefill shapes, so auto prefers
-        # it whenever the score matrix fits the configured budget; beyond
-        # the budget routing falls back to zero-materialization streaming.
-        return "logits" if rows * num_blocks * 4 <= budget_mb << 20 else "stream"
-
     def _select_slots(
         self,
         q: torch.Tensor,
@@ -347,8 +317,7 @@ class QSAIndexer(nn.Module):
         page_size = compressed.shape[1]
         cache = compressed.view(-1, 1, self.index_head_dim)
         enable_pdl = pdl_enabled()
-        # Auto normally materializes scores for persistent radix selection;
-        # oversized matrices retain the zero-materialization streaming path.
+        # The kernel composition owns bounded score materialization.
         selected_blocks = qwen4_exp_qsa_block_topk(
             q,
             cache,
@@ -359,8 +328,9 @@ class QSAIndexer(nn.Module):
             block_topk=self.block_topk,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm=self._topk_algorithm(q.shape[0], qsa_page_table, page_size),
+            algorithm=envs.TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH.get(),
             enable_pdl=enable_pdl,
+            max_logits_bytes=envs.TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB.get() << 20,
         )
         return qwen4_exp_qsa_selected_slots(
             selected_blocks,

@@ -140,6 +140,7 @@ def _qsa(rows, solution):
             max_partial_bytes=32 * 1024 * 1024,
             algorithm=solution,
             enable_pdl=pdl_enabled(),
+            max_logits_bytes=None,
         )
         slots = qwen4_exp_qsa_selected_slots(
             selected,
