@@ -163,7 +163,8 @@ weights; the pinned public Kimi-K3 snapshot has none, so the CI task selects T1.
 MTP3 uses greedy sampling with synthetic accepted length 3.7. Each request has
 4096 input tokens and 371 output tokens; prefix caching is disabled. Both modes use main/current/current/main
 server starts, with two warmup and three measured waves per concurrency per
-start. Requests have identical token IDs and launch from one client barrier;
+start. Both arms receive identical text prompts, checked to encode to exactly 4096
+tokens, and launch from one client barrier;
 HTTP arrival and scheduler batch identity are not guaranteed.
 
 Reported request E2E includes prefill. The report also records TTFT, output-token

@@ -140,6 +140,46 @@ print(json.dumps({'modules': {m.__name__: str(Path(m.__file__).resolve()) for m 
     return {"source": source, "python": python, "env": env, "audit": info}
 
 
+def make_payloads(tokenizer, *, num_requests, input_tokens, output_tokens, seed):
+    # The OpenAI gateway accepts text prompts, not arrays of token IDs.
+    # ASCII text avoids partial UTF-8 characters when truncating token prefixes.
+    rng = random.Random(seed)
+    payloads = []
+    for _ in range(num_requests):
+        text = " ".join(
+            f"word{rng.randrange(1_000_000):06d}" for _ in range(input_tokens)
+        )
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        budget = input_tokens - tokenizer.num_special_tokens_to_add(pair=False)
+        for _ in range(8):
+            prompt = tokenizer.decode(
+                tokens[:budget], clean_up_tokenization_spaces=False
+            )
+            actual = len(tokenizer.encode(prompt, add_special_tokens=True))
+            if actual == input_tokens:
+                break
+            budget += input_tokens - actual
+        else:
+            raise RuntimeError(f"Cannot construct an exact {input_tokens}-token prompt")
+        payloads.append(
+            json.dumps(
+                {
+                    "model": "kimi-k3",
+                    "prompt": prompt,
+                    "max_tokens": output_tokens,
+                    "temperature": 0,
+                    "seed": seed,
+                    "ignore_eos": True,
+                    "skip_special_tokens": False,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+                separators=(",", ":"),
+            )
+        )
+    return payloads
+
+
 async def stream_request(session, url, payload, gate, index, expected_tokens):
     await gate.wait()
     started = time.perf_counter()
@@ -432,27 +472,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, revision=model_revision, trust_remote_code=True
     )
-    rng = random.Random(1)
-    special = set(tokenizer.all_special_ids)
-    vocabulary = [
-        i for i in range(1000, min(tokenizer.vocab_size, 30000)) if i not in special
-    ]
-    payloads = [
-        json.dumps(
-            {
-                "model": "kimi-k3",
-                "prompt": rng.choices(vocabulary, k=4096),
-                "max_tokens": 371,
-                "temperature": 0,
-                "seed": 1,
-                "ignore_eos": True,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            },
-            separators=(",", ":"),
-        )
-        for _ in range(128)
-    ]
+    payloads = make_payloads(
+        tokenizer, num_requests=128, input_tokens=4096, output_tokens=371, seed=1
+    )
+    report["prompt_format"] = "text; tokenizer-verified 4096 input tokens"
+    print("KDA_E2E_INPUTS: 128 text prompts, each verified as 4096 tokens", flush=True)
     report["payload_sha256"] = [
         hashlib.sha256(p.encode()).hexdigest() for p in payloads
     ]
