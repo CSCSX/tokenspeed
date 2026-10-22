@@ -141,16 +141,18 @@ def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
     assert torch.count_nonzero(out[[1, 4]]).item() == 0
 
 
-def _arena_cache(rows, fmt, page_pad):
-    """Page-planar cache view with an arena-style padded page stride."""
+def _arena_cache(rows, fmt, page_pad, fill=0, first_slot=0):
+    """Page-planar cache view with an arena-style padded page stride.
+
+    Rows land at slots from first_slot; every other byte holds fill.
+    """
     width = {"swa": 528, "global": 288}[fmt]
-    pages = (rows.shape[0] + 63) // 64
+    pages = (first_slot + rows.shape[0] + 63) // 64
     stride = 64 * width + page_pad
-    raw = torch.zeros(pages * stride, dtype=torch.uint8, device=rows.device)
+    raw = torch.full((pages * stride,), fill, dtype=torch.uint8, device=rows.device)
     cache = raw.as_strided((pages, 64, width), (stride, width, 1))
-    dsv41.cache_scatter(
-        rows, cache, torch.arange(rows.shape[0], device=rows.device), fmt
-    )
+    slots = first_slot + torch.arange(rows.shape[0], device=rows.device)
+    dsv41.cache_scatter(rows, cache, slots, fmt)
     return cache
 
 
@@ -164,6 +166,8 @@ def _gather_softmax(q, sink, segments):
             & (slots < cache.shape[0] * 64)
         )
     kv, valid = torch.cat(parts, dim=1), torch.cat(masks, dim=1)
+    # Invalid rows may gather unwritten bytes; keep their NaNs out of the bmm.
+    kv = kv.masked_fill(~valid[..., None], 0.0)
     logits = torch.bmm(q.float(), kv.transpose(1, 2)) * 512**-0.5
     logits.masked_fill_(~valid[:, None], -torch.inf)
     sinks = sink[None, :, None].expand(q.shape[0], -1, 1)
@@ -281,6 +285,55 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_
             out[..., -64:], expected_rope[..., -64:], rtol=0.008, atol=0.0005
         )
         expected = dsv41.rope_inplace(expected, positions, cos_sin, None)
+    torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
+
+
+@pytest.mark.parametrize("tokens", [6, 192])
+def test_fused_selected_attention_ignores_unwritten_rows(tokens):
+    """Invalid selections stay zero over 0xFF (NaN-scale) unwritten bytes.
+
+    Page 0 is never written, so a kernel that clamps invalid rows to slot 0
+    reads 0xFF scales there; padded zero-query heads take the row-sum path.
+    """
+    platform = current_platform()
+    if platform.is_cdna4:
+        pytest.xfail("gfx950 dequantizes invalid rows with their read scales")
+    if not platform.is_cdna5:
+        pytest.skip("AMD fused selected attention")
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device="cpu").manual_seed(13)
+    segments = []
+    for fmt, rows, width, page_pad in (
+        ("swa", 192, 128, 512),
+        ("global", 960, 512, 256),
+    ):
+        values = torch.randn((rows, 512), generator=generator).bfloat16()
+        cache = _arena_cache(values.to(device), fmt, page_pad, 0xFF, 64)
+        slots = torch.randint(-2, 64 + rows + 40, (tokens, width), generator=generator)
+        slots = slots.masked_fill((slots >= 0) & (slots < 64), -1)
+        lens = torch.randint(0, width + 1, (tokens,), generator=generator)
+        lens[:2] = width
+        segments.append((cache, slots.to(device), lens.int().to(device), fmt))
+    q, sink = _padded_query(tokens, 16, 64, device, 17)
+    expected = _gather_softmax(q, sink, segments).bfloat16()
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    out = dsv41.selected_attention(
+        q,
+        swa,
+        swa_slots,
+        swa_lens,
+        glob,
+        global_slots,
+        global_lens,
+        sink,
+        512**-0.5,
+        None,
+        256,
+        None,
+        None,
+        None,
+        lse=None,
+    )
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
 
 
