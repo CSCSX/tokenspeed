@@ -181,6 +181,8 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
         tp_group=(0, 1),
         dp_lm_head_tp=False,
     )
+    # The collective fallback, also on a host whose group has multicast.
+    monkeypatch.setattr(processor, "_tp_group_multicast_reachable", lambda: False)
     hidden_states = torch.empty((0, 2), dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.ones((3, 2), dtype=torch.float32))
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
@@ -222,25 +224,27 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, nvidia_logits, dtype, cac
         tp_group=(0, 1),
         dp_lm_head_tp=False,
     )
-    state = object()
+    # BF16 logits are one multicast word, FP32 two; FP16 keeps the collective.
+    words = {torch.bfloat16: 1, torch.float32: 2}.get(dtype, 0)
+    state = SimpleNamespace(hidden_dim=32)
     if cached:
         processor._all_gather_state = state
     calls = []
 
-    def initialize(lm_head):
-        assert dtype == torch.bfloat16
+    def initialize(lm_head, words_per_logit):
+        assert words and words_per_logit == words
         calls.append("init")
         return state
 
     def multicast(received_state, logits, *, tp_hidden_dim, skip_entry_sync, safe):
         assert received_state is state
         assert logits.dtype == torch.bfloat16
-        assert tp_hidden_dim == 16 and skip_entry_sync and not safe
+        assert tp_hidden_dim == 16 * words and skip_entry_sync and not safe
         calls.append("multicast")
         return torch.cat((logits, logits), dim=-1)
 
     def collective(output, logits, group):
-        assert dtype != torch.bfloat16
+        assert not words
         assert output.dtype == logits.dtype == dtype
         assert group == (0, 1)
         calls.append("collective")
@@ -267,7 +271,7 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, nvidia_logits, dtype, cac
     torch.testing.assert_close(
         output, torch.cat((local, local), dim=-1), rtol=0, atol=0
     )
-    if dtype == torch.bfloat16:
+    if words:
         assert calls == (["multicast"] if cached else ["init", "multicast"])
     else:
         assert calls == ["collective"]
@@ -317,7 +321,7 @@ def test_tp_logits_collective_gather_lays_rank_shards_side_by_side(monkeypatch, 
 @pytest.mark.parametrize(
     ("initializer_name", "args"),
     [
-        ("_init_all_gather_state", (SimpleNamespace(),)),
+        ("_init_all_gather_state", (SimpleNamespace(), 1)),
         ("_init_dist_argmax_state", (SimpleNamespace(), torch.bfloat16)),
     ],
 )
@@ -401,7 +405,7 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
         ),
     )
 
-    assert processor._init_all_gather_state(lm_head) is None
+    assert processor._init_all_gather_state(lm_head, 1) is None
     assert isinstance(
         processor._init_dist_argmax_state(lm_head, torch.float32), VocabParallelArgmax
     )
@@ -475,11 +479,15 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
     )
 
     try:
-        assert processor._init_all_gather_state(lm_head) == "ag-state"
+        assert processor._init_all_gather_state(lm_head, 1) == "ag-state"
         assert created["hidden_size"] == 64
+        # FP32 logits travel as two BF16 words each.
+        assert processor._init_all_gather_state(lm_head, 2) == "ag-state"
+        assert created["hidden_size"] == 128
     finally:
-        # The cache is class-level; drop the stub so it cannot leak.
+        # The cache is class-level; drop the stubs so they cannot leak.
         LogitsProcessor._LOGITS_AG_STATES.pop((tuple(range(8)), 64), None)
+        LogitsProcessor._LOGITS_AG_STATES.pop((tuple(range(8)), 128), None)
 
 
 def test_logits_gather_state_spans_the_vocab_of_a_transposed_quantized_head(
@@ -512,7 +520,7 @@ def test_logits_gather_state_spans_the_vocab_of_a_transposed_quantized_head(
     )
 
     try:
-        assert processor._init_all_gather_state(lm_head) == "ag-state"
+        assert processor._init_all_gather_state(lm_head, 1) == "ag-state"
         assert created["hidden_size"] == 64
     finally:
         LogitsProcessor._LOGITS_AG_STATES.pop(((0, 1), 64), None)
@@ -1020,7 +1028,9 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
             "the fused argmax gate must stay off"
         ),
     )
-    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
+    monkeypatch.setattr(
+        proc, "_init_all_gather_state", lambda lm_head, words_per_logit: None
+    )
     monkeypatch.setattr(
         logits_processor_module, "all_gather_single", lambda out, inp, group: None
     )
@@ -1081,7 +1091,9 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
     monkeypatch.setattr(
         proc,
         "_init_all_gather_state",
-        lambda lm_head: pytest.fail("the gate must not run inside a capture"),
+        lambda lm_head, words_per_logit: pytest.fail(
+            "the gate must not run inside a capture"
+        ),
     )
     monkeypatch.setattr(
         logits_processor_module, "is_current_stream_capturing", lambda device: True
@@ -1102,7 +1114,11 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
     monkeypatch.setattr(
         logits_processor_module, "is_current_stream_capturing", lambda device: False
     )
-    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
+    monkeypatch.setattr(
+        proc,
+        "_init_all_gather_state",
+        lambda lm_head, words_per_logit: SimpleNamespace(hidden_dim=1 << 20),
+    )
     monkeypatch.setattr(
         logits_processor_module,
         "all_gather_inner",
@@ -1130,7 +1146,11 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch, nvidia_logits):
     monkeypatch.setattr(
         proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: object()
     )
-    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
+    monkeypatch.setattr(
+        proc,
+        "_init_all_gather_state",
+        lambda lm_head, words_per_logit: SimpleNamespace(hidden_dim=1 << 20),
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     called = {}
 
@@ -1359,7 +1379,9 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch, nvidia_l
     monkeypatch.setattr(
         proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: object()
     )
-    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
+    monkeypatch.setattr(
+        proc, "_init_all_gather_state", lambda lm_head, words_per_logit: None
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         logits_processor_module,
@@ -1415,8 +1437,10 @@ def test_input_logprob_chunks_never_take_the_multicast_gather(
         tp_group=(0, 1),
         dp_lm_head_tp=False,
     )
-    multicast_state = object()
-    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: multicast_state)
+    multicast_state = SimpleNamespace(hidden_dim=1 << 20)
+    monkeypatch.setattr(
+        proc, "_init_all_gather_state", lambda lm_head, words_per_logit: multicast_state
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     multicast_rows: list[int] = []
     collective_rows: list[int] = []
@@ -1474,7 +1498,9 @@ def _sharded_processor(monkeypatch, size: int, rank: int) -> LogitsProcessor:
         tp_group=tuple(range(size)),
         dp_lm_head_tp=False,
     )
-    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
+    monkeypatch.setattr(
+        proc, "_init_all_gather_state", lambda lm_head, words_per_logit: None
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def no_gather(hidden_states, lm_head, md, embedding_bias=None, plan=None, **kw):

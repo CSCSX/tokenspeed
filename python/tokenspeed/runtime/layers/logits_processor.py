@@ -531,7 +531,9 @@ class LogitsProcessor(nn.Module):
             return True
         return group_has_fabric(self.tp_group)
 
-    def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
+    def _init_all_gather_state(
+        self, lm_head: VocabParallelEmbedding, words_per_logit: int
+    ):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
@@ -547,13 +549,13 @@ class LogitsProcessor(nn.Module):
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
-        key = (self.tp_group, vocab_padded)
+        key = (self.tp_group, vocab_padded * words_per_logit)
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
                 max_tokens=self._LOGITS_AG_MAX_TOKENS,
-                hidden_size=vocab_padded,
+                hidden_size=vocab_padded * words_per_logit,
                 device=None,
             )
         return self._LOGITS_AG_STATES[key]
@@ -1220,32 +1222,36 @@ class LogitsProcessor(nn.Module):
                 ):
                     return logits
 
-            # The multicast buffer/kernel is BF16-only; retain other logits dtypes
-            # through the existing collective, including when a state is cached.
-            # A private full-vocab result never uses the shared buffer either.
-            state = (
-                self._all_gather_state
-                if logits.dtype == torch.bfloat16 and not require_full_vocab
-                else None
+            # FP32 rides the BF16 multicast as word pairs; others take the collective.
+            words_per_logit = (
+                {torch.bfloat16: 1, torch.float32: 2}.get(logits.dtype, 0)
+                if not require_full_vocab
+                else 0
             )
+            state = self._all_gather_state if words_per_logit else None
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
                 if is_current_stream_capturing(logits.device):
                     state = None
                 else:
                     state = self._all_gather_state = self._init_all_gather_state(
-                        lm_head
+                        lm_head, words_per_logit
                     )
+            words = logits.view(torch.bfloat16) if words_per_logit else None
 
-            if state is not None and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS:
+            if (
+                state is not None
+                and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS
+                and words.size(-1) * self.tp_size <= state.hidden_dim
+            ):
                 # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
                 logits = all_gather_inner(
                     state,
-                    logits,
-                    tp_hidden_dim=logits.size(-1) * self.tp_size,
+                    words,
+                    tp_hidden_dim=words.size(-1) * self.tp_size,
                     skip_entry_sync=True,
                     safe=False,
-                )
+                ).view(logits.dtype)
             elif (
                 current_platform().is_cdna4
                 and not require_full_vocab
