@@ -108,16 +108,18 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
-### gfx950 single-row BF16 GEMV
+### gfx950 few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
-`x @ w.T` for one BF16 row with one program per output: program `n` streams
-weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks, keeps per-lane FP32
-partial sums and reduces them once. `N` programs per launch keep many
-independent weight streams in flight per CU, which suits cold weights.
+`x @ w.T` for one BF16 row, or a few, with one program per output (block):
+program `n` streams weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks,
+keeps per-lane FP32 partial sums and reduces them once. `N` programs per
+launch keep many independent weight streams in flight per CU, which suits
+cold weights.
 
-- `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
-  a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
+- `x` is a contiguous `[M, K]` matrix, `w` a contiguous `[N, K]` matrix and
+  `out` a contiguous `[M, N]` destination, all BF16. `K` is a compile-time
+  constant.
 - `BLOCK_K` and the wave count follow `K` (one wave of 16-byte loads for
   `K <= 1536`, wider programs above), except for the `(N, K)` shapes in
   `_CONFIGS`, whose geometry measured faster in cold-cache sweeps.
@@ -126,6 +128,13 @@ independent weight streams in flight per CU, which suits cold weights.
   `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
   hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
   measured shapes route single rows to `mv` separately.
+- A few rows (`M` up to a power-of-two bucket) run the same per-output
+  reduction with every row held in each lane's registers, so row `m` is bitwise
+  the single-row GEMV of `x[m]` and each weight load serves all rows. `gemm.mv`
+  takes it only for the `(N, K)` buckets in `_ROWS_CONFIGS`, where it beat the
+  Gluon MFMA decode GEMM; one binary per bucket, `M` is a runtime argument.
+  Unlike `gluon_gemv_a16w16_gfx950` (MFMA, waves split K), every row keeps the
+  single-row result, and FMA throughput limits it to a few rows.
 - `gluon_gated_rowcta_bf16_gemv_gfx950` projects one row through a per-head
   weightless RMSNorm x sigmoid(gate) prologue that every program recomputes. It
   keeps the Triton gated norm's layout and this GEMV's reduction, so it is
