@@ -399,7 +399,7 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
     output, sentinel = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None
+        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
     )
     assert sentinel is None
 
@@ -1076,6 +1076,89 @@ def test_mixed_rounds_are_rejected_before_any_attention_runs() -> None:
         MuseSparkDecoderLayer.forward(
             SimpleNamespace(), torch.arange(3), torch.zeros(3, 8), ctx, None, None, None
         )
+
+
+@pytest.mark.parametrize(
+    "rows,gemm_policy,fused",
+    [(1, False, True), (2, False, False), (1, True, False)],
+)
+def test_single_decode_row_projects_post_expert_columns_in_the_boundary(
+    monkeypatch: pytest.MonkeyPatch, rows, gemm_policy, fused
+) -> None:
+    """One row hands the unprojected expert output to the fused Iris boundary.
+
+    Wider batches and an explicit dense-projection policy keep the projection
+    in the MoE and the separate boundary.
+    """
+    hidden = torch.zeros(rows, 8)
+    calls = []
+
+    class Attention:
+        tp_size = 1
+        o_proj = SimpleNamespace(tp_size=1)
+
+        def __call__(self, positions, attention_input, ctx, owned):
+            return attention_input, None, 1
+
+    def mlp(x, router_input, global_tokens, tokens_per_gpu, owned, project):
+        calls.append(("mlp", project))
+        return x + 1, None
+
+    def boundary(stream, branch, *args):
+        calls.append(("boundary",))
+        return stream, branch
+
+    class Iris:
+        def can_gemv_all_gather_boundary(self, count, weight, *args):
+            return count == 1 and weight is projection.weight
+
+        def gemv_all_gather_boundary(self, x, weight, stream, *args):
+            calls.append(("gemv_all_gather_boundary", weight))
+            return stream, x
+
+    projection = SimpleNamespace(
+        replicated=True, gather_column_view=False, weight=torch.ones(8, 4)
+    )
+    layer = _stub(MuseSparkDecoderLayer)
+    layer.comm_manager = SimpleNamespace(
+        pre_attn_comm=lambda value, ctx: value,
+        post_attn_comm=lambda value, stream, ctx: (value, stream),
+        pre_mlp_comm=lambda value, ctx: value,
+        get_num_tokens=lambda ctx: (rows, rows),
+    )
+    layer.self_attn = Attention()
+    norm = SimpleNamespace(weight=torch.ones(8), eps=1e-6, weight_offset=1.0)
+    layer.post_attention_layernorm = layer.pre_feedforward_layernorm = norm
+    layer.post_feedforward_layernorm = norm
+    layer.post_attention_residual_gate = SimpleNamespace(
+        _gate_coefficients=lambda: (torch.ones(8), torch.ones(8))
+    )
+    layer.post_feedforward_residual_gate = layer.post_attention_residual_gate
+    mlp.post_expert_proj = projection
+    layer.mlp = mlp
+    layer.iris_state = Iris()
+    monkeypatch.setattr(
+        module,
+        "post_norm_residual_pre_norm",
+        lambda stream, branch, *args: (stream, branch, branch),
+    )
+    monkeypatch.setattr(module, "post_norm_residual_pre_norm_bf16", boundary)
+    monkeypatch.setattr(module, "pdl_enabled", lambda: False)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
+    monkeypatch.setattr(module, "_gemm_dispatch_required", lambda: gemm_policy)
+    ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_mixed=lambda: False))
+    MuseSparkDecoderLayer.forward(
+        layer, torch.arange(rows), hidden, ctx, torch.zeros(rows, 8), norm, None
+    )
+    if fused:
+        assert calls == [
+            ("mlp", False),
+            ("gemv_all_gather_boundary", projection.weight),
+        ]
+    else:
+        assert calls == [("mlp", True), ("boundary",)]
 
 
 def test_packed_qkv_gate_loader_replicates_kv_heads_across_ranks() -> None:
