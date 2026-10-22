@@ -162,6 +162,179 @@ def gluon_rowcta_bf16_gemv_gfx950(
     return out
 
 
+# (N, K, heads) where one gated launch beat the gated norm plus this GEMV by
+# at least 5% of the attention tail in 8-rank MI355X graph replay (median of
+# six alternating trials); Muse Spark's TP4 shape measured slower fused.
+_GATED_SHAPES = frozenset(
+    {
+        (8192, 1024, 16),  # Muse Spark TP8 attention output projection
+    }
+)
+# Four-subgroup programs with two outputs per subgroup measured fastest.
+_GATED_NUM_WARPS = 4
+_GATED_ROWS_PER_WAVE = 2
+# triton_weightless_rmsnorm_gated_sigmoid launches four warps; its default
+# layout, and so its per-head sums, follow from that count.
+_GATE_NORM_NUM_WARPS = 4
+
+
+@gluon.constexpr_function
+def _gate_norm_layout(
+    num_heads: int, head_dim: int, norm_warps: int, num_warps: int
+) -> gl.constexpr:
+    """Lay out a [heads, head_dim] tile as the Triton gated-norm kernel does.
+
+    That kernel runs ``norm_warps`` warps; its per-head sums run over the
+    columns of this layout, so matching them keeps every value bit for bit.
+    Rows may spread over a different warp count.
+    """
+    heads = 1 << (num_heads - 1).bit_length()
+    per_thread = min(8, max(1, heads * head_dim // (64 * norm_warps)))
+    lanes = head_dim // per_thread
+    return gl.BlockedLayout(
+        [1, per_thread], [64 // lanes, lanes], [num_warps, 1], [1, 0]
+    )
+
+
+@gluon.jit
+def _gated_rowcta_bf16_gemv_kernel(
+    x_ptr,
+    gate_ptr,
+    weight_ptr,
+    out_ptr,
+    K: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    EPS: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_ROW: gl.constexpr,
+    ROWS_PER_WAVE: gl.constexpr,
+    NORM_WARPS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    HEAD_DIM: gl.constexpr = 64
+    HEADS: gl.constexpr = BLOCK_K // HEAD_DIM
+    ROWS: gl.constexpr = NUM_WARPS // WAVES_PER_ROW * ROWS_PER_WAVE
+    # Each output keeps the rowcta reduction for (BLOCK_K, WAVES_PER_ROW).
+    layout: gl.constexpr = gl.BlockedLayout(
+        [ROWS_PER_WAVE, BLOCK_K // (64 * WAVES_PER_ROW)],
+        [1, 64],
+        [NUM_WARPS // WAVES_PER_ROW, WAVES_PER_ROW],
+        [1, 0],
+    )
+    head_layout: gl.constexpr = _gate_norm_layout(
+        NUM_HEADS, HEAD_DIM, NORM_WARPS, NUM_WARPS
+    )
+    rows = gl.program_id(0) * ROWS + gl.arange(
+        0, ROWS, layout=gl.SliceLayout(1, layout)
+    )
+    offsets = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, layout))
+    heads = gl.arange(0, HEADS, layout=gl.SliceLayout(1, head_layout))
+    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, head_layout))
+    accumulator = gl.zeros((ROWS, BLOCK_K), gl.float32, layout=layout)
+    for chunk in gl.static_range(K // BLOCK_K):
+        columns = chunk * BLOCK_K + offsets
+        weight = gl.amd.cdna4.buffer_load(
+            weight_ptr,
+            (rows[:, None] * K + columns[None, :]).to(gl.int32),
+            cache=".cg",
+        ).to(gl.float32)
+        # The chunk's heads, normalized and gated as the Triton kernel rounds them.
+        head_offsets = (chunk * HEADS + heads)[:, None] * HEAD_DIM + dims[None, :]
+        gate = gl.amd.cdna4.buffer_load(gate_ptr, head_offsets).to(gl.float32)
+        values = gl.amd.cdna4.buffer_load(x_ptr, head_offsets).to(gl.float32)
+        variance = gl.sum(values * values, axis=1) / HEAD_DIM
+        gated = values * gl.rsqrt(variance[:, None] + EPS) * (1 / (1 + gl.exp(-gate)))
+        x = gl.convert_layout(
+            gl.reshape(gated.to(gl.bfloat16), [BLOCK_K]), gl.SliceLayout(0, layout)
+        ).to(gl.float32)
+        accumulator += x[None, :] * weight
+    gl.store(out_ptr + rows, gl.sum(accumulator, axis=1).to(gl.bfloat16))
+
+
+def _gated_geometry(
+    n: int, k: int, num_heads: int, head_dim: int
+) -> tuple[int, int] | None:
+    if (n, k, num_heads) not in _GATED_SHAPES or head_dim * num_heads != k:
+        return None
+    return _rowcta_config(n, k)
+
+
+def supports_gluon_gated_rowcta_bf16_gemv_gfx950(
+    n: int, k: int, num_heads: int, head_dim: int
+) -> bool:
+    """Whether one gated row of ``[N, K]`` runs in a single launch here."""
+    return _gated_geometry(n, k, num_heads, head_dim) is not None
+
+
+def gluon_gated_rowcta_bf16_gemv_gfx950(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    eps: float,
+) -> torch.Tensor:
+    """Project one per-head weightless-RMSNormed, sigmoid-gated BF16 row.
+
+    Every program recomputes the gated row from ``x`` and ``gate`` and keeps
+    both the Triton gated norm's rounding and the single-row GEMV's
+    reduction, so ``out`` is bitwise ``weightless_rmsnorm_gated_sigmoid``
+    followed by ``gluon_rowcta_bf16_gemv_gfx950``.
+
+    Args:
+        x: Contiguous BF16 attention row ``[1, num_heads * 64]``.
+        gate: BF16 gate logits with ``x``'s shape and a unit inner stride.
+        weight: Contiguous BF16 weight ``[N, K]``.
+        out: Contiguous BF16 destination ``[1, N]``.
+        num_heads: Heads in ``x``; each head is 64 wide.
+        eps: Epsilon added to each per-head variance.
+
+    Returns:
+        ``out`` after the projection completes.
+    """
+    n, k = weight.shape
+    geometry = _gated_geometry(n, k, num_heads, x.shape[-1] // max(num_heads, 1))
+    if geometry is None:
+        raise ValueError(
+            f"no single-launch gated GEMV for [{n}, {k}], {num_heads} heads"
+        )
+    if (
+        x.shape != (1, k)
+        or gate.shape != x.shape
+        or x.dtype != torch.bfloat16
+        or gate.dtype != x.dtype
+        or weight.dtype != x.dtype
+        or not x.is_contiguous()
+        or gate.stride(1) != 1
+        or not weight.is_contiguous()
+        or out.shape != (1, n)
+        or out.dtype != x.dtype
+        or not out.is_contiguous()
+        or len({x.device, gate.device, weight.device, out.device}) != 1
+    ):
+        raise ValueError(
+            "expected one contiguous BF16 row, its gate, [N, K] and [1, N]"
+        )
+    block_k, waves = geometry
+    rows = _GATED_NUM_WARPS // waves * _GATED_ROWS_PER_WAVE
+    _gated_rowcta_bf16_gemv_kernel[(n // rows,)](
+        x,
+        gate,
+        weight,
+        out,
+        K=k,
+        NUM_HEADS=num_heads,
+        EPS=eps,
+        BLOCK_K=block_k,
+        WAVES_PER_ROW=waves,
+        ROWS_PER_WAVE=_GATED_ROWS_PER_WAVE,
+        NORM_WARPS=_GATE_NORM_NUM_WARPS,
+        NUM_WARPS=_GATED_NUM_WARPS,
+        num_warps=_GATED_NUM_WARPS,
+    )
+    return out
+
+
 # Single-row shapes (N, K) where this GEMV beat ``gemm.mm``'s own path (Torch's
 # skinny GEMM or hipBLASLt) by at least 5% in cold-cache standalone sweeps on
 # MI350X, and stayed faster in serving traces. ``gemm.mm`` hands a single row
@@ -203,7 +376,9 @@ def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
 
 
 __all__ = [
+    "gluon_gated_rowcta_bf16_gemv_gfx950",
     "gluon_rowcta_bf16_gemv_geometry_gfx950",
     "gluon_rowcta_bf16_gemv_gfx950",
     "prefers_gluon_rowcta_bf16_gemv_gfx950",
+    "supports_gluon_gated_rowcta_bf16_gemv_gfx950",
 ]
