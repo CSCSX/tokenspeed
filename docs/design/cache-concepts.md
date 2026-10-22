@@ -950,7 +950,9 @@ Its responsibilities:
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
-  the group indexes), so the scheduler keeps no residency counters of its own
+  the group indexes). At a partial boundary, each State group contributes its
+  single checkpoint block at offset zero, without token-span arithmetic.
+  The scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
   currently out. A mutation only marks its boundary for reconcile;
   `DrainKvEvents` reconciles each marked boundary against its residency and
@@ -958,6 +960,10 @@ Its responsibilities:
   descriptors of boundaries with no cached child. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
+  Admission may pre-hash the rest of a prompt before it is computed. An early
+  junction or retraction tail names the parent at its published frontier, not
+  the last page in that hash memo.
+
 Replica-agreed D2H ACKs publish Host entries and release Device sources
 without waiting for L3. Backup candidates are nonowning; PUT dispatch pins
 resident Host sources until all cache owners report native retirement.
