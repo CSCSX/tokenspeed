@@ -48,8 +48,10 @@ Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded
 rows masked; QKVG exchange derives each rank's head widths from the group size.
-Muse's single-row post-expert tail sends and receives through the one-shot
-mailbox within one launch, its own slot included.
+Muse's decode post-expert tail (up to eight rows at TP8, one at TP4) sends and
+receives through the one-shot mailbox within one launch, its own slot
+included; with P ranks, row m uses elements [m * width / P, (m + 1) *
+width / P) of each slot and its reducer advances only that row's tiles.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
