@@ -622,6 +622,12 @@ def create_paged_router(
         # names the WRAPPER; the leaf under it auto-resolves from the arch.
         name = None
     leaf_cls = _get_backend_cls(name, arch)
+    if config.draft_block_causal and not leaf_cls.supports_causal_block_decode:
+        raise ValueError(
+            f"attention backend {name!r} cannot run a block draft whose rows "
+            "attend causally within the block (dflash_config.causal); serve "
+            "this draft with --drafter-attention-backend mha"
+        )
 
     def leaf_factory(group_id: str, block_granularity: int):
         del group_id
