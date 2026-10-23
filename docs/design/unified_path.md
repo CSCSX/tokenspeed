@@ -1607,9 +1607,13 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
-The convolution reads row-strided fused projection slices directly and writes
-packed token rows. Consumers can split that output without another layout copy;
-the model does not compact the projection before the attention break.
+The convolution reads row-strided fused projection slices directly. It writes
+packed token rows by default, or a caller-owned buffer of equal channel
+partitions. On Blackwell, equal-width Q/K/V prefill uses three partitions so
+the recurrent scan receives contiguous tensors without a split copy. Padding
+is scrubbed in every partition before the scan. Convolution-state updates and
+verification replay retain their existing contracts; the model does not compact
+the projection before the attention break.
 
 Prefill state staging fuses resumed conv-window copying, recurrent-state
 gather/zero, and history flags in one kernel. It preserves scheduler-owned
