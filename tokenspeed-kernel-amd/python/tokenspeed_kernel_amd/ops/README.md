@@ -859,6 +859,18 @@ WMMA layout instead of through LDS. At 16 requests this takes CSA decode
 (attention plus reduce, in a graph) from 22.2 to 19.9 us and SWA from 13.1
 to 9.7 us; at 1 request, from 13.0 to 12.3 us and from 8.8 to 7.6 us.
 
+Tiles dequantize from the raw ring straight into the QK operand layout, so
+QK runs from registers and the BF16 tile in LDS only feeds the transposed PV
+read. That operand reads 16 value rows at once, so the ring pads each row by
+16 bytes; unpadded, the rows share banks and the change is a net loss. CSA
+decode goes from 19.9 to 18.9 us at 16 requests and from 12.2 to 11.9 us at
+1 request, SWA from 9.7 to 9.4 us and from 7.6 to 7.2 us. PV keeps the BF16
+tile: its operand needs each lane's rows transposed, and the E2M1 global
+rows pack their nibbles along the head dims. Moving the scores into the PV
+operand layout before the softmax, so that the row max and sum stay within
+a wave, saved the cross-wave reductions but cost more in the 4x redundant
+exponentials and was slower.
+
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
 x tiles stays within 640. That re-reads each selected row once per head
