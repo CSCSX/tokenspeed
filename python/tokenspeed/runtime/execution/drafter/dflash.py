@@ -43,7 +43,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
@@ -982,18 +981,16 @@ class DFlash(BaseDrafter):
     def _overlap_allowed(self, ctx: ForwardContext) -> bool:
         """Whether this round's draft KV write may run on the aux stream
         alongside the target / the draft: decode-only rows (the target's
-        verify window is the round's full write vector), the fused writer,
-        and not the graph warmup phase — capture-only auxiliary branches warm
-        serially there and are recorded only under capture."""
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        verify window is the round's full write vector) and the fused writer.
+
+        The graph warmup phase takes the same branch as capture, so the aux
+        stream's GEMMs run before capture records them: on ROCm, hipBLASLt's
+        first call on a stream is not capture-safe."""
         return (
             ctx.dspark_context_producer is None
             and ctx.num_extends == 0
             and self._fused_kv_enabled
             and self._kv_aux_stream is not None
-            and (capturing or not get_is_cuda_graph_phase())
         )
 
     @override
