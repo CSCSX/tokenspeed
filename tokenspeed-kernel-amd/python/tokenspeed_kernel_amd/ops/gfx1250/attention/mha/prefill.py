@@ -2383,7 +2383,7 @@ def _select_prefill_geometry(
                 and 64 < length <= 128
                 and can_pack
                 and group >= 8
-                and (group < 32 or grid >= 3 * _GFX1250_NUM_CUS // 4)
+                and (group < 32 or length < 128 or grid >= 3 * _GFX1250_NUM_CUS // 4)
                 and len(set(seqlens)) == 1
             )
             min_workgroups = (
