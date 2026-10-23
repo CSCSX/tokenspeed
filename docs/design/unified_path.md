@@ -1168,7 +1168,8 @@ query count. Grids of at most 128 rows first try bounded scratch for split scori
 if that exceeds the caller's partial-workspace budget, they use workspace-free
 grouped scoring. This includes small decode grids with a zero-byte budget;
 capacities above 4096 compressed blocks use the overlap algorithm. Other
-geometries, larger page tables and other GPU architectures retain portable Triton.
+geometries, larger page tables, and other GPU architectures retain portable
+Triton.
 
 CuTe grouped scoring handles up to eight rows from one request. Uniform runs
 resolve their groups arithmetically, including a masked final group. Ragged runs
@@ -1176,11 +1177,11 @@ resolve group ownership from device request indices at eight-row boundaries and
 ownership changes, splitting at the next boundary. A ragged grid launches one
 CTA per query row; only those boundaries start scoring groups. Long runs leave
 most CTAs inactive, exiting before pipeline setup. This trades a larger launch
-grid for avoiding a global group table, metadata allocation or device-to-host read;
-aligned uniform runs retain their original unmasked specialization. Invalid
-query rows are zero-filled, have zero complete blocks and never write output,
-but their threads participate in the same pipeline synchronization. Small query
-grids can also score rows independently. Grouped streams keep exact
+grid for avoiding a global group table, metadata allocation, or device-to-host
+read; aligned uniform runs retain their original unmasked specialization.
+Invalid query rows are zero-filled, have zero complete blocks, and never write
+output, but their threads participate in the same pipeline synchronization.
+Small query grids can also score rows independently. Grouped streams keep exact
 running selections in selector registers, with double-buffered score
 candidates overlapping selection and MMA across tiles. Small grids can split
 the key range into bounded global scratch, including uniform runs whose final
