@@ -2368,19 +2368,32 @@ def _select_prefill_geometry(
             partial_short = (
                 config.head_dim == 128
                 and candidate == 256
-                and 96 < length < 128
+                and 64 < length < 128
                 and can_pack
-                and group >= 4
+                and group >= 2
+                and (group > 2 or grid <= _GFX1250_NUM_CUS)
                 and len(set(seqlens)) == 1
                 and (length * group) % 128 != 0
+                and config.batch_size * heads * triton_cdiv(length * group, 128)
+                > _GFX1250_NUM_CUS
+            )
+            short_narrow = (
+                config.head_dim == 128
+                and candidate == 128
+                and 64 < length <= 128
+                and can_pack
+                and group >= 8
+                and (group < 32 or grid >= 3 * _GFX1250_NUM_CUS // 4)
+                and len(set(seqlens)) == 1
             )
             min_workgroups = (
-                3 * _GFX1250_NUM_CUS // 4 if partial_short else _GFX1250_NUM_CUS
+                _GFX1250_NUM_CUS // 2
+                if partial_short or short_narrow
+                else _GFX1250_NUM_CUS
             )
             if (
-                candidate <= min(length, 128) * effective_group
-                and grid >= min_workgroups
-            ):
+                candidate <= min(length, 128) * effective_group or partial_short
+            ) and grid >= min_workgroups:
                 block_m = candidate
         if (
             length <= 128
@@ -2406,6 +2419,18 @@ def _select_prefill_geometry(
             and config.batch_size * heads * triton_cdiv(length * group, block_m)
             > _GFX1250_NUM_CUS
         ):
+            warps = 8
+        if (
+            config.head_dim == 128
+            and 64 < length < 128
+            and can_pack
+            and group >= 16
+            and len(set(seqlens)) == 1
+            and (length * group) % 128 != 0
+            and config.batch_size * heads * triton_cdiv(length * group, 128)
+            > _GFX1250_NUM_CUS
+        ):
+            block_m = 128
             warps = 8
         block_n = (
             64 if length <= 64 or (group > 1 and can_pack and block_m >= 128) else 128
