@@ -608,6 +608,9 @@ class ServerArgs:
     # Run each eligible decoder layer's decode step as one persistent
     # megakernel launch (DECODE_MEGAKERNEL_ARCHITECTURES). Off by default.
     decode_megakernel: bool = False
+    # Run an MTP draft's LM head from an MXFP4 copy of the target's head.
+    # Off by default.
+    draft_lm_head_mxfp4: bool = False
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -3298,6 +3301,17 @@ class ServerArgs:
                 "without attention or expert parallelism. Startup fails when "
                 "the model has no megakernel layer. Larger steps keep the "
                 "regular path."
+            ),
+        )
+        parser.add_argument(
+            "--draft-lm-head-mxfp4",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.draft_lm_head_mxfp4,
+            help=(
+                "Run the draft's LM head from an MXFP4 copy of the target's "
+                "BF16 head (about a quarter of its size), for drafts that "
+                "share the target's head. The target's logits do not change; "
+                "the draft's tokens, and so the accept rate, can."
             ),
         )
         parser.add_argument(
