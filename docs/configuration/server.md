@@ -1300,7 +1300,8 @@ For replicated groups, `object_rank` is the attention-TP rank; for cyclic
 page groups it is `tp_rank // shard_count`, independent of which cyclic owner
 allocated the block. The literal `c0` is a reserved format field.
 The namespace isolates loaded target/draft checkpoints, explicit weight
-versions, packed Host layout, parallel geometry and cache-producing runtime
+versions, packed Host layout, parallel geometry (including ordered group shard
+counts for page-sharded layouts) and cache-producing runtime
 choices. Different compatibility epochs start cold caches. See
 [cache concepts](../design/cache-concepts.md) for the identity contract.
 
