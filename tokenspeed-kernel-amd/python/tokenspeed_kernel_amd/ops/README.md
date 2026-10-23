@@ -861,15 +861,25 @@ to 9.7 us; at 1 request, from 13.0 to 12.3 us and from 8.8 to 7.6 us.
 
 Tiles dequantize from the raw ring straight into the QK operand layout, so
 QK runs from registers and the BF16 tile in LDS only feeds the transposed PV
-read. That operand reads 16 value rows at once, so the ring pads each row by
-16 bytes; unpadded, the rows share banks and the change is a net loss. CSA
-decode goes from 19.9 to 18.9 us at 16 requests and from 12.2 to 11.9 us at
-1 request, SWA from 9.7 to 9.4 us and from 7.6 to 7.2 us. PV keeps the BF16
-tile: its operand needs each lane's rows transposed, and the E2M1 global
-rows pack their nibbles along the head dims. Moving the scores into the PV
-operand layout before the softmax, so that the row max and sum stay within
-a wave, saved the cross-wave reductions but cost more in the 4x redundant
-exponentials and was slower.
+read. That operand reads 16 value rows at once, so the ring pads every 256
+bytes of a row by 8; unpadded, the rows share banks and the change is a net
+loss. CSA decode goes from 19.9 to 18.9 us at 16 requests and from 12.2 to
+11.9 us at 1 request, SWA from 9.7 to 9.4 us and from 7.6 to 7.2 us. PV
+keeps the BF16 tile: its operand needs each lane's rows transposed, and the
+E2M1 global rows pack their nibbles along the head dims. Moving the scores
+into the PV operand layout before the softmax, so that the row max and sum
+stay within a wave, saved the cross-wave reductions but cost more in the 4x
+redundant exponentials and was slower.
+
+SWA and global tiles share one value ring, viewed as 512- or 256-byte rows
+with the same padding, so a workgroup takes 146 KiB of LDS and two fit on a
+CU. Rows then split until the grid reaches 512 workgroups rather than 256.
+The reduce loads every split at once, at clamped splits and heads whose
+weight is zero, since masked loads would branch and wait around each one.
+Its width bounds the split count from the slot widths alone, so batch size
+never recompiles it. CSA decode goes from 18.9 to 16.2 us at 16 requests,
+11.9 to 9.9 us at 1, 29.3 to 26.6 us at 32 and 56.6 to 38.0 us at 64; SWA
+is unchanged.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
