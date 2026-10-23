@@ -2121,7 +2121,7 @@ def _select_deep_pipeline(
 ) -> bool:
     """Select deep causal pipelining for full tiles and guarded D128 batches.
 
-    Guarded rows use scaled FP32 softmax state and one/two-tile fallbacks.
+    Guarded rows mask invalid queries and use one/two-tile fallbacks.
     Their schedule needs enough KV iterations to amortize the pipeline setup.
     """
     full_query_tiles = _has_full_query_tiles(
@@ -2423,7 +2423,7 @@ def _select_prefill_geometry(
                 and candidate == 256
                 and 64 < length < 128
                 and can_pack
-                and group >= 2
+                and 2 <= group <= 8
                 and (group > 2 or grid <= _GFX1250_NUM_CUS)
                 and len(set(seqlens)) == 1
                 and (length * group) % 128 != 0

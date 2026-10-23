@@ -1111,99 +1111,46 @@ pays a fixed prologue and an FP32 partial store.
 
 ### gfx1250 MHA prefill
 
-The MHA prefill kernel computes causal attention over packed sequences with
-cumulative sequence boundaries. Sequence lengths may be equal or ragged. It
-supports BF16, FP16, and FP8 inputs with head dimension 64 or 128, grouped
-query heads, optional sliding windows and sinks, and natural-log LSE output.
+The kernel computes causal attention over packed sequences with equal or ragged
+lengths. It supports BF16, FP16, and FP8, head dimensions 64 and 128, grouped
+query heads, sliding windows, sinks, and natural-log LSE output.
 
-QK and PV accumulate in FP32. Probabilities round to the input dtype before
-PV. The numerical contract assumes the dot products are finite in FP32;
-FP32 softmax state preserves large finite scores by subtracting the maximum
-before scaling. The running maximum stays in unscaled score units, including
-when sinks and LSE are enabled.
+BF16/FP16 use finite tile and wave-count buckets. Compatible GQA groups pack
+query heads into matrix rows so they share K/V loads. Short sequences use one-
+or two-key-tile schedules with TDM query loads and fused K/V transfers. Short
+eight-wave tiles preserve wave ownership through the output store. Long
+sequences overlap K/V transfers with QK, softmax, and PV through a double
+buffer; selected layouts defer probability reductions to reduce loop work.
 
-BF16 and FP16 share a finite set of query/key tiles and wave counts. Short
-sequences use one- and two-key-tile schedules with TDM query loads and fused
-K/V loads. Larger batches use wider query tiles to amortize the K/V stream;
-smaller batches use more workgroups to occupy the device. Power-of-two GQA
-groups of up to 32 heads can share a workgroup, packing token/head pairs into
-the matrix rows. Other groups retain separate query-head workgroups.
-Aligned short single-sequence requests can use 64-row tiles instead of
-32-row tiles, reducing workgroup overhead while retaining masked tail handling.
-Short schedules that preload Q with K/V complete all TDM transfers before
-reading Q, so subsequent shared-memory reads omit redundant TDM waits. Short
-eight-wave BF16/FP16 tiles with head dimension 128 preserve each wave's query
-rows through the output store, avoiding cross-wave shared-memory transfers.
-For head dimension 128, full 128-row GQA tiles with four waves finish each
-resident key tile before starting the next QK product for head ratios 2, 8, 16,
-and 32. Uniform full 128-row tiles can use eight waves when their grid exceeds
-one workgroup per CU; group-of-four GQA retains the overlapped two-tile schedule.
-Uniform partial short GQA batches can use 256-row tiles with eight waves when
-the 128-row grid exceeds the CU count and the wider grid covers at least half
-the CUs. Head ratio two keeps the wider grid within the CU count. For head
-ratios 16 and 32, these batches retain 128-row tiles with eight waves to reduce
-per-thread register use. Short batches with head ratios of at least eight can
-also choose 128-row tiles when their grid covers half the CUs. Full 128-token
-batches with head ratio 32 require three quarters of the CUs. This avoids the
-wider key tile used by the 64-row fallback.
-Four-wave, 128-row short tiles with head ratio two use 32- or 64-row matrices
-for small query tails, reusing their resident K/V tiles. The remaining row count
-is evaluated on the device, so neighboring lengths retain the same JIT key.
-Wide short tiles with head ratio two can process all 128 keys together.
-Without sinks or LSE, a single key tile normalizes directly from its maximum
-and FP32 probability sum, since there is no previous tile to rescale. A finite
-maximum seed gives masked rows zero probability. Partial four-wave GQA2 tiles
-finish QK and probability conversion before reading V into registers.
-Partial query rows remain masked.
-Medium ragged MHA batches and small batches up to 512 tokens can use 64-row query
-and key tiles to expose more workgroups. Medium uniform GQA batches also use
-these tiles for small query tails and shorter partially filled tiles.
+Strongly imbalanced ragged batches compact live query tiles onto the grid.
+Partial query tiles remain masked and can use smaller matrices while reusing
+resident K/V. Request counts, uniform lengths, and tail lengths are runtime
+values; changing them within a tile/feature bucket does not recompile kernels.
+The launch policy and its thresholds live in `mha/prefill.py`.
 
-Long sequences use the K-ahead/V-behind pipeline. It finishes the previous
-tile's probability sum and conversion before computing the next QK tile.
-Separate-head launches with 256-row tiles advance heads first, then query
-tiles, then sequences. Other launches retain batch/head/query order. Full
-query tiles omit row bounds; short tails can use a smaller 32-row matrix.
-These decisions use device sequence lengths within the same launch.
-Packed 256-row tiles share one body for full and partial query rows, limiting
-code size while preserving masked tail stores.
-Full four-wave, 128-row pipelines alternate row blocks in the WMMA register
-layout. QK and PV share that row order so their softmax state needs no extra
-layout conversion. Short schedules retain their original register layout.
+QK and PV accumulate in FP32. The denominator uses probabilities before rounding
+them to the input dtype for PV. Dot products must be finite in FP32. Online
+softmax subtracts the maximum before scaling, preserving large finite scores.
+The fixed-shift schedule changes probability rounding, so its results are
+numerically equivalent within tolerance, rather than bitwise identical.
 
-Strongly imbalanced ragged batches compact their live query tiles onto the
-launch grid. The kernel obtains the request count from the grid at runtime,
-walks cumulative sequence boundaries, and skips the rounded grid's empty
-slots. Their fixed-shift pipeline fuses the next K transfer with the preceding
-V transfer and waits for each fused operation before consuming its data.
-Uniform lengths are also runtime scalars. Neither a new request count
-nor a new length alone introduces a JIT specialization; tile and feature
-choices remain finite compile-time classes.
-
-Four-wave causal pipelines with 64- or 128-key tiles can hold the first
-maximum fixed, avoiding later maximum reductions and accumulator rescaling.
-This changes probability rounding, so results are tolerance-equivalent to
-online softmax rather than bitwise identical.
-Since these probabilities share a scale, their FP32 denominator can accumulate
-column sums and reduce them at the end. Selected tile layouts first reduce
-within each thread to limit live state. Tiles with 256 rows retain per-tile
-row sums for head dimension 64 or separate-head execution to avoid excess
-register pressure. The denominator always uses probabilities before rounding
-for PV.
-
-| Numerical mode | Prerequisites | State and retry contract |
+| Mode | Eligibility | Numerical contract |
 | --- | --- | --- |
-| Online softmax | General path, including short schedules | Update the unscaled maximum per key tile; subtract it before scaling, rescale FP32 state, and round probabilities before PV. |
-| Fixed first-tile shift | BF16/FP16, four waves, head dimension 64 or 128, no sliding window, at least three key tiles | Use online softmax on the first tile and its fixed shift thereafter. Accept only rows with absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. The shift bound limits cancellation in fused scale-minus-shift arithmetic. |
-| Online retry | Any valid row in a fixed-shift workgroup fails a guard | Recompute that workgroup with subtract-before-scale online softmax in the same launch and buffers, then overwrite its provisional output. NaN-propagating reductions detect invalid output; the denominator bound prevents reciprocal underflow. |
+| Online softmax | General path, including FP8 and windows | Keep the maximum in unscaled score units; update it and rescale FP32 state for each key tile. |
+| Single-tile normalization | Short BF16/FP16, D128, 256 query rows, 128 keys, eight waves, no sinks/LSE | Subtract the tile maximum, accumulate the FP32 denominator, then round probabilities for PV. A finite maximum seed gives masked rows zero probability. |
+| Fixed first-tile shift | BF16/FP16, four waves, D64/D128, 64/128-key tiles, no window, at least three key tiles | Keep the first tile's shift. Require an absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. |
+| Online retry | Any valid row fails a fixed-shift guard | Recompute the workgroup with subtract-before-scale online softmax in the same launch and buffers, overwriting provisional output and LSE. |
 
-Natural-log LSE excludes sinks, matching the common attention reference.
-When both features are requested, the kernel preserves a maximum from key
-logits, writes their LSE, then adds sinks with stable rescaling of the output
-normalization. Masked tail rows start at
-the most negative finite FP32 value and do not participate in retry decisions.
-Selection uses current tensor values on every graph replay; high-range
-inputs can pay for both passes.
+The shift bound limits cancellation; NaN-propagating reductions detect invalid
+output, and the denominator bound prevents reciprocal underflow. Masked rows do
+not participate in retry decisions. Guards evaluate current tensor values on
+every graph replay; high-range inputs can pay for both passes.
+
+LSE describes key logits and excludes sinks. When both are requested, the kernel
+writes key-only LSE before adding sinks to output normalization with stable
+rescaling. Tests cover this contract with independent FP64 attention, changing
+graph inputs, storage offsets, ragged boundaries, and bounded JIT
+specialization.
 
 ### gfx1250 MLA prefill
 
