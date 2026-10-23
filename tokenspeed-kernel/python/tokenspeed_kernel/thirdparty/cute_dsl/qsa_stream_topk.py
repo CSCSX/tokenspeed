@@ -88,13 +88,17 @@ def _configuration(
     grouped = (
         queries_per_request is not None
         and queries_per_request >= 8
-        and queries_per_request % 8 == 0
         and rows % queries_per_request == 0
+    )
+    group_layout = (
+        "aligned"
+        if grouped and queries_per_request % _QUERY_GROUP == 0
+        else "uniform" if queries_per_request else "ragged"
     )
     if rows <= 128:
         if grouped and capacity > 8192:
             splits = 1 << (((capacity + 4095) // 4096) - 1).bit_length()
-            config = StreamConfig("split", splits, 0, False, False, 64, "aligned")
+            config = StreamConfig("split", splits, 0, False, False, 64, group_layout)
         else:
             splits = 1 << (((capacity + 63) // 64) - 1).bit_length()
             keep = 0
@@ -122,9 +126,6 @@ def _configuration(
             )
         if _workspace_bytes(rows, config) <= max_partial_bytes:
             return config
-    group_layout = (
-        "aligned" if grouped else "uniform" if queries_per_request else "ragged"
-    )
     if capacity <= 2048:
         algorithm = "prefill"
     elif capacity <= 4096:
@@ -148,9 +149,9 @@ def _compile(
     complete_blocks,
     selected,
     scratch,
+    queries_per_request: int | None,
     config: StreamConfig,
     enable_pdl: bool,
-    queries_per_request: int | None,
 ):
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     options = "--enable-tvm-ffi --opt-level 3"
@@ -375,9 +376,9 @@ def kernel(
             complete_blocks,
             selected,
             scratch,
+            queries_per_request,
             config,
             enable_pdl,
-            queries_per_request,
         )
         _COMPILED[key] = compiled
     target = [selected] if not scratch else scratch
