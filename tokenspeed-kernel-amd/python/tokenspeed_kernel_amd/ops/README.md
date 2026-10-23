@@ -851,6 +851,14 @@ pass computing both P @ V and the row sum reads V from LDS once. Together
 these save about 3.5 us of the 21 us CSA attention at 16 requests and 1 us
 at 1 request.
 
+The zero-query check loads every group's query at once as int32 words and
+ORs them. Its rows, like the staged slot rows, load clamped rather than
+masked: a row mask is uniform per register, so it becomes a branch and a
+full wait around each load. Outputs and partials store straight from the
+WMMA layout instead of through LDS. At 16 requests this takes CSA decode
+(attention plus reduce, in a graph) from 22.2 to 19.9 us and SWA from 13.1
+to 9.7 us; at 1 request, from 13.0 to 12.3 us and from 8.8 to 7.6 us.
+
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
 x tiles stays within 640. That re-reads each selected row once per head
