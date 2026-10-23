@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: perf-kda-replay-e2e-amd-gfx950
+name: perf-kda-replay-e2e-amd-gfx950-t1
 type: perf
 workflow_stage: model-test
 triggers:
@@ -20,9 +20,11 @@ perf:
     this_pr=ee90a9e8f94780846ef07f5cef9b99c8475e6603
     --model moonshotai/Kimi-K3
     --model-revision f831ab66814297da540d832a5235f8e904f29d06
-    --draft-model lightseekorg/kimi-k3-eagle3-mla
-    --draft-revision 4c48d2bb72134094340067e3012ebe0e822fac37
-    --modes t1 eagle3
+    --modes t1
+    --concurrency 32 64
+    --warmup-waves 2
+    --measured-waves 10
+    --passes 2
     --output .ci-artifacts/published/kda-replay-e2e
 report:
   github_step_summary: true

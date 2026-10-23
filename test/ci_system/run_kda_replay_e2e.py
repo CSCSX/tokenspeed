@@ -428,10 +428,21 @@ def main():
         "--modes", nargs="+", choices=("t1", "mtp3", "eagle3"), required=True
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--concurrency", type=int, nargs="+", default=[32, 64, 128])
+    parser.add_argument("--warmup-waves", type=int, default=2)
+    parser.add_argument("--measured-waves", type=int, default=3)
+    parser.add_argument(
+        "--passes",
+        type=int,
+        default=1,
+        help="Repeat the mirrored server order; each pass starts every arm twice",
+    )
     args = parser.parse_args()
     candidates = dict(item.split("=", 1) for item in args.candidates)
     if "main" in candidates or len(candidates) != len(args.candidates):
         parser.error("Candidate names must be unique and must not be 'main'")
+    if not all(0 < c <= 128 for c in args.concurrency):
+        parser.error("Concurrency must be between 1 and the 128 prepared requests")
     if "eagle3" in args.modes:
         if not args.draft_model or not args.draft_revision:
             parser.error("EAGLE3 requires --draft-model and --draft-revision")
@@ -448,14 +459,15 @@ def main():
         "candidates": candidates,
         "input_tokens": 4096,
         "output_tokens": 371,
-        "concurrency": [32, 64, 128],
+        "concurrency": args.concurrency,
         "tp": 8,
         "ep": 1,
         "modes": args.modes,
         "synthetic_acceptance_length": 3.7,
-        "warmup_waves": 2,
-        "measured_waves_per_start": 3,
-        "server_order": ["main", *candidates, *reversed(candidates), "main"],
+        "warmup_waves": args.warmup_waves,
+        "measured_waves_per_start": args.measured_waves,
+        "server_order": ["main", *candidates, *reversed(candidates), "main"]
+        * args.passes,
         "scope": "HTTP request E2E including prefill; prefix cache disabled; full source revisions with separately built schedulers; no profiler",
         "submission": "identical token requests released by one client barrier; scheduler batch identity is not guaranteed",
         "runs": [],
@@ -564,14 +576,16 @@ def main():
                     wait_ready(process, url, 3600)
                     run["status"] = "measuring"
                     for concurrency in report["concurrency"]:
-                        for repetition in range(5):
+                        for repetition in range(
+                            args.warmup_waves + args.measured_waves
+                        ):
                             result = asyncio.run(
                                 wave(url, metrics_url, payloads[:concurrency], 371)
                             )
                             result.update(
                                 concurrency=concurrency,
                                 repetition=repetition,
-                                warmup=repetition < 2,
+                                warmup=repetition < args.warmup_waves,
                             )
                             for r in result["requests"]:
                                 if r["usage"]["prompt_tokens"] != 4096:
@@ -618,6 +632,7 @@ def main():
                 finally:
                     stop_server(process)
                     write_json(args.output / "report.json", report)
+    expected_waves = 2 * args.passes * args.measured_waves
     comparisons = []
     for mode in report["modes"]:
         for concurrency in report["concurrency"]:
@@ -633,7 +648,7 @@ def main():
                     if w["concurrency"] == concurrency and not w["warmup"]
                 ]
                 row[name] = {"waves": len(samples)}
-                if len(samples) == 6:
+                if len(samples) == expected_waves:
                     for key in (
                         "elapsed_s",
                         "throughput_tokens_s",
@@ -649,11 +664,11 @@ def main():
                         row[name]["acceptance_rate"] = statistics.mean(
                             w["acceptance_rate"] for w in samples
                         )
-            if row["main"]["waves"] == 6:
+            if row["main"]["waves"] == expected_waves:
                 row["speedup"] = {
                     name: row["main"]["elapsed_s"] / row[name]["elapsed_s"]
                     for name in candidates
-                    if row[name]["waves"] == 6
+                    if row[name]["waves"] == expected_waves
                 }
             comparisons.append(row)
     report["comparisons"] = comparisons
