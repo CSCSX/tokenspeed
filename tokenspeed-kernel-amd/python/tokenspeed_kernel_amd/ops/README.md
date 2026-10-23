@@ -1144,7 +1144,8 @@ the CUs. Head ratio two keeps the wider grid within the CU count. For head
 ratios 16 and 32, these batches retain 128-row tiles with eight waves to reduce
 per-thread register use. Short batches with head ratios of at least eight can
 also choose 128-row tiles when their grid covers half the CUs. Full 128-token
-batches with head ratio 32 require three quarters of the CUs. This avoids the wider key tile used by the 64-row fallback.
+batches with head ratio 32 require three quarters of the CUs. This avoids the
+wider key tile used by the 64-row fallback.
 Partial query rows remain masked.
 Medium ragged MHA batches and small batches up to 512 tokens can use 64-row query
 and key tiles to expose more workgroups. Medium uniform GQA batches also use
