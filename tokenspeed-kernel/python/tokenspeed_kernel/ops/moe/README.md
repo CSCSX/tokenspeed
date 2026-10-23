@@ -406,3 +406,19 @@ This optional backend requires the qualified 152-SM planner and the matching
 CUDA source payload in FlashInfer. The unpatched 0.7.2 wheel lacks these and
 does not enable the registration. Prepare/warm up before graph capture;
 no persistent activation tensors are cached per layer by this adapter.
+
+## MegaMoE producer buffers
+
+The MegaMoE workspace exposes packed activation/scales, FP32 route weights,
+and INT32 expert-ID buffers through `input_buffers`. Routing producers can
+write directly into these views; `-1` marks inactive routes and padded rows.
+External INT32 or INT64 routes remain accepted through input staging.
+
+### Large Kimi-K3 router
+
+On SM103, the optional FlashInfer source bundle supplies biased-sigmoid top-16
+routing for contiguous FP32 logits and bias, 896 experts, and 3072-8192 tokens.
+It requires normalized weights with scale 1, FP32 output weights, and INT32 ids.
+The dispatcher preserves the existing implementations for other contracts or
+when the source bundle is absent. Explicit kernel selections still apply.
+MegaMoE supplies its INT32 input buffer directly, avoiding an ID conversion.

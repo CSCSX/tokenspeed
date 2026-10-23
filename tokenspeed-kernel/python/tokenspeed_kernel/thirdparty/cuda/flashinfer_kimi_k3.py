@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Optional FlashInfer Kimi-K3 front projections with their source payload."""
+"""Optional FlashInfer Kimi-K3 kernels with their source payloads."""
 
 from __future__ import annotations
 
@@ -73,3 +73,44 @@ def latent_front(
         shared,
         backend="cake",
     )
+
+
+@functools.cache
+def fused_router_available() -> bool:
+    """Whether the installed wheel includes the fused-router source payload."""
+    try:
+        from flashinfer.experimental.kimi_k3_fused_router import cake_jit
+    except ImportError:
+        return False
+    root = Path(cake_jit.__file__).parent / "csrc"
+    return bool(cake_jit.MODULES) and all(
+        (root / source).is_file()
+        for record in cake_jit.MODULES.values()
+        for source in record["sources"]
+    )
+
+
+def fused_router(
+    logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    out: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return normalized FP32 top-16 weights and INT32 expert IDs.
+
+    ``logits`` and ``correction_bias`` use the Kimi-K3 FP32/896-expert
+    contract. ``out`` supplies the two output buffers or requests allocation
+    when None. This function preserves caller-owned buffers.
+    """
+    from flashinfer.fused_moe.kimi_k3_fused_router import (
+        allocate_kimi_k3_route_plan,
+        prepare_kimi_k3_fused_router,
+    )
+
+    plan = allocate_kimi_k3_route_plan(logits.shape[0], 8, logits.device)
+    if out is not None:
+        plan = plan._replace(topk_weights=out[0], topk_ids=out[1])
+    prepare_kimi_k3_fused_router(
+        logits, correction_bias, block_m=8, plan=plan, backend="cake"
+    )()
+    return plan.topk_weights, plan.topk_ids

@@ -4326,3 +4326,66 @@ if (
             return latent_front(
                 hidden_states, router_weight, routed_weight, shared_gate_up_weight
             )
+
+
+if platform.is_nvidia and platform.arch_version == ArchVersion(10, 3):
+    from tokenspeed_kernel.thirdparty.cuda.flashinfer_kimi_k3 import (
+        fused_router,
+        fused_router_available,
+    )
+
+    if fused_router_available():
+
+        @register_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            name="flashinfer_kimi3_sigmoid_bias_topk",
+            solution="flashinfer",
+            capability=CapabilityRequirement(
+                min_arch_version=ArchVersion(10, 3),
+                max_arch_version=ArchVersion(10, 3),
+                vendors=frozenset({"nvidia"}),
+            ),
+            signatures=format_signatures("router_logits", "dense", {torch.float32}),
+            priority=Priority.SPECIALIZED,
+            traits={
+                "tokens_min": frozenset({3072}),
+                "tokens_max": frozenset({8192}),
+                "experts": frozenset({896}),
+                "topk": frozenset({16}),
+                "bias_dtype": frozenset({torch.float32}),
+                "inputs_contiguous": frozenset({True}),
+                "normalize_topk_weights": frozenset({True}),
+                "routed_scaling_factor": frozenset({1.0}),
+                "weights_dtype": frozenset({torch.float32}),
+                "ids_dtype": frozenset({torch.int32}),
+                "supports_output_buffers": frozenset({True}),
+            },
+        )
+        def flashinfer_kimi3_sigmoid_bias_topk(
+            *,
+            router_logits: torch.Tensor,
+            correction_bias: torch.Tensor,
+            topk: int,
+            routed_scaling_factor: float,
+            normalize_topk_weights: bool,
+            weights_dtype: torch.dtype,
+            out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Route normalized top-16 scores into FP32 weights and INT32 ids.
+
+            Args follow ``_moe_sigmoid_bias_topk``. Optional caller-owned
+            outputs are returned in place; omission allocates both outputs.
+            """
+            if (
+                topk != 16
+                or routed_scaling_factor != 1.0
+                or not normalize_topk_weights
+                or (out[0].dtype if out is not None else weights_dtype) != torch.float32
+                or (out is not None and out[1].dtype != torch.int32)
+            ):
+                raise ValueError(
+                    "FlashInfer Kimi-K3 routing requires normalized top-16 "
+                    "weights with scale 1, FP32 weights, and INT32 ids"
+                )
+            return fused_router(router_logits, correction_bias, out=out)
