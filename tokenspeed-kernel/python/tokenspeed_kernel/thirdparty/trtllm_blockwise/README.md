@@ -31,3 +31,9 @@ Matrix widths, fixed dtypes and output shapes remain in the tuning key.
 Tactics compile before tuning/capture, and serving uses cached
 choices. An untuned shape retains the existing implementation. Explicit
 `trtllm_cutedsl` selection keeps the original fixed-tile comparison path.
+
+Startup enumeration can be widened for an operator with `autotune_max_rows`.
+The 64-row serving bucket map stays fixed, so wider-range entries remain
+usable after the scope exits and after cache reload. MLA KV expansion declares
+its cached-history chunk capacity; ordinary projections retain the engine's
+normal token range. Serving never tunes a missing shape.

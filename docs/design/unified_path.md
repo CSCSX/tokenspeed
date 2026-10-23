@@ -1708,7 +1708,11 @@ bucket can use the next existing token bucket, otherwise the ordinary fallback
 remains. Startup autotuning uses the same dummy-batch builder with an explicit
 minimum request count, `ceil(num_tokens / context_len)`, independent of the
 configured capture request counts. Its token budget also respects rank-local
-request capacity. Request counts exceeding captured capacity retain the
+request capacity. Operators whose inputs can exceed the new-token budget declare
+their row capacity during that traversal: MLA KV expansion uses its cached
+history chunk capacity. This widens only that operator's startup tuning sweep;
+its serving bucket map is unchanged, including after loading persisted tactics.
+Request counts exceeding captured capacity retain the
 ordinary attention break and eager KDA. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror. Unifying metadata does not

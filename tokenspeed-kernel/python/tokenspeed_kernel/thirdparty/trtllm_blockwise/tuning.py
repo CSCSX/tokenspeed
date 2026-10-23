@@ -168,10 +168,7 @@ class CuteBlockFp8Runner(TunableRunner):
 
 
 @functools.cache
-def _configuration():
-    from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
-
-    maximum = get_autotune_max_num_tokens()
+def _configuration(maximum: int):
     buckets = (1, 2, 4, 8, 16, 32, *range(64, ((maximum + 63) // 64) * 64 + 1, 64))
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -199,6 +196,8 @@ def tuned_blockwise_gemm(a, b, a_scales, b_scales, out, *, allow_existing: bool)
     """
     if a.shape[0] == 0:
         return out
+    from tokenspeed_kernel.ops.tuning import get_autotune_max_rows
+
     inputs = [a, b, a_scales, b_scales, out]
     if (
         allow_existing
@@ -211,7 +210,7 @@ def tuned_blockwise_gemm(a, b, a_scales, b_scales, out, *, allow_existing: bool)
     runner, tactic = AutoTuner.get().choose_one(
         "tokenspeed::block_fp8_gemm",
         runners,
-        _configuration(),
+        _configuration(get_autotune_max_rows()),
         inputs,
     )
     return runner(inputs, tactic=tactic)
