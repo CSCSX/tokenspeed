@@ -842,6 +842,15 @@ rows) as tiny or zero, so invalid rows stay exactly zero. At decode shapes on
 MI455X this saves about 2 us at 1 request and 3.5 us at 16 requests on CSA
 layers over unprefetched loads.
 
+Staging also resolves every position's gather row (-1 when unusable) in one
+vectorized pass. TDM takes its row indices in SGPRs, so deriving them per
+tile from the slots ran about ten dependent scalar instructions per row, and
+the score mask reads the same table. The first pass's leading copies go out
+before the zero-query check, whose query loads then overlap them, and a
+pass computing both P @ V and the row sum reads V from LDS once. Together
+these save about 3.5 us of the 21 us CSA attention at 16 requests and 1 us
+at 1 request.
+
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
 x tiles stays within 640. That re-reads each selected row once per head
