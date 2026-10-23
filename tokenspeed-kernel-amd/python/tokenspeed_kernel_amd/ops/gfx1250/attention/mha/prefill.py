@@ -198,11 +198,21 @@ class AttentionConfig:
                 [[HEAD_DIM, 16]], [BLOCK_N, HEAD_DIM], [1, 0]
             )
         )
-        store_vec = 8
+        # Keep each wave's query rows through the short eight-wave epilogue.
+        # Redistributing them across waves needs extra shared-memory barriers.
+        preserve_store_waves = (
+            HEAD_DIM == 128
+            and BLOCK_M == 256
+            and NUM_WARPS == 8
+            and not IS_FP8
+            and not DEEP_PIPELINE
+        )
+        store_vec = 4 if preserve_store_waves else 8
         store_threads = HEAD_DIM // store_vec
+        store_rows = store_threads // 2 if preserve_store_waves else 1
         self.store_layout = gl.constexpr(
             gl.BlockedLayout(
-                [1, store_vec],
+                [store_rows, store_vec],
                 [32 // store_threads, store_threads],
                 [NUM_WARPS, 1],
                 [1, 0],
@@ -555,17 +565,18 @@ class AttentionProgram:
             )
             q_head = self.row_qhead(offs_m)
             sink_log2 = gl.load(self.sink_ptr + q_head).to(gl.float32) * _INV_LN2
-            sink_unscaled = sink_log2 / cfg.SM_SCALE
-            sink_state = sink_unscaled
+        else:
+            sink_log2 = 0.0
+        if cfg.HAS_SINK and not cfg.HAS_LSE:
             m_i = gl.full(
                 [cfg.BLOCK_M],
                 value=0,
                 dtype=gl.float32,
                 layout=gl.SliceLayout(1, cfg.pv_layout),
             )
-            m_i += sink_state
+            m_i += sink_log2 / cfg.SM_SCALE
         else:
-            sink_log2 = 0.0
+            # LSE excludes sinks, so preserve a maximum from the key logits.
             # Packed tail rows can be fully masked. A finite seed keeps their
             # max-difference arithmetic defined while exp2 still underflows to zero.
             initial_max: gl.constexpr = (
@@ -669,12 +680,20 @@ class AttentionProgram:
         return p, l_i, acc
 
     @gluon.jit
-    def apply_sinks(self, l_i, m_i, sink_log2):
+    def apply_sinks(self, l_i, m_i, acc, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            m_i_scaled = m_i * cfg.SM_SCALE
-            l_i += gl.exp2(sink_log2 - m_i_scaled)
-        return l_i
+            sink_delta = sink_log2 - m_i * cfg.SM_SCALE
+            if cfg.HAS_LSE:
+                # Sinks join output normalization after writing key-only LSE.
+                # Rescale both terms when a sink exceeds the key maximum.
+                shift = maximum(sink_delta, 0.0)
+                alpha = gl.exp2(-shift)
+                acc *= alpha[:, None]
+                l_i = l_i * alpha + gl.exp2(sink_delta - shift)
+            else:
+                l_i += gl.exp2(sink_delta)
+        return l_i, acc
 
     @gluon.jit
     def store_lse(self, l_i, m_i):
@@ -814,8 +833,8 @@ def process_single_attention_tile(
         v = program.tdm_shared_load_v(0, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
     program.store_lse(l_i, m_i)
+    l_i, acc = program.apply_sinks(l_i, m_i, acc, sink_log2)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
     output = output.to(program.output_ptr.dtype.element_ty)
@@ -880,9 +899,7 @@ def process_attention_tile(
     if not USE_TDM_Q or num_tiles != 2:
         program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
     if prefetched:
-        k = (
-            program.k_buffer.index(1).permute([1, 0]).load(layout=cfg.k_layout)
-        )
+        k = program.k_buffer.index(1).permute([1, 0]).load(layout=cfg.k_layout)
     else:
         k = program.tdm_shared_load_k(1, wait_count=2)
 
@@ -980,8 +997,8 @@ def process_attention_tile(
         v = program.tdm_shared_load_v(last_buffer_index, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
     program.store_lse(l_i, m_i)
+    l_i, acc = program.apply_sinks(l_i, m_i, acc, sink_log2)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
     output = output.to(program.output_ptr.dtype.element_ty)
@@ -1107,8 +1124,8 @@ def process_attention_tile_deep(
     v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
     program.store_lse(l_i, m_i)
+    l_i, acc = program.apply_sinks(l_i, m_i, acc, sink_log2)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
     output = output.to(program.output_ptr.dtype.element_ty)
@@ -1131,6 +1148,42 @@ def process_attention_tile_retry(
 
 
 @gluon.jit
+def local_probability_sums(p, program):
+    cfg = program.cfg
+    if (
+        cfg.HEAD_DIM == 128
+        and cfg.BLOCK_M >= 64
+        and (cfg.BLOCK_M != 128 or cfg.BLOCK_N == 128 or cfg.COMPACT_RAGGED)
+    ):
+        linear: gl.constexpr = gl.to_linear_layout(
+            cfg.qk_layout, [cfg.BLOCK_M, cfg.BLOCK_N]
+        )
+        terms = gl.convert_layout(p, linear)
+        terms = gl.reshape(terms, [cfg.BLOCK_M, cfg.BLOCK_N // 16, 2, 8])
+        terms = gl.sum(terms, axis=3)
+        return gl.sum(terms, axis=1)
+    else:
+        return p
+
+
+@gluon.jit
+def prefetch_staggered_kv(program, k_start, k_index, v_start, v_index):
+    k_desc = cdna5.tdm.update_tensor_descriptor(
+        program.k_desc, add_offsets=[k_start, 0], pred=True, clamp_bounds=True
+    )
+    v_desc = cdna5.tdm.update_tensor_descriptor(
+        program.v_desc, add_offsets=[v_start, 0], pred=True, clamp_bounds=True
+    )
+    cdna5.tdm.async_load_fused(
+        [
+            (k_desc, program.k_buffer.index(k_index), 0b0011),
+            (v_desc, program.v_buffer.index(v_index), 0b1100),
+        ],
+        cache_modifier=".cg",
+    )
+
+
+@gluon.jit
 def process_attention_tile_fixed_shift(
     program: AttentionProgram,
     kv_start,
@@ -1140,69 +1193,117 @@ def process_attention_tile_fixed_shift(
 ):
     """Keep the first maximum; retry with online softmax on unsafe state."""
     cfg = program.cfg
+    staggered: gl.constexpr = cfg.COMPACT_RAGGED
+    # Wide D64 and separate-head tiles retain row sums to limit live registers.
+    defer_probability_sum: gl.constexpr = cfg.BLOCK_M != 256 or (
+        cfg.HEAD_DIM == 128 and cfg.PACKED_GQA
+    )
+    # Query starts align to their span. For spans at most two key tiles,
+    # every prefix tile precedes all valid query rows; the last two need care.
+    skip_prefix_mask: gl.constexpr = cfg.COMPACT_RAGGED or cfg.BLOCK_M <= 64
+    query_span: gl.constexpr = (
+        cfg.BLOCK_M // (cfg.N_HEADS // cfg.N_KV_HEADS)
+        if cfg.PACKED_GQA
+        else cfg.BLOCK_M
+    )
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
     program.tdm_load_global_to_shared_k(kv_start, 0)
-    program.tdm_load_global_to_shared_k(kv_start + cfg.BLOCK_N, 1)
-    program.tdm_load_global_to_shared_v(kv_start, 0)
-
-    k = program.tdm_shared_load_k(0, wait_count=2)
-    qk = program.compute_qk(q, k)
-    if cfg.WINDOW_LEFT < 0:
-        if kv_start + cfg.BLOCK_N > program.q_start:
-            qk = program.apply_mask(qk, kv_start)
+    if staggered:
+        prefetch_staggered_kv(program, kv_start + cfg.BLOCK_N, 1, kv_start, 0)
     else:
-        qk = program.apply_mask(qk, kv_start)
-    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+        program.tdm_load_global_to_shared_k(kv_start + cfg.BLOCK_N, 1)
+        program.tdm_load_global_to_shared_v(kv_start, 0)
 
-    program.tdm_load_global_to_shared_k(kv_start + 2 * cfg.BLOCK_N, 0)
-    program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
-    k = program.tdm_shared_load_k(1, wait_count=3)
+    k = program.tdm_shared_load_k(0, wait_count=1 if staggered else 2)
+    qk = program.compute_qk(q, k)
+    if not skip_prefix_mask or cfg.WINDOW_LEFT >= 0 or query_span > 2 * cfg.BLOCK_N:
+        if cfg.WINDOW_LEFT >= 0 or kv_start + cfg.BLOCK_N > program.q_start:
+            qk = program.apply_mask(qk, kv_start)
+    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    if not defer_probability_sum:
+        l_i = gl.sum(p, axis=1)
+    else:
+        denom_terms = local_probability_sums(p, program)
+    p = p.to(program.q_ptr.dtype.element_ty)
+    p = gl.convert_layout(p, cfg.p_layout)
+
+    if staggered:
+        prefetch_staggered_kv(
+            program, kv_start + 2 * cfg.BLOCK_N, 0, kv_start + cfg.BLOCK_N, 1
+        )
+    else:
+        program.tdm_load_global_to_shared_k(kv_start + 2 * cfg.BLOCK_N, 0)
+        program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
+    k = program.tdm_shared_load_k(1, wait_count=1 if staggered else 3)
 
     iter_id = 0
     for tile_idx in range(1, num_tiles - 2):
         cur_kv_start = kv_start + tile_idx * cfg.BLOCK_N
 
-        v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
-        qk = program.compute_qk(q, k)
-        if cfg.WINDOW_LEFT < 0:
-            if cur_kv_start + cfg.BLOCK_N > program.q_start:
-                qk = program.apply_mask(qk, cur_kv_start)
-        else:
-            qk = program.apply_mask(qk, cur_kv_start)
-        program.tdm_load_global_to_shared_k(
-            cur_kv_start + 2 * cfg.BLOCK_N,
-            (iter_id + 1) % cfg.NUM_BUFFERS,
+        v = program.tdm_shared_load_v(
+            iter_id % cfg.NUM_BUFFERS, wait_count=1 if staggered else 2
         )
+        qk = program.compute_qk(q, k)
+        if not skip_prefix_mask or cfg.WINDOW_LEFT >= 0 or query_span > 2 * cfg.BLOCK_N:
+            if cfg.WINDOW_LEFT >= 0 or cur_kv_start + cfg.BLOCK_N > program.q_start:
+                qk = program.apply_mask(qk, cur_kv_start)
+        if staggered:
+            prefetch_staggered_kv(
+                program,
+                cur_kv_start + 2 * cfg.BLOCK_N,
+                (iter_id + 1) % cfg.NUM_BUFFERS,
+                cur_kv_start + cfg.BLOCK_N,
+                iter_id % cfg.NUM_BUFFERS,
+            )
+        else:
+            program.tdm_load_global_to_shared_k(
+                cur_kv_start + 2 * cfg.BLOCK_N,
+                (iter_id + 1) % cfg.NUM_BUFFERS,
+            )
 
         acc = program.compute_pv(p, v, acc)
         p, alpha, m_i = program.softmax_fixed_shift(qk, m_i)
-        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
-        k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=2)
-
-        program.tdm_load_global_to_shared_v(
-            cur_kv_start + cfg.BLOCK_N,
-            iter_id % cfg.NUM_BUFFERS,
+        if not defer_probability_sum:
+            l_i += gl.sum(p, axis=1)
+        else:
+            denom_terms += local_probability_sums(p, program)
+        p = p.to(program.q_ptr.dtype.element_ty)
+        p = gl.convert_layout(p, cfg.p_layout)
+        k = program.tdm_shared_load_k(
+            iter_id % cfg.NUM_BUFFERS, wait_count=1 if staggered else 2
         )
+
+        if not staggered:
+            program.tdm_load_global_to_shared_v(
+                cur_kv_start + cfg.BLOCK_N,
+                iter_id % cfg.NUM_BUFFERS,
+            )
         iter_id += 1
 
     penultimate_kv_start = kv_start + (num_tiles - 2) * cfg.BLOCK_N
     last_kv_start = kv_start + (num_tiles - 1) * cfg.BLOCK_N
 
-    v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
+    v = program.tdm_shared_load_v(
+        iter_id % cfg.NUM_BUFFERS, wait_count=1 if staggered else 2
+    )
     acc = program.compute_pv(p, v, acc)
 
     qk = program.compute_qk(q, k)
-    if cfg.WINDOW_LEFT < 0:
-        if penultimate_kv_start + cfg.BLOCK_N > program.q_start:
+    if not skip_prefix_mask or cfg.WINDOW_LEFT >= 0 or query_span > cfg.BLOCK_N:
+        if cfg.WINDOW_LEFT >= 0 or penultimate_kv_start + cfg.BLOCK_N > program.q_start:
             qk = program.apply_mask(qk, penultimate_kv_start)
-    else:
-        qk = program.apply_mask(qk, penultimate_kv_start)
     p, alpha, m_i = program.softmax_fixed_shift(qk, m_i)
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    if not defer_probability_sum:
+        l_i += gl.sum(p, axis=1)
+    else:
+        denom_terms += local_probability_sums(p, program)
+    p = p.to(program.q_ptr.dtype.element_ty)
+    p = gl.convert_layout(p, cfg.p_layout)
 
-    k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=1)
+    k = program.tdm_shared_load_k(
+        iter_id % cfg.NUM_BUFFERS, wait_count=0 if staggered else 1
+    )
     program.tdm_load_global_to_shared_v(last_kv_start, iter_id % cfg.NUM_BUFFERS)
 
     qk = program.compute_qk(q, k)
@@ -1211,12 +1312,21 @@ def process_attention_tile_fixed_shift(
     acc = program.compute_pv(p, v, acc)
 
     p, alpha, m_i = program.softmax_fixed_shift(qk, m_i)
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    if not defer_probability_sum:
+        l_i += gl.sum(p, axis=1)
+    else:
+        denom_terms += local_probability_sums(p, program)
+    p = p.to(program.q_ptr.dtype.element_ty)
+    p = gl.convert_layout(p, cfg.p_layout)
     v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
+    # Fixed-shift probabilities share one scale; defer their cross-lane sum.
+    if defer_probability_sum:
+        l_i = gl.sum(denom_terms, axis=1)
+        l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.pv_layout))
     program.store_lse(l_i, m_i)
+    l_i, acc = program.apply_sinks(l_i, m_i, acc, sink_log2)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output_fp32 = acc * (1.0 / denom)[:, None]
     output = output_fp32.to(program.output_ptr.dtype.element_ty)
@@ -1312,7 +1422,7 @@ def process_attention_tile_selected(
                     QK_VALU_GROUP_SIZE,
                     QK_DS_GROUP_STRIDE,
                 )
-            elif program.q_start + query_span <= program.seq_len:
+            elif cfg.BLOCK_M < 256 and program.q_start + query_span <= program.seq_len:
                 full_cfg: gl.constexpr = _query_tile_config(
                     cfg, cfg.BLOCK_M, True, False
                 )
@@ -1545,7 +1655,7 @@ def process_attention_wide_transport(
         )
 
     m_i, l_i, acc, sink_log2 = state
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
+    l_i, acc = program.apply_sinks(l_i, m_i, acc, sink_log2)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
     output = gl.convert_layout(
@@ -2096,10 +2206,10 @@ def _select_m_tile(
 ) -> tuple[int, int]:
     """Pick (BLOCK_M, num_warps) for prefill, measured on gfx1250.
 
-    A 256-row tile is worth ~1.4x over a 128-row one, but only together with 8
-    warps: warps tile M only, so doubling them halves the registers each lane
-    holds for the fp32 accumulator and keeps the tile off the spill cliff.
-    Either change alone is neutral or slower.
+    The baseline online schedule pairs a 256-row tile with eight warps
+    to limit per-thread accumulator storage. The deep pipeline can use four
+    warps for this tile; get_config and the final geometry selection apply
+    that schedule's wave count separately.
 
     The wide tile costs two things, and both bound where it pays:
 
@@ -2238,7 +2348,19 @@ def _select_prefill_geometry(
         config.head_dim == 128
         and 256 < length <= 2048
         and 16384 <= rows <= 32768
-        and (length <= 512 or (group == 1 and len(set(seqlens)) > 1))
+        and (
+            length <= 512
+            or (group == 1 and len(set(seqlens)) > 1)
+            or (
+                group > 1
+                and can_pack
+                and len(set(seqlens)) == 1
+                and (
+                    0 < (length * group) % 128 <= 32
+                    or (length <= 768 and (length * group) % 128 != 0)
+                )
+            )
+        )
     ):
         return 64, 64, 4, can_pack, True
     if config.head_dim == 64:
@@ -2357,7 +2479,7 @@ def launch_gluon_mha_prefill_gfx1250(
             block_m=block_m,
             block_n=block_n,
             num_warps=4,
-            waves_per_eu=0 if wide_packed_gqa else 2,
+            waves_per_eu=2,
             packed_gqa=True,
             grid=(
                 config.batch_size,

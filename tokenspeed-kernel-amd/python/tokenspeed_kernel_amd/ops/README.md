@@ -1131,9 +1131,12 @@ the matrix rows. Other groups retain separate query-head workgroups.
 Aligned short single-sequence requests can use 64-row tiles instead of
 32-row tiles, reducing workgroup overhead while retaining masked tail handling.
 Short schedules that preload Q with K/V complete all TDM transfers before
-reading Q, so subsequent shared-memory reads omit redundant TDM waits. Medium
-ragged MHA batches and small batches up to 512 tokens can use 64-row query
-and key tiles to expose more workgroups.
+reading Q, so subsequent shared-memory reads omit redundant TDM waits. Short
+eight-wave BF16/FP16 tiles with head dimension 128 preserve each wave's query
+rows through the output store, avoiding cross-wave shared-memory transfers.
+Medium ragged MHA batches and small batches up to 512 tokens can use 64-row query
+and key tiles to expose more workgroups. Medium uniform GQA batches also use
+these tiles for small query tails and shorter partially filled tiles.
 
 Long sequences use the K-ahead/V-behind pipeline. It finishes the previous
 tile's probability sum and conversion before computing the next QK tile.
@@ -1141,6 +1144,8 @@ Separate-head launches with 256-row tiles advance heads first, then query
 tiles, then sequences. Other launches retain batch/head/query order. Full
 query tiles omit row bounds; short tails can use a smaller 32-row matrix.
 These decisions use device sequence lengths within the same launch.
+Packed 256-row tiles share one body for full and partial query rows, limiting
+code size while preserving masked tail stores.
 Full four-wave, 128-row pipelines alternate row blocks in the WMMA register
 layout. QK and PV share that row order so their softmax state needs no extra
 layout conversion. Short schedules retain their original register layout.
@@ -1148,7 +1153,9 @@ layout conversion. Short schedules retain their original register layout.
 Strongly imbalanced ragged batches compact their live query tiles onto the
 launch grid. The kernel obtains the request count from the grid at runtime,
 walks cumulative sequence boundaries, and skips the rounded grid's empty
-slots. Uniform lengths are also runtime scalars. Neither a new request count
+slots. Their fixed-shift pipeline fuses the next K transfer with the preceding
+V transfer and waits for each fused operation before consuming its data.
+Uniform lengths are also runtime scalars. Neither a new request count
 nor a new length alone introduces a JIT specialization; tile and feature
 choices remain finite compile-time classes.
 
@@ -1156,6 +1163,12 @@ Four-wave causal pipelines with 64- or 128-key tiles can hold the first
 maximum fixed, avoiding later maximum reductions and accumulator rescaling.
 This changes probability rounding, so results are tolerance-equivalent to
 online softmax rather than bitwise identical.
+Since these probabilities share a scale, their FP32 denominator can accumulate
+column sums and reduce them at the end. Selected tile layouts first reduce
+within each thread to limit live state. Tiles with 256 rows retain per-tile
+row sums for head dimension 64 or separate-head execution to avoid excess
+register pressure. The denominator always uses probabilities before rounding
+for PV.
 
 | Numerical mode | Prerequisites | State and retry contract |
 | --- | --- | --- |
@@ -1163,7 +1176,10 @@ online softmax rather than bitwise identical.
 | Fixed first-tile shift | BF16/FP16, four waves, head dimension 64 or 128, no sliding window, at least three key tiles | Use online softmax on the first tile and its fixed shift thereafter. Accept only rows with absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. The shift bound limits cancellation in fused scale-minus-shift arithmetic. |
 | Online retry | Any valid row in a fixed-shift workgroup fails a guard | Recompute that workgroup with subtract-before-scale online softmax in the same launch and buffers, then overwrite its provisional output. NaN-propagating reductions detect invalid output; the denominator bound prevents reciprocal underflow. |
 
-Sinks and natural-log LSE retain their semantics. Masked tail rows start at
+Natural-log LSE excludes sinks, matching the common attention reference.
+When both features are requested, the kernel preserves a maximum from key
+logits, writes their LSE, then adds sinks with stable rescaling of the output
+normalization. Masked tail rows start at
 the most negative finite FP32 value and do not participate in retry decisions.
 Selection uses current tensor values on every graph replay; high-range
 inputs can pay for both passes.

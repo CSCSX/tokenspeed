@@ -597,7 +597,7 @@ def test_select_m_tile_gates():
     assert prefill._select_m_tile(batch_size=4, n_heads=32, max_seqlen=4096) == wide
 
 
-def _check_sampled_fp64(out, q, k, v, cu_cpu):
+def _check_sampled_fp64(out, q, k, v, cu_cpu, *, sinks=None, lse=None):
     # Sample complete chunks at causal/tile boundaries without materializing a
     # quadratic FP64 score tensor for every query in a long prefill.
     assert torch.isfinite(out).all()
@@ -610,14 +610,14 @@ def _check_sampled_fp64(out, q, k, v, cu_cpu):
             {0, min(63, length - 1), min(127, length - 1), max(0, length - 33)}
         ):
             stop = min(length, row + 33)
-            expected, _ = torch_dense_attention(
+            expected, expected_lse = torch_dense_attention(
                 q[start + row : start + stop].double(),
                 k[start:end].double(),
                 v[start:end].double(),
                 scale=1.0 / math.sqrt(q.shape[-1]),
                 causal_offset=row,
                 window_left=None,
-                sinks=None,
+                sinks=None if sinks is None else sinks.double(),
             )
             actual = out[start + row : start + stop].double()
             torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
@@ -625,6 +625,14 @@ def _check_sampled_fp64(out, q, k, v, cu_cpu):
             error_norm = torch.linalg.vector_norm(actual - expected)
             reference_norm = torch.linalg.vector_norm(expected)
             assert error_norm <= rms_tolerance * reference_norm + 1e-12
+
+            if lse is not None:
+                torch.testing.assert_close(
+                    lse[start + row : start + stop].double(),
+                    expected_lse,
+                    atol=3e-5,
+                    rtol=3e-5,
+                )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -830,8 +838,11 @@ def test_mha_prefill_storage_offset_repeated(seqlens, n_q_heads, n_kv_heads, dty
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("seqlen", [8192, 8193], ids=["full", "tail"])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    "head_dim,seqlen",
+    [(64, 8192), (64, 8193), (128, 8192), (128, 8193), (64, 32768), (64, 32769)],
+    ids=["d64-full", "d64-tail", "d128-full", "d128-tail", "d64-wide", "d64-wide-tail"],
+)
 def test_mha_prefill_fixed_shift_retry_graph(dtype, seqlen, head_dim):
     """Changing logits must select a safe numerical path on every replay."""
     torch.manual_seed(46)
@@ -960,6 +971,8 @@ def _launch_tile(
     "seqlens,n_q_heads,n_kv_heads,head_dim",
     [
         ([64] * 32, 32, 8, 128),
+        ([96] * 32, 32, 8, 128),
+        ([127] * 32, 32, 8, 128),
         ([128] * 32, 32, 8, 128),
         ([128] * 32, 8, 1, 128),
         ([128] * 32, 8, 8, 128),
@@ -972,6 +985,8 @@ def _launch_tile(
     ],
     ids=[
         "one_tile",
+        "gqa_96",
+        "gqa_127",
         "gqa_two_tiles",
         "mqa",
         "mha",
@@ -1211,3 +1226,112 @@ def test_mha_prefill_medium_ragged_lengths_do_not_recompile(dtype):
                     q, k, v, cu, cu_cpu, maximum
                 )
         _check_sampled_fp64(output, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "batch,n_q_heads,n_kv_heads,lengths",
+    [
+        (1, 32, 16, (513, 514, 520, 537, 545, 569, 577, 633)),
+        (1, 32, 8, (513, 514, 520, 521, 537, 545, 552, 553, 577)),
+        (1, 32, 4, (513, 514, 516, 521, 525, 529, 532, 541, 553)),
+        (1, 32, 2, (513, 514, 515, 517, 519, 521, 522, 531)),
+        (1, 32, 1, (513, 515, 517, 519, 521, 523)),
+        (4, 8, 1, (513, 514, 516, 521, 525, 529, 532, 541, 553)),
+    ],
+)
+def test_mha_prefill_partial_packed_tiles_replay_without_recompile(
+    dtype, batch, n_q_heads, n_kv_heads, lengths
+):
+    """Partial packed tiles preserve numerics and reuse code across request lengths."""
+    torch.manual_seed(73)
+    for index, length in enumerate(lengths):
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            [length] * batch, n_q_heads, n_kv_heads, 128, "cuda", dtype
+        )
+
+        def shifted(tensor):
+            storage = torch.empty(tensor.numel() + 1, device="cuda", dtype=dtype)
+            return storage[1:].view_as(tensor).copy_(tensor)
+
+        q, k, v = (shifted(tensor) for tensor in (q, k, v))
+        saved = [tensor.clone() for tensor in (q, k, v)]
+        if index == 0:
+            prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        for scale in (1, 8, 1):
+            for tensor, original in zip((q, k, v), saved):
+                tensor.copy_(original)
+            q.mul_(scale)
+            k.mul_(scale)
+            output.fill_(float("nan"))
+            graph.replay()
+            _check_sampled_fp64(output, q, k, v, cu_cpu)
+            expected = output.clone()
+            for _ in range(100):
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("feature", ["sink", "lse", "both"])
+def test_mha_prefill_full_tile_sink_lse_replay(dtype, head_dim, feature):
+    """Full-tile normalization preserves sinks and LSE when replay triggers retry."""
+    torch.manual_seed(74)
+    q, k, v, cu, cu_cpu, maximum = _inputs([4096] * 4, 8, 2, head_dim, "cuda", dtype)
+    saved = [tensor.clone() for tensor in (q, k, v)]
+    sinks = (
+        torch.linspace(-4, 4, 8, device="cuda", dtype=dtype)
+        if feature in ("sink", "both")
+        else None
+    )
+    original_sinks = None if sinks is None else sinks.clone()
+    return_lse = feature in ("lse", "both")
+    prefill.launch_gluon_mha_prefill_gfx1250(
+        q, k, v, cu, cu_cpu, maximum, sinks=sinks, return_lse=return_lse
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, maximum, sinks=sinks, return_lse=return_lse
+        )
+    output, lse = result if return_lse else (result, None)
+    for pattern in ("normal", "sharp", "late_large", "normal"):
+        for tensor, original in zip((q, k, v), saved):
+            tensor.copy_(original)
+        if sinks is not None:
+            sinks.copy_(original_sinks)
+        if pattern == "sharp":
+            q.mul_(8)
+            k.mul_(8)
+        elif pattern == "late_large":
+            q.fill_(1)
+            k.zero_()
+            for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
+                k[start + 256 : end].fill_(16)
+            if sinks is not None:
+                sinks.add_(96)
+        output.fill_(float("nan"))
+        if lse is not None:
+            lse.fill_(float("nan"))
+        graph.replay()
+        _check_sampled_fp64(output, q, k, v, cu_cpu, sinks=sinks, lse=lse)
+        expected = output.clone()
+        expected_lse = None if lse is None else lse.clone()
+        for _ in range(20):
+            output.fill_(float("nan"))
+            if lse is not None:
+                lse.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            if lse is not None:
+                torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
