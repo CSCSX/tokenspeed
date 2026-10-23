@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from cutlass import cute
@@ -62,7 +63,7 @@ class StreamConfig:
     compact_ids: bool
     linear_bins: bool
     partition_width: int
-    group_layout: str
+    group_layout: Literal["aligned", "uniform", "ragged"]
 
 
 def _workspace_bytes(rows: int, config: StreamConfig) -> int:
@@ -117,7 +118,7 @@ def _configuration(
                 compact_ids,
                 linear_bins,
                 partition_width,
-                "aligned",
+                "aligned",  # Unused by the independent-row small-grid kernels.
             )
         if _workspace_bytes(rows, config) <= max_partial_bytes:
             return config

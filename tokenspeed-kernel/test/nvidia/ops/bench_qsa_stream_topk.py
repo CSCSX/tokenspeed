@@ -22,7 +22,8 @@
 
 The benchmark clears the device cache before every invocation. CUDA events
 bracket only score/top-k, so cache clearing is not included in reported time.
-Use ``--query-lengths`` for ragged request runs; uniform widths may have tails.
+Unequal ``--query-lengths`` use ragged runs; equal lengths select uniform runs.
+Use ``--max-partial-mb 0`` to benchmark the workspace-free grouped fallback.
 KV token counts may leave an incomplete ratio-four compressed block.
 """
 
@@ -44,7 +45,12 @@ from tokenspeed_kernel.platform import pdl_enabled
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, required=True)
-    parser.add_argument("--pages", type=int, required=True)
+    parser.add_argument(
+        "--pages",
+        type=int,
+        required=True,
+        help="Per-request page-table capacity in 64-block compressed pages",
+    )
     parser.add_argument(
         "--kv-tokens",
         type=int,
@@ -52,11 +58,22 @@ def _parse_args() -> argparse.Namespace:
     )
     layout = parser.add_mutually_exclusive_group(required=True)
     layout.add_argument("--queries-per-request", type=int)
-    layout.add_argument("--query-lengths", type=int, nargs="+")
+    layout.add_argument(
+        "--query-lengths",
+        type=int,
+        nargs="+",
+        help="Consecutive request query counts; equal lengths select uniform, unequal lengths ragged",
+    )
     parser.add_argument(
         "--solution", choices=("auto", "cute_dsl", "triton", "logits"), required=True
     )
     parser.add_argument("--max-logits-mb", type=int, required=True)
+    parser.add_argument(
+        "--max-partial-mb",
+        type=int,
+        required=True,
+        help="Streaming scratch budget in MiB; zero disables split scratch",
+    )
     parser.add_argument("--timing", choices=("eager", "graph"), required=True)
     parser.add_argument("--frontier", choices=("full", "causal"), required=True)
     parser.add_argument("--distribution", choices=("random", "ties"), required=True)
@@ -174,6 +191,8 @@ def main() -> None:
         raise ValueError("rows and pages must be positive")
     if args.warmups < 1 or args.iterations < 1:
         raise ValueError("warmups and iterations must be positive")
+    if args.max_partial_mb < 0:
+        raise ValueError("max-partial-mb must be non-negative")
     if args.query_lengths is not None:
         lengths = args.query_lengths
         if min(lengths) < 1 or sum(lengths) != args.rows:
@@ -258,7 +277,7 @@ def main() -> None:
             page_size=page_size,
             block_topk=block_topk,
             queries_per_request=width,
-            max_partial_bytes=32 * 1024 * 1024,
+            max_partial_bytes=args.max_partial_mb << 20,
             max_logits_bytes=args.max_logits_mb << 20,
             path=path,
             solution=backend,
@@ -345,6 +364,7 @@ def main() -> None:
                 "queries_per_request": width,
                 "query_lengths": args.query_lengths,
                 "max_logits_mb": args.max_logits_mb,
+                "max_partial_mb": args.max_partial_mb,
                 "pdl": enable_pdl,
                 "warmups": args.warmups,
                 "iterations": args.iterations,

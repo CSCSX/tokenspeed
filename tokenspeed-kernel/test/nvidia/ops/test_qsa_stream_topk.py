@@ -156,19 +156,22 @@ def _assert_matches_reference(
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
-    ("lengths", "pages", "uniform"),
+    ("lengths", "pages", "uniform", "algorithm"),
     [
-        pytest.param([129], 9, True, id="uniform-prefill-tail"),
-        pytest.param([65, 65], 64, True, id="uniform-dense-tails"),
-        pytest.param([67, 67], 129, True, id="uniform-overlap-tails"),
-        pytest.param([1] * 129, 9, True, id="uniform-singletons"),
-        pytest.param([3, 61, 67, 7, 1], 9, False, id="ragged-prefill"),
-        pytest.param([65, 72, 9], 64, False, id="ragged-dense"),
-        pytest.param([127, 1, 9], 129, False, id="ragged-overlap"),
+        pytest.param([129], 9, True, "prefill", id="uniform-prefill-tail"),
+        pytest.param([65, 65], 64, True, "dense", id="uniform-dense-tails"),
+        pytest.param([67, 67], 129, True, "overlap", id="uniform-overlap-tails"),
+        pytest.param([1] * 129, 9, True, "prefill", id="uniform-singletons"),
+        pytest.param([3, 61, 67, 7, 1], 9, False, "prefill", id="ragged-prefill"),
+        pytest.param([65, 72, 9], 64, False, "dense", id="ragged-dense"),
+        pytest.param([127, 1, 9], 129, False, "overlap", id="ragged-overlap"),
+        pytest.param(
+            [3, 2, 1], 1024, False, "overlap", id="ragged-decode-zero-scratch"
+        ),
     ],
 )
 def test_stream_topk_request_tails_and_ragged_graph_replay(
-    device, lengths, pages, uniform, request_dtype, enable_pdl
+    device, lengths, pages, uniform, algorithm, request_dtype, enable_pdl
 ):
     torch.manual_seed(163)
     rows = sum(lengths)
@@ -207,6 +210,18 @@ def test_stream_topk_request_tails_and_ragged_graph_replay(
         )
 
     selected = invoke()
+    config = stream_topk._configuration(
+        rows, capacity, lengths[0] if uniform else None, 0
+    )
+    assert config is not None
+    assert config.algorithm == algorithm
+    assert config.group_layout == ("uniform" if uniform else "ragged")
+    assert (
+        query.device.index,
+        request_dtype,
+        enable_pdl,
+        config,
+    ) in stream_topk._COMPILED
     _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -276,6 +291,10 @@ def test_stream_topk_grouped_tails_reuse_compilation(device, monkeypatch, unifor
         _assert_matches_reference(
             query, keys, table, requests, complete, selected, 64, 512
         )
+        configs = [key[-1] for key in stream_topk._COMPILED]
+        assert len(configs) == 1
+        assert configs[0].algorithm == "overlap"
+        assert configs[0].group_layout == ("uniform" if uniform else "ragged")
     assert compile_count == 1
 
 

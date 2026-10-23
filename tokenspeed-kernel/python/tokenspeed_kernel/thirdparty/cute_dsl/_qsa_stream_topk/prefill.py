@@ -721,7 +721,7 @@ class PrefillTopK(QueryGroups):
         page_size: cutlass.Constexpr[int],
     ):
         block_idx, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(self.enable_pdl and self.group_layout != "aligned"):
+        if cutlass.const_expr(self.enable_pdl and self.group_layout == "ragged"):
             cute.arch.griddepcontrol_wait()
         row_base, valid_rows = self._query_group(
             request_indices, query.shape[0], queries_per_request, block_idx
@@ -773,7 +773,7 @@ class PrefillTopK(QueryGroups):
             row_base = block_idx * self.query_group
         num_blocks = page_table.shape[1] * page_size
 
-        if cutlass.const_expr(self.enable_pdl and self.group_layout == "aligned"):
+        if cutlass.const_expr(self.enable_pdl and self.group_layout != "ragged"):
             cute.arch.griddepcontrol_wait()
         frontier = cutlass.Int32(0)
         for row in cutlass.range_constexpr(self.query_group):
@@ -906,7 +906,7 @@ class PrefillTopK(QueryGroups):
 
             # Producers may release us before publishing Q or the row frontiers.
             # Wait before either read, including the asynchronous Q copy.
-            if cutlass.const_expr(self.enable_pdl and self.group_layout == "aligned"):
+            if cutlass.const_expr(self.enable_pdl and self.group_layout != "ragged"):
                 cute.arch.griddepcontrol_wait()
 
             if warpgroup_idx == _K_COPY_WARPGROUP:
@@ -1238,7 +1238,6 @@ class PrefillTopK(QueryGroups):
                                 value = cutlass.Int32(
                                     running_values[item] & cutlass.Int64(0xFFFFFFFF)
                                 )
-                        if cutlass.const_expr(self.group_layout == "aligned"):
-                            selected_row[index] = value
-                        elif row_in_group < valid_rows:
-                            selected_row[index] = value
+                        self._store_row(
+                            selected_row, index, value, row_in_group, valid_rows
+                        )
