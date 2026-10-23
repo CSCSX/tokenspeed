@@ -818,15 +818,43 @@ def process_single_attention_tile(
         k = program.tdm_shared_load_k(0, wait_count=0 if USE_TDM_Q else 1)
     qk = program.compute_qk(q, k)
     qk = program.apply_mask(qk, kv_start)
-    if cfg.DEEP_PIPELINE:
-        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-    elif cfg.PACKED_GQA and not cfg.GUARDED_QUERY_ROWS:
-        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    if (
+        cfg.BLOCK_M == 256
+        and cfg.BLOCK_N == 128
+        and cfg.NUM_WARPS == 8
+        and cfg.HEAD_DIM == 128
+        and not cfg.IS_FP8
+        and not cfg.HAS_SINK
+        and not cfg.HAS_LSE
+    ):
+        # Finite seed gives masked rows zero probability. No previous tile exists.
+        m_i = maximum(max(qk, 1), -3.4028234663852886e38)
+        p = gl.exp2((qk - m_i[:, None]) * cfg.SM_SCALE)
+        l_i = gl.sum(p, 1)
+        p = gl.convert_layout(p.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
     else:
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
+        if cfg.DEEP_PIPELINE:
+            p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        elif cfg.PACKED_GQA and not cfg.GUARDED_QUERY_ROWS:
+            p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        else:
+            p, alpha, m_i = program.softmax_part0(qk, m_i)
 
-    # SM1, LR_V, PV
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+        # SM1, LR_V, PV
+        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    if (
+        cfg.BLOCK_M == 128
+        and cfg.BLOCK_N == 64
+        and cfg.NUM_WARPS == 4
+        and cfg.HEAD_DIM == 128
+        and cfg.PACKED_GQA
+        and cfg.GUARDED_QUERY_ROWS
+        and cfg.N_HEADS == 2 * cfg.N_KV_HEADS
+        and not cfg.DEEP_PIPELINE
+        and not cfg.IS_FP8
+    ):
+        # Delay the V read until QK and probability conversion are finished.
+        gl.amd.hint.sched_barrier()
     if prefetched:
         v = program.v_buffer.index(0).load(layout=cfg.v_layout)
     else:
@@ -2460,6 +2488,15 @@ def _select_prefill_geometry(
         block_n = (
             64 if length <= 64 or (group > 1 and can_pack and block_m >= 128) else 128
         )
+        if (
+            config.head_dim == 128
+            and group == 2
+            and block_m == 256
+            and warps == 8
+            and 64 < length < 128
+            and len(set(seqlens)) == 1
+        ):
+            block_n = 128
         return block_m, block_n, warps, can_pack, True
     if (
         config.head_dim == 128

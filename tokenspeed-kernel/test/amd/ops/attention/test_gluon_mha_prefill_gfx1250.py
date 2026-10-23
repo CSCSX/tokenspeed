@@ -1184,6 +1184,7 @@ def test_mha_prefill_nonzero_sequence_base(dtype):
         (4, 32, 1, (125, 126, 127)),
         (47, 8, 1, (97, 111, 125, 127)),
         (48, 8, 4, (65, 79, 95, 111, 127)),
+        (64, 8, 4, (65, 79, 81, 95, 97, 111, 127)),
         (96, 8, 4, (65, 79, 81, 95, 97, 111, 127)),
         (24, 16, 4, (97, 111, 125, 127)),
         # Keep neighboring lengths inside the eight-wave dispatch bucket.
@@ -1303,12 +1304,19 @@ def test_mha_prefill_partial_packed_tiles_replay_without_recompile(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    "head_dim,batch,seqlen,n_kv_heads",
+    [(64, 4, 4096, 2), (128, 4, 4096, 2), (128, 64, 95, 4), (128, 96, 95, 4)],
+)
 @pytest.mark.parametrize("feature", ["sink", "lse", "both"])
-def test_mha_prefill_full_tile_sink_lse_replay(dtype, head_dim, feature):
-    """Full-tile normalization preserves sinks and LSE when replay triggers retry."""
+def test_mha_prefill_sink_lse_replay(
+    dtype, head_dim, batch, seqlen, n_kv_heads, feature
+):
+    """Short and long schedules preserve sinks/LSE as graph inputs change."""
     torch.manual_seed(74)
-    q, k, v, cu, cu_cpu, maximum = _inputs([4096] * 4, 8, 2, head_dim, "cuda", dtype)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [seqlen] * batch, 8, n_kv_heads, head_dim, "cuda", dtype
+    )
     saved = [tensor.clone() for tensor in (q, k, v)]
     sinks = (
         torch.linspace(-4, 4, 8, device="cuda", dtype=dtype)
@@ -1338,7 +1346,7 @@ def test_mha_prefill_full_tile_sink_lse_replay(dtype, head_dim, feature):
             q.fill_(1)
             k.zero_()
             for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
-                k[start + 256 : end].fill_(16)
+                k[start + min(256, seqlen // 2) : end].fill_(16)
             if sinks is not None:
                 sinks.add_(96)
         output.fill_(float("nan"))

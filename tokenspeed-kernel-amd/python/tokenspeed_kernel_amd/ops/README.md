@@ -1149,6 +1149,11 @@ wider key tile used by the 64-row fallback.
 Four-wave, 128-row short tiles with head ratio two use 32- or 64-row matrices
 for small query tails, reusing their resident K/V tiles. The remaining row count
 is evaluated on the device, so neighboring lengths retain the same JIT key.
+Wide short tiles with head ratio two can process all 128 keys together.
+Without sinks or LSE, a single key tile normalizes directly from its maximum
+and FP32 probability sum, since there is no previous tile to rescale. A finite
+maximum seed gives masked rows zero probability. Partial four-wave GQA2 tiles
+finish QK and probability conversion before reading V into registers.
 Partial query rows remain masked.
 Medium ragged MHA batches and small batches up to 512 tokens can use 64-row query
 and key tiles to expose more workgroups. Medium uniform GQA batches also use
