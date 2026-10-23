@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -51,7 +51,6 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
 
 
@@ -228,6 +227,27 @@ class DFlashMLP(nn.Module):
         return x
 
 
+def reduce_norm(
+    norm: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    tp: MappingBase,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a shard-local partial, then norm.
+
+    Deliberately the unfused path, matching
+    ``K3DSparkDecoderLayer._norm_with_allreduce``: the fused variant is sized
+    from the target's shapes and the draft's block forward is a different
+    width. On ROCm the fused Iris all-reduce returns wrong sums at the
+    smallest draft widths (one request's block), so a draft served through it
+    loses most of its acceptance. This puts the reduction where that fusion
+    can absorb it once it has been verified at this width.
+    """
+    if tp.tp_size <= 1:
+        return norm(hidden_states, residual)
+    return norm(all_reduce(hidden_states, tp.tp_group), residual)
+
+
 class DFlashDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -271,19 +291,9 @@ class DFlashDecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif (
-            ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
-        ):
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
-            hidden_states, residual, *_ = (
-                self.input_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.dense.tp_rank,
-                    self.mapping.dense.tp_group,
-                    hidden_states,
-                    residual,
-                )
+            hidden_states, residual = reduce_norm(
+                self.input_layernorm, hidden_states, residual, self.mapping.dense
             )
 
         hidden_states = self.self_attn(
@@ -292,20 +302,9 @@ class DFlashDecoderLayer(nn.Module):
             ctx=ctx,
         )
 
-        if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-        else:
-            hidden_states, residual, *_ = (
-                self.post_attention_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
-                    hidden_states,
-                    residual,
-                )
-            )
+        hidden_states, residual = reduce_norm(
+            self.post_attention_layernorm, hidden_states, residual, self.mapping.attn
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -519,12 +518,12 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     ) -> torch.Tensor:
         """Norm the last layer's output.
 
-        A draft whose layers hand back a shard-local partial overrides this to
-        reduce first.
+        The last layer hands back its row-parallel MLP's partial (the next
+        layer's input norm would reduce it); reduce it here.
         """
         if residual is None:
             return self.norm(hidden_states)
-        return self.norm(hidden_states, residual)[0]
+        return reduce_norm(self.norm, hidden_states, residual, self.mapping.dense)[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
