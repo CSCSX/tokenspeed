@@ -946,7 +946,14 @@ def test_mha_prefill_partial_packed_tiles_replay_without_recompile(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "head_dim,batch,seqlen,n_kv_heads",
-    [(64, 4, 4096, 2), (128, 4, 4096, 2), (128, 64, 95, 4), (128, 96, 95, 4)],
+    [
+        (64, 4, 4096, 2),
+        (128, 4, 4096, 2),
+        (128, 64, 95, 4),
+        (128, 96, 95, 4),
+        # Sinks/LSE must route the wide-transfer shape to a compatible schedule.
+        (128, 8, 1024, 1),
+    ],
 )
 @pytest.mark.parametrize("feature", ["sink", "lse", "both"])
 def test_mha_prefill_sink_lse_replay(
