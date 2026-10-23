@@ -1184,6 +1184,7 @@ def test_mha_prefill_nonzero_sequence_base(dtype):
         (4, 32, 1, (125, 126, 127)),
         (47, 8, 1, (97, 111, 125, 127)),
         (48, 8, 4, (65, 79, 95, 111, 127)),
+        (96, 8, 4, (65, 79, 81, 95, 97, 111, 127)),
         (24, 16, 4, (97, 111, 125, 127)),
         # Keep neighboring lengths inside the eight-wave dispatch bucket.
         (24, 16, 1, (81, 95, 97, 111, 125, 127)),

@@ -1146,6 +1146,9 @@ per-thread register use. Short batches with head ratios of at least eight can
 also choose 128-row tiles when their grid covers half the CUs. Full 128-token
 batches with head ratio 32 require three quarters of the CUs. This avoids the
 wider key tile used by the 64-row fallback.
+Four-wave, 128-row short tiles with head ratio two use 32- or 64-row matrices
+for small query tails, reusing their resident K/V tiles. The remaining row count
+is evaluated on the device, so neighboring lengths retain the same JIT key.
 Partial query rows remain masked.
 Medium ragged MHA batches and small batches up to 512 tokens can use 64-row query
 and key tiles to expose more workgroups. Medium uniform GQA batches also use

@@ -1944,6 +1944,31 @@ def gluon_mha_prefill_gfx1250(
                 and not cfg.IS_FP8
             ):
                 process_two_attention_tiles(program, kv_start)
+            elif (
+                cfg.GUARDED_QUERY_ROWS
+                and cfg.PACKED_GQA
+                and cfg.NUM_WARPS == 4
+                and cfg.BLOCK_M == 128
+                and cfg.HEAD_DIM == 128
+                and cfg.N_HEADS == 2 * cfg.N_KV_HEADS
+            ):
+                group: gl.constexpr = cfg.N_HEADS // cfg.N_KV_HEADS
+                # Reuse the resident K/V tiles with fewer masked query rows.
+                live_rows = (program.seq_len - program.q_start) * group
+                if live_rows <= 32:
+                    tail_cfg: gl.constexpr = _query_tile_config(cfg, 32, True, True)
+                    tail = _clone_program_with_buffers(
+                        program, tail_cfg, program.k_buffer, program.v_buffer
+                    )
+                    process_attention_tile(tail, kv_start, 2, USE_TDM_Q)
+                elif live_rows <= 64:
+                    tail_cfg64: gl.constexpr = _query_tile_config(cfg, 64, True, True)
+                    tail64 = _clone_program_with_buffers(
+                        program, tail_cfg64, program.k_buffer, program.v_buffer
+                    )
+                    process_attention_tile(tail64, kv_start, 2, USE_TDM_Q)
+                else:
+                    process_attention_tile(program, kv_start, 2, USE_TDM_Q)
             else:
                 process_attention_tile(program, kv_start, 2, USE_TDM_Q)
         elif cfg.DEEP_PIPELINE:
