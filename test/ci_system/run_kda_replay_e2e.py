@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compare two complete Kimi-K3 source revisions on one AMD TP8 allocation."""
+"""Compare complete Kimi-K3 source revisions on one AMD TP8 allocation."""
 
 from __future__ import annotations
 
@@ -417,7 +417,9 @@ def serve_command(arm, args, model_revision, draft_path, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
-    parser.add_argument("--candidate", required=True)
+    parser.add_argument(
+        "--candidates", nargs="+", required=True, metavar="NAME=REVISION"
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--draft-model")
@@ -427,6 +429,9 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    candidates = dict(item.split("=", 1) for item in args.candidates)
+    if "main" in candidates or len(candidates) != len(args.candidates):
+        parser.error("Candidate names must be unique and must not be 'main'")
     if "eagle3" in args.modes:
         if not args.draft_model or not args.draft_revision:
             parser.error("EAGLE3 requires --draft-model and --draft-revision")
@@ -440,7 +445,7 @@ def main():
     report = {
         "status": "preparing",
         "baseline": args.baseline,
-        "candidate": args.candidate,
+        "candidates": candidates,
         "input_tokens": 4096,
         "output_tokens": 371,
         "concurrency": [32, 64, 128],
@@ -450,7 +455,7 @@ def main():
         "synthetic_acceptance_length": 3.7,
         "warmup_waves": 2,
         "measured_waves_per_start": 3,
-        "server_order": ["main", "current", "current", "main"],
+        "server_order": ["main", *candidates, *reversed(candidates), "main"],
         "scope": "HTTP request E2E including prefill; prefix cache disabled; full source revisions with separately built schedulers; no profiler",
         "submission": "identical token requests released by one client barrier; scheduler batch identity is not guaranteed",
         "runs": [],
@@ -519,7 +524,7 @@ def main():
     ]
     arms = {
         name: prepare_arm(root, work, args.output, name, revision)
-        for name, revision in (("main", args.baseline), ("current", args.candidate))
+        for name, revision in {"main": args.baseline, **candidates}.items()
     }
     report["source_audit"] = {name: arm["audit"] for name, arm in arms.items()}
     report["status"] = "running"
@@ -644,8 +649,12 @@ def main():
                         row[name]["acceptance_rate"] = statistics.mean(
                             w["acceptance_rate"] for w in samples
                         )
-            if all(row[n]["waves"] == 6 for n in arms):
-                row["speedup"] = row["main"]["elapsed_s"] / row["current"]["elapsed_s"]
+            if row["main"]["waves"] == 6:
+                row["speedup"] = {
+                    name: row["main"]["elapsed_s"] / row[name]["elapsed_s"]
+                    for name in candidates
+                    if row[name]["waves"] == 6
+                }
             comparisons.append(row)
     report["comparisons"] = comparisons
     report["status"] = "failed" if report["errors"] else "complete"

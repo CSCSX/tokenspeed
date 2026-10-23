@@ -14,13 +14,15 @@ install:
 perf:
   command: >-
     python3 test/ci_system/run_kda_replay_e2e.py
-    --baseline 3461560d467a76401ce3cb3d72742fccb05dd591
-    --candidate 0737cd42c5b8b844d56c170832433da2c8240703
+    --baseline d5a4c0b0da8ba74c1867912c59920ab3de88236e
+    --candidates
+    pr2240=b1c0f473ce399170323fd2d793791c2f451163ec
+    this_pr=ee90a9e8f94780846ef07f5cef9b99c8475e6603
     --model moonshotai/Kimi-K3
     --model-revision f831ab66814297da540d832a5235f8e904f29d06
     --draft-model lightseekorg/kimi-k3-eagle3-mla
     --draft-revision 4c48d2bb72134094340067e3012ebe0e822fac37
-    --modes eagle3
+    --modes t1 eagle3
     --output .ci-artifacts/published/kda-replay-e2e
 report:
   github_step_summary: true
