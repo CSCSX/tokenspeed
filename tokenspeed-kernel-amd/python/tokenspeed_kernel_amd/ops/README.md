@@ -1134,6 +1134,13 @@ Short schedules that preload Q with K/V complete all TDM transfers before
 reading Q, so subsequent shared-memory reads omit redundant TDM waits. Short
 eight-wave BF16/FP16 tiles with head dimension 128 preserve each wave's query
 rows through the output store, avoiding cross-wave shared-memory transfers.
+For head dimension 128, full 128-row GQA tiles with four waves finish each
+resident key tile before starting the next QK product for head ratios 2, 8, 16,
+and 32. Uniform full 128-row tiles can use eight waves when their grid exceeds
+one workgroup per CU; group-of-four GQA retains the overlapped two-tile schedule.
+Uniform partial short GQA batches can use 256-row tiles with eight waves when
+the wider grid covers at least three quarters of the CUs, reducing repeated
+workgroup setup while retaining masks on partial rows.
 Medium ragged MHA batches and small batches up to 512 tokens can use 64-row query
 and key tiles to expose more workgroups. Medium uniform GQA batches also use
 these tiles for small query tails and shorter partially filled tiles.

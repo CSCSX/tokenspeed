@@ -843,6 +843,35 @@ def process_single_attention_tile(
 
 
 @gluon.jit
+def process_two_attention_tiles(program, kv_start):
+    """Finish each resident key tile before beginning the next QK product."""
+    cfg = program.cfg
+    q_buffer = single_tile_load_q_async(program)
+    m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    program.tdm_load_global_to_shared_kv_fused(kv_start, 0)
+    program.tdm_load_global_to_shared_kv_fused(kv_start + cfg.BLOCK_N, 1)
+    cdna5.tdm.async_wait(0)
+    q = q_buffer.load(layout=cfg.q_layout)
+    for tile in gl.static_range(2):
+        offset = kv_start + tile * cfg.BLOCK_N
+        k = program.k_buffer.index(tile).permute([1, 0]).load(layout=cfg.k_layout)
+        qk = program.compute_qk(q, k)
+        qk = program.apply_mask(qk, offset)
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+        v = program.v_buffer.index(tile).load(layout=cfg.v_layout)
+        acc = program.compute_pv(p, v, acc)
+    program.store_lse(l_i, m_i)
+    l_i, acc = program.apply_sinks(l_i, m_i, acc, sink_log2)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
+    output = gl.convert_layout(
+        output.to(program.output_ptr.dtype.element_ty), cfg.store_layout
+    )
+    program.store_output(output)
+
+
+@gluon.jit
 def process_attention_tile(
     program: AttentionProgram, kv_start, num_tiles, USE_TDM_Q: gl.constexpr
 ):
@@ -1902,6 +1931,19 @@ def gluon_mha_prefill_gfx1250(
         elif TWO_KV_TILES:
             if num_tiles == 1:
                 process_single_attention_tile(program, kv_start, USE_TDM_Q)
+            elif (
+                USE_TDM_Q
+                and cfg.BLOCK_M == 128
+                and cfg.NUM_WARPS == 4
+                and cfg.HEAD_DIM == 128
+                and cfg.BLOCK_N == 64
+                and cfg.PACKED_GQA
+                and cfg.N_HEADS > cfg.N_KV_HEADS
+                and cfg.N_HEADS != 4 * cfg.N_KV_HEADS
+                and not cfg.GUARDED_QUERY_ROWS
+                and not cfg.IS_FP8
+            ):
+                process_two_attention_tiles(program, kv_start)
             else:
                 process_attention_tile(program, kv_start, 2, USE_TDM_Q)
         elif cfg.DEEP_PIPELINE:
@@ -2323,9 +2365,21 @@ def _select_prefill_geometry(
                 * heads
                 * triton_cdiv(length * effective_group, candidate)
             )
+            partial_short = (
+                config.head_dim == 128
+                and candidate == 256
+                and 96 < length < 128
+                and can_pack
+                and group >= 4
+                and len(set(seqlens)) == 1
+                and (length * group) % 128 != 0
+            )
+            min_workgroups = (
+                3 * _GFX1250_NUM_CUS // 4 if partial_short else _GFX1250_NUM_CUS
+            )
             if (
                 candidate <= min(length, 128) * effective_group
-                and grid >= _GFX1250_NUM_CUS
+                and grid >= min_workgroups
             ):
                 block_m = candidate
         if (
@@ -2340,6 +2394,19 @@ def _select_prefill_geometry(
         ):
             block_m = 32
         warps = (16 if length <= 64 else 8) if block_m == 256 else 4
+        # More than one CU-wide round benefits from the extra resident waves.
+        if (
+            config.head_dim == 128
+            and block_m == 128
+            and 64 < length <= 128
+            and can_pack
+            and group > 1
+            and len(set(seqlens)) == 1
+            and (length * group) % block_m == 0
+            and config.batch_size * heads * triton_cdiv(length * group, block_m)
+            > _GFX1250_NUM_CUS
+        ):
+            warps = 8
         block_n = (
             64 if length <= 64 or (group > 1 and can_pack and block_m >= 128) else 128
         )

@@ -1160,21 +1160,27 @@ def test_mha_prefill_nonzero_sequence_base(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "n_q_heads,n_kv_heads,lengths",
+    "batch,n_q_heads,n_kv_heads,lengths",
     [
-        (16, 4, (80, 96, 112, 128)),
-        (32, 8, (80, 96, 112, 128)),
-        (64, 16, (80, 96, 112, 128)),
-        (32, 16, (96, 128)),
-        (32, 1, (80, 96, 112, 128)),
-        (32, 32, (128,)),
+        (1, 16, 4, (80, 96, 112, 128)),
+        (1, 32, 8, (80, 96, 112, 128)),
+        (1, 64, 16, (80, 96, 112, 128)),
+        (1, 32, 16, (96, 128)),
+        (1, 32, 1, (80, 96, 112, 128)),
+        (1, 32, 32, (128,)),
+        (48, 8, 1, (96, 112, 128)),
+        (48, 8, 1, (97, 111, 125, 127)),
+        (24, 16, 4, (97, 111, 125, 127)),
+        # Keep neighboring lengths inside the wider-tile dispatch bucket.
+        (24, 16, 1, (113, 117, 121, 125, 127)),
+        (12, 32, 1, (121, 123, 125, 127)),
     ],
 )
-def test_mha_prefill_aligned_short_queries(dtype, n_q_heads, n_kv_heads, lengths):
+def test_mha_prefill_short_queries_replay(dtype, batch, n_q_heads, n_kv_heads, lengths):
     torch.manual_seed(71)
     for index, length in enumerate(lengths):
         q, k, v, cu, cu_cpu, maximum = _inputs(
-            [length], n_q_heads, n_kv_heads, 128, "cuda", dtype
+            [length] * batch, n_q_heads, n_kv_heads, 128, "cuda", dtype
         )
 
         def shifted(tensor):
