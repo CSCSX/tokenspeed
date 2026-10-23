@@ -330,7 +330,7 @@ index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c39a7ffca8f3fdd34e92511a5dbb585a
 +
 +#endif
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
-index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..426e570591ebc749e5350192757c1026563d2586 100644
+index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ca3394ec7c1720eb00118f4153bc679c94578cc1 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
 @@ -20,0 +21,2 @@
@@ -363,21 +363,29 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..426e570591ebc749e5350192757c1026
 @@ -140 +160 @@
 -                         problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
 +                         problem_m_offsets, num_problems, effective_m, max_shape_m_4_align_,
-@@ -142 +162 @@
+@@ -142 +162,2 @@
 -                         internal_quantize_a, internal_quantize_b);
-+                         internal_quantize_a, internal_quantize_b, max_num_stages);
-@@ -148,2 +168,2 @@
++                         internal_quantize_a, internal_quantize_b, max_num_stages,
++                         shape_m_4_align_);
+@@ -148,2 +169,3 @@
 -                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
 -                         shape_k, stream, internal_quantize_a, internal_quantize_b);
 +                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
-+                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages);
-@@ -155,2 +175,2 @@
++                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
++                         shape_m_4_align_);
+@@ -155,2 +177,3 @@
 -                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
 -                         shape_k, stream, internal_quantize_a, internal_quantize_b);
 +                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
-+                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages);
++                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
++                         shape_m_4_align_);
+@@ -219,0 +243,4 @@
++  // The workspace keeps the largest M requested so far. The grouped input quantization is
++  // launched for this call's M instead, so a small call after a large batch keeps its small
++  // grid and binary search; neither changes the quantized values or their layout.
++  shape_m_4_align_ = int64_t(div_up(max_shape_m, 4) * 4);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
-index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..9b9a0d3045216214c7a502ac6367922ae825c1d3 100644
+index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..937854fd9bb4352d434a244b38603d4bc3ef3c8b 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 @@ -40,0 +41,6 @@
@@ -402,8 +410,11 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..9b9a0d3045216214c7a502ac6367922a
 -               float const* scales_a = nullptr, float const* scales_b = nullptr) override;
 +               float const* scales_a = nullptr, float const* scales_b = nullptr,
 +               int64_t expected_m = -1, int max_num_stages = -1) override;
+@@ -121,0 +136,2 @@
++  // This call's M, 4-aligned; sizes only the grouped input quantization launch.
++  int64_t shape_m_4_align_ = 0;
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..af21a026679fba9e93790c4aa17ed54ed6cffcad 100644
+index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..42fd25c54e316dd4a186263ad812e8335a78682f 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 @@ -1465 +1465,2 @@
@@ -416,10 +427,24 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..af21a026679fba9e93790c4aa17ed54e
 @@ -1490 +1491 @@
 -                                             num_device_sms, false, true);
 +                                             num_device_sms, false, true, max_num_stages);
-@@ -1509 +1510 @@
+@@ -1509 +1510,2 @@
 -                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
-+                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages) {
-@@ -1553 +1554 @@
++                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages,
++                          int64_t quant_shape_m) {
+@@ -1521,3 +1523,6 @@
+-    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
+-                              div_up(max_shape_m * scales_dim_x, NumThreads / 32));
+-    // Binary search is expected to have lower complexity when max_shape_m is small
++    // Size the launch from this call's rows (quant_shape_m), not the runner's high-water mark
++    // max_shape_m; the kernel reads the real row count from problem_m_offsets either way.
++    int num_blocks = std::max<int64_t>(
++        1, std::min(static_cast<int64_t>(kNumDeviceSMs),
++                    div_up(quant_shape_m * scales_dim_x, NumThreads / 32)));
++    // Binary search is expected to have lower complexity when quant_shape_m is small
+@@ -1525 +1530 @@
+-        static_cast<double>(max_shape_m) * scales_dim_x /
++        static_cast<double>(quant_shape_m) * scales_dim_x /
+@@ -1553 +1558 @@
 -                          stream);
 +                          stream, max_num_stages);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
