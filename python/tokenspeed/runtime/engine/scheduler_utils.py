@@ -119,6 +119,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    drop_dead_state_checkpoints: bool = False,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -161,6 +162,12 @@ def make_config(
             spans a long prompt's last prefix-page boundary before its replay
             tail also writes the State checkpoint there. Requires prefix
             caching.
+        drop_dead_state_checkpoints:
+            ``--drop-dead-state-checkpoints``: publish no KV tail and no State
+            checkpoint at a prompt end the pre-tail checkpoint covers (prefill
+            and fused roles) or at a fused finish past the prompt end.
+            Requires prefix caching, except on the decode role, which ignores
+            it.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -205,6 +212,9 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if drop_dead_state_checkpoints:
+        # Set only when on, for the same reason.
+        cfg.drop_dead_state_checkpoints = True
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode

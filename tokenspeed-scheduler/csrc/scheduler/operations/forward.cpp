@@ -509,6 +509,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
+        .resume_tokens = hit_tokens,
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -648,8 +649,14 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // the fresh slot 1). The P and D roles publish at finish only -- the P
     // never writes again, the D's prompt-end state arrived by transfer or was
     // claimed. Every later decode writes slot 1 in place and lets slot 0 go.
+    // With drop_dead_state_checkpoints, a fused prompt end its pre-tail State
+    // checkpoint covers (promptEndIsCoveredByCheckpoint) is such a later
+    // decode instead: no tail and no prompt-end state are published, the
+    // partial page stays the owner's and the state is written in place.
     const bool first_decode = request->Is<fsm::PrefillDone>();
-    const bool prompt_end = first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache;
+    const bool prompt_end =
+        first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache &&
+        !(config_.drop_dead_state_checkpoints && promptEndIsCoveredByCheckpoint(*request, cache_progress));
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};

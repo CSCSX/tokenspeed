@@ -236,6 +236,26 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
+bool CacheCoordinator::HoldsStateCheckpoint(const std::string& content_hash) const {
+    // A probe resumes from one tier's checkpoints, so one tier must hold
+    // every State group's.
+    const auto holds_on = [&](const BlockPool& pool) {
+        bool any_state_group = false;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (!GroupIsState(i)) {
+                continue;
+            }
+            const CacheKey key{.group_id = groups_[i].Id(), .content_hash = content_hash, .page_offset = 0};
+            if (!groups_[i].Index().Contains(pool, key)) {
+                return false;
+            }
+            any_state_group = true;
+        }
+        return any_state_group;
+    };
+    return holds_on(pool_) || (host_pool_ != nullptr && holds_on(*host_pool_));
+}
+
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                      std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
@@ -1364,7 +1384,9 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     }
     // A sliding window resumes from the newest page boundary and, at an
     // unaligned point, from the tail as well: both publish the blocks holding
-    // the window behind them.
+    // the window behind them. The window behind an in-forward State
+    // checkpoint is an endpoint's, like the checkpoint, even when a chunk end
+    // publishes it.
     std::vector<std::int32_t> boundaries;
     if (completed.first_new_prefix_page < hashed_prefix_pages) {
         boundaries.push_back(hashed_prefix_pages * prefix_granularity_);
@@ -1372,12 +1394,17 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     if (tail_blocks > 0) {
         boundaries.push_back(hashed_prefix_pages * prefix_granularity_ + completed.tail->tail_tokens);
     }
+    const std::int32_t state_checkpoint_tokens = completed.state_checkpoint_pages * prefix_granularity_;
     for (const std::int32_t boundary_tokens : boundaries) {
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(group_index), boundary_tokens);
         if (window.first >= window.past_end) {
             continue;
         }
-        ranges.push_back(history_range(window.first, window.past_end));
+        PublishedRange range = history_range(window.first, window.past_end);
+        if (state_checkpoint_tokens > 0 && boundary_tokens == state_checkpoint_tokens) {
+            range.boundary_kind = CacheBoundaryKind::kEndpoint;
+        }
+        ranges.push_back(std::move(range));
     }
     return ranges;
 }

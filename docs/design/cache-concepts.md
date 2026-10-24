@@ -261,6 +261,10 @@ that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
 the conv and PLE windows are the inputs before it -- which is then published
 like a natural checkpoint
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+Conversely, `--drop-dead-state-checkpoints` skips the natural checkpoints a
+next turn that re-renders the end of the previous prompt cannot resume at,
+with their KV tails: a prompt end inside the page whose start holds the
+pre-tail checkpoint, and a fused finish past the prompt end (same section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -842,7 +846,7 @@ Its responsibilities:
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission, or a junction cut) queues its tail and state checkpoint too;
+  admission, or a junction cut) queues the tail and state it publishes too;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the

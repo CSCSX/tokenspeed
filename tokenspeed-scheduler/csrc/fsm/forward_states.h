@@ -63,6 +63,11 @@ struct CacheProgress {
     // index keeps them cached. A retraction drops them once its publication
     // is applied (a Retracted request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
+    // The boundary the first admission resumed from (its prefix hit; zero for
+    // none). SchedulerConfig::drop_dead_state_checkpoints counts a cached
+    // pre-tail State checkpoint as covering the prompt end only for a request
+    // that resumed at or below it.
+    std::int32_t resume_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

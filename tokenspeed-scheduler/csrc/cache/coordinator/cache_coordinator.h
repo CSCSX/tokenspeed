@@ -443,6 +443,10 @@ public:
     // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    // Whether one tier, the Device or the Host, caches every State group's
+    // checkpoint published under the chain hash content_hash (false for a
+    // model without State groups).
+    bool HoldsStateCheckpoint(const std::string& content_hash) const;
 
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped.
