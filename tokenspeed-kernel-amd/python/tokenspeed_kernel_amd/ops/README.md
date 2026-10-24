@@ -219,6 +219,25 @@ Launches that leave most CUs idle with a long K walk (medium `M` with small
 picks the count and splits only within one wave of workgroups. The count is a
 runtime argument.
 
+#### FP32 block scales
+
+Canonical block-scaled E4M3 GEMM computes `A @ B.T` from values shaped
+`[M, K]` and `[N, K]`. With explicit block size `[128, 128]`, FP32 activation
+scales have shape `[M, ceil(K/128)]`: one scale per activation row and
+128-element reduction block. FP32 weight scales have shape
+`[ceil(N/128), ceil(K/128)]`: one scale shared by each 128-by-128 weight block.
+The values retain their canonical matrix layout; the scales are separate
+FP32 tensors and need not be powers of two.
+
+gfx950's scaled matrix instructions (MFMA) accept E8M0 scale operands, not
+arbitrary FP32 scales. FP32 block scales therefore require separate scaling
+of the unscaled block products; this is distinct from FP32 accumulation,
+which MFMA supports. Rounding the scales to E8M0 would change the numerical
+contract. Each block product receives its activation scale and then its
+weight scale before accumulation. This order avoids requiring a product of
+scales that could overflow or underflow even when the scaled block result
+is representable.
+
 ### gfx950 MXFP8 decode projection
 
 The gfx950 package provides the weight-bandwidth-bound MXFP8 projection used
@@ -240,6 +259,19 @@ rows on weights of at least 2**26 elements, use the prefill kernel above.
   comes from the smallest M bucket (16, 32, 64, 128, 256) covering `M`:
   measured per bucket for the V4.1 TP4 projection shapes, a heuristic
   otherwise. `K` is a compile-time model constant.
+
+The same decode machinery also accepts the canonical FP32 block-scale
+contract described above, including partial final K128 groups. This form
+requires BF16 output and applies each activation scale before its weight
+scale to an unscaled FP8 K128 matrix partial; it does not convert coefficients
+to E8M0 or inherit the native path's exact-upcast arithmetic. Scale strides
+are unrestricted. Values require unit inner stride; unaligned rows use
+ordinary loads into the same shared-memory ring instead of direct-to-LDS
+copies. Neither form rearranges weights or creates a persistent weight copy.
+Public FP32 selection uses decode for measured short and moderate reductions;
+longer reductions retain the existing GEMM selection.
+This selection policy does not restrict the raw decoder's supported shapes
+or change native E8M0 selection.
 
 #### Algorithm
 
