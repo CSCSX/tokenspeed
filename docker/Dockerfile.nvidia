@@ -6,7 +6,7 @@ FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18
 USER root
 
 ARG MAX_JOBS=16
-ARG CUDA_ARCH_LIST="9.0a 10.0a"
+ARG CUDA_ARCH_LIST="9.0a 10.0a 10.3a"
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
