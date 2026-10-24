@@ -171,6 +171,10 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
 def _tactic(rows: int, projection_rows: int):
     # S, M_proj, B_mma, L_proj, L_batch, stages, F_mma. The single
     # parameterized kernel also supports S=1 and cluster-local projection loops.
+    if current_platform().arch_version == ArchVersion(10, 7) and 16 < rows <= 64:
+        # Wider token tiles let each split-K rank process fewer Down tiles.
+        # Above 32 rows, S8 keeps the token groups in one resident round.
+        return 16 if rows <= 32 else 8, 64, 32, 1, 1, 5, 32
     if rows <= 16:
         return 16, 64, 8 if rows <= 8 else 16, 1, 1, 5, 32
     if rows <= 32:
@@ -316,6 +320,7 @@ if _AVAILABLE:
         projection_rows: int,
         projection_scale: float,
         weights_independent: bool,
+        packed_up_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run down, SiLU, up and gate/output in one tiled CuTe kernel.
 
@@ -370,28 +375,11 @@ if _AVAILABLE:
             stream_id = int(torch.cuda.current_stream(normalized.device).cuda_stream)
             stream = CUstream(stream_id)
             enable_pdl = pdl_enabled()
-            tactic = _tactic(rows, projection_rows)
-            split_k, m, n, lp, lb, stages, f = tactic
-            single_tile = rows <= n and lb == 1
-            full_tiles = rows % n == 0
-            # A stream changes available occupancy (for example in a green
-            # context), but it does not change generated code. The final plan
-            # key adds the worker count derived from that occupancy below.
-            static_key = (
-                normalized.device.index,
-                normalized.dtype,
-                tactic,
-                single_tile,
-                full_tiles,
-                projection_rows,
-                enable_pdl,
-                projection_scale,
-                weights_independent,
-            )
 
             def operands_for(kernel):
+                tile_rows = kernel.n * kernel.batch_tiles
                 workers = (
-                    (rows + n * lb - 1) // (n * lb)
+                    (rows + tile_rows - 1) // tile_rows
                     if kernel.clusters == 1
                     else kernel.workers
                 )
@@ -418,32 +406,6 @@ if _AVAILABLE:
                     )
                     for value, leading in zip(values, leading_dims)
                 )
-
-            def compile_plan(workers, rounds):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "fused CuTe HC kernel plan is not initialized for CUDA graph "
-                        "capture; warm up this variant before capture"
-                    )
-                kernel = FusedGatedResidualKernel(
-                    projection_tile=m,
-                    token_tile=n,
-                    projection_rows=projection_rows,
-                    split_k=split_k,
-                    projection_tiles=lp,
-                    batch_tiles=lb,
-                    workers=workers,
-                    stages=stages,
-                    final_tile=f,
-                    rounds=rounds,
-                    use_pdl=enable_pdl,
-                    scale=projection_scale,
-                    weights_independent=weights_independent,
-                    single_tile=single_tile,
-                    full_tiles=full_tiles,
-                )
-                compiled = cute_ext.compile(kernel, *operands_for(kernel), stream)
-                return kernel, compiled
 
             def capacity_for(plan_key, plan):
                 kernel, compiled = plan
@@ -472,35 +434,97 @@ if _AVAILABLE:
                     )
                 return capacity
 
-            def plan_for(workers, rounds):
-                plan_key = (*static_key, workers, rounds)
+            def plan_for(tactic, workers, rounds):
+                split_k, m, n, lp, lb, stages, f = tactic
+                single_tile = rows <= n and lb == 1
+                full_tiles = rows % n == 0
+                # A stream changes available occupancy (for example in a green
+                # context), but only the resulting worker count changes code.
+                plan_key = (
+                    normalized.device.index,
+                    normalized.dtype,
+                    tactic,
+                    single_tile,
+                    full_tiles,
+                    projection_rows,
+                    enable_pdl,
+                    projection_scale,
+                    weights_independent,
+                    workers,
+                    rounds,
+                )
                 plan = _PLANS.get(plan_key)
                 if plan is None:
                     with _CACHE_LOCK:
                         plan = _PLANS.get(plan_key)
                         if plan is None:
-                            plan = compile_plan(workers, rounds)
+                            if torch.cuda.is_current_stream_capturing():
+                                raise RuntimeError(
+                                    "fused CuTe HC kernel plan is not initialized for CUDA graph "
+                                    "capture; warm up this variant before capture"
+                                )
+                            kernel = FusedGatedResidualKernel(
+                                projection_tile=m,
+                                token_tile=n,
+                                projection_rows=projection_rows,
+                                split_k=split_k,
+                                projection_tiles=lp,
+                                batch_tiles=lb,
+                                workers=workers,
+                                stages=stages,
+                                final_tile=f,
+                                rounds=rounds,
+                                use_pdl=enable_pdl,
+                                scale=projection_scale,
+                                weights_independent=weights_independent,
+                                single_tile=single_tile,
+                                full_tiles=full_tiles,
+                            )
+                            compiled = cute_ext.compile(
+                                kernel, *operands_for(kernel), stream
+                            )
+                            plan = kernel, compiled
                             _PLANS[plan_key] = plan
                 return plan_key, plan
 
-            probe_key, probe = plan_for(1, 1)
-            probe_capacity = capacity_for(probe_key, probe)
-            workers = 1 if single_tile else probe_capacity // probe[0].clusters
-            plan = probe
-            if workers > 1:
-                worker_key, plan = plan_for(workers, 1)
-                capacity_for(worker_key, plan)
-            kernel, compiled = plan
-            rounds = (
-                (rows + n * lb * kernel.workers - 1) // (n * lb * kernel.workers)
-                if kernel.clusters > 1
-                else 1
-            )
-            if rounds > 1:
-                # Bucket by scheduling rounds, not exact rows. Static loop bounds
-                # preserve register reuse across the pipeline's warp roles.
-                round_key, plan = plan_for(kernel.workers, rounds)
-                capacity_for(round_key, plan)
+            fallback = _tactic(rows, projection_rows)
+            tactics = (fallback,)
+            if (
+                current_platform().arch_version == ArchVersion(10, 7)
+                and 192 < rows <= 256
+            ):
+                # Reuse the medium tile while its measured cluster capacity
+                # avoids a second round; smaller contexts keep the wider tile.
+                medium = _tactic(192, projection_rows)
+                if medium != fallback:
+                    tactics = (medium, fallback)
+            for tactic in tactics:
+                probe_key, probe = plan_for(tactic, 1, 1)
+                probe_capacity = capacity_for(probe_key, probe)
+                kernel = probe[0]
+                tile_rows = kernel.n * kernel.batch_tiles
+                workers = 1 if kernel.single_tile else probe_capacity // kernel.clusters
+                if tactic != fallback and rows > workers * tile_rows:
+                    # The narrower projection tile only wins while all token
+                    # groups fit in one resident round on this stream.
+                    continue
+                plan = probe
+                if workers > 1:
+                    worker_key, plan = plan_for(tactic, workers, 1)
+                    capacity_for(worker_key, plan)
                 kernel, compiled = plan
-            compiled(*operands_for(kernel), stream)
+                rounds = (
+                    (rows + tile_rows * kernel.workers - 1)
+                    // (tile_rows * kernel.workers)
+                    if kernel.clusters > 1
+                    else 1
+                )
+                if rounds > 1:
+                    # Bucket by scheduling rounds, not exact rows. Static loop bounds
+                    # preserve register reuse across the pipeline's warp roles.
+                    round_key, plan = plan_for(tactic, kernel.workers, rounds)
+                    capacity_for(round_key, plan)
+                    kernel, compiled = plan
+                compiled(*operands_for(kernel), stream)
+                break
         return out, inject
