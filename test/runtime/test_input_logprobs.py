@@ -1032,6 +1032,9 @@ def _handler(disaggregation_mode: str) -> RequestHandler:
     handler.tokenizer = None
     handler.hf_eos_token_id = None
     handler.max_req_len = 4096
+    # The window less the decode reserve, as the engine declares it; the
+    # generation budget refuses a prompt past it before the scheduler sees it.
+    handler.max_req_input_len = 4095
     # The layout that refuses prompt logprobs (LM-head TP under attention DP)
     # is off in these cases.
     handler.supports_input_logprobs = True
