@@ -1223,6 +1223,51 @@ and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
 wait only on LDS rather than one global round trip per token. The kernel is
 HBM bound: it reads the state once and writes it once per destination.
 
+### KDA records verify and commit (gfx950 / gfx1250)
+
+Standard target decode is a one-token verify window. Both standard and
+speculative decode follow verify, acceptance, and commit. Verify retains
+the Gluon fused convolution, LDS vectors and batched value-split selection.
+GFX950 uses 32-row state panels for one-token windows with a bounded gate
+and no value split. Other cases use 16-row panels. Verify preserves committed
+FP32 state. It saves correction U in FP32, and unnormalized K and raw gate in
+the activation dtype.
+Convolution values round to that dtype before recurrence so recovery uses
+the same K as verify. The current AMD registration supports BF16. Verify can
+also retain original QKV in a separate caller-owned buffer, which commit
+reads for conv history.
+A null destination leaves retention to the caller. Padding pages do not write
+retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
+inside verify for up to 64 total input rows and uses a separate GEMM above that.
+MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
+GFX1250 projects inside verify at every row count. A supplied raw gate is used
+directly. Both save the gate used by verify. On both targets, each value split
+starts its first checkpoint-panel load before preparing the token vectors.
+Without value splits, one-token verify keeps 64 state rows in flight after
+preparation.
+GFX950 recovery uses 64-row panels for one-token windows with a bounded gate.
+Other windows keep 16-row panels, with two in flight for one-token softplus.
+
+Records use slot/head/ring-position/channel order. INT64 metadata supplies the
+slot, generation, and absolute start; position/generation stamps guard against
+reusing a stale window. Recovery reads the accepted prefix, recomputes key
+normalization and decay, and applies U without recomputing the prediction.
+A zero accepted count copies the checkpoint. Nonpositive source/destination
+pages are padding. Groups select independent page-table rows for each layer.
+Verify and commit disable Triton debug mode and automatic integer-overflow
+instrumentation. Interval and generation guards remain active; invalid
+records are skipped without device assertions.
+
+Batched descriptors use the shared ten-column table: original QKV (0), conv
+history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
+The remaining columns are reserved. Recovery retains one program per head,
+request and layer. It stages accepted
+U, K and raw gate once in LDS, then applies the same updates per value panel.
+It commits each head's convolution history after loading all old taps,
+including when source and destination alias. History retains its bound pool
+dtype; original QKV is converted on commit.
+
+
 ## Transform
 
 ### gfx950 Hadamard query transform
