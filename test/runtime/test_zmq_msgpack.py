@@ -265,6 +265,9 @@ def test_slim_out_from_full_roundtrip():
     # frame-wide [] (the columns stay parallel to rids on the wire).
     assert rt.output_top_logprobs_val == [[]]
     assert rt.output_top_logprobs_idx == [[]]
+    # A length finish carries no status and no words: nil in both columns.
+    assert rt.finished_status_codes == [None]
+    assert rt.finished_messages == [None]
 
 
 def test_slim_out_carries_the_producing_engine_index():
@@ -292,6 +295,8 @@ def test_slim_out_load_tail_defaults_for_older_senders(
     assert rt.kv_total_pages == 0
     assert rt.output_top_logprobs_val == []
     assert rt.output_top_logprobs_idx == []
+    assert rt.finished_status_codes == []
+    assert rt.finished_messages == []
 
 
 def test_slim_out_fourteen_element_batch_decodes_without_alternatives():
@@ -312,6 +317,8 @@ def test_slim_out_fourteen_element_batch_decodes_without_alternatives():
     assert (rt.engine_index, rt.kv_total_pages) == (2, 40)
     assert rt.output_top_logprobs_val == []
     assert rt.output_top_logprobs_idx == []
+    assert rt.finished_status_codes == []
+    assert rt.finished_messages == []
 
 
 def test_slim_out_carries_the_ranked_alternatives():
@@ -341,7 +348,7 @@ def test_slim_out_carries_the_ranked_alternatives():
     )
     slim = BatchTokenIDOutSlim.from_full(out)
     raw = msgspec.msgpack.decode(_encode_payload(slim))
-    assert len(raw) == 16
+    assert len(raw) == 18
     assert raw[14] == [
         [
             [pytest.approx(-0.1), pytest.approx(-2.3)],
@@ -390,8 +397,9 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form pins SMG's exact 16-element positional contract (the
-    14-element prefix of older engines plus the two ranked-candidate columns)."""
+    """The wire form pins SMG's exact 18-element positional contract (the
+    14-element prefix of older engines, the two ranked-candidate columns, the
+    two finish-detail columns)."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
@@ -406,7 +414,7 @@ def test_slim_out_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 16
+    assert len(raw) == 18
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
@@ -419,12 +427,71 @@ def test_slim_out_is_tagged_positional_tuple():
     assert raw[13] == 20  # kv_total_pages
     assert raw[14] == [[]]  # output_top_logprobs_val (appended)
     assert raw[15] == [[]]  # output_top_logprobs_idx (appended)
+    assert raw[16] == [None]  # finished_status_codes (appended)
+    assert raw[17] == [None]  # finished_messages (appended)
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
     out = _make_batch_out(finished_reasons=[None])
     slim = BatchTokenIDOutSlim.from_full(out)
     assert slim.finished_reasons == [""]
+
+
+def test_slim_out_carries_the_abort_finishs_status_and_words():
+    """A request the engine ended with an attributed abort (an admission
+    refusal: its 400 and the reason) carries both on the slim frame, parallel
+    to ``finished_reasons``; a request not finished this step and a finish
+    without them carry nil; an abort without a status carries its words
+    alone. The frontend reads the columns' names off the layout before it
+    trusts them (``test_ready_response_declares_the_emitted_output_structs``).
+    """
+    refusal = (
+        "Invalid request: the input (16 tokens) exceeds the engine's maximum "
+        "input length (14 tokens)"
+    )
+    out = _make_batch_out(
+        rids=["edge", "running", "done"],
+        finished_reasons=[
+            FINISH_ABORT(refusal, status_code=400).to_json(),
+            None,
+            FINISH_LENGTH(length=1).to_json(),
+        ],
+        decoded_texts=["", "", ""],
+        decode_ids=[[], [12], [13]],
+        read_offsets=[0, 0, 0],
+        output_ids=[[], [12], [13]],
+        output_multi_ids=[[], [], []],
+        skip_special_tokens=[True, True, True],
+        spaces_between_special_tokens=[True, True, True],
+        no_stop_trim=[False, False, False],
+        prompt_tokens=[16, 4, 4],
+        completion_tokens=[0, 1, 1],
+        cached_tokens=[0, 0, 0],
+        spec_verify_ct=[0, 0, 0],
+        output_token_logprobs_val=[[], [], []],
+        output_token_logprobs_idx=[[], [], []],
+        output_extra_infos=[{}, {}, {}],
+    )
+    slim = BatchTokenIDOutSlim.from_full(out)
+    assert slim.finished_reasons == ["abort", "", "length"]
+    assert slim.finished_status_codes == [400, None, None]
+    assert slim.finished_messages == [refusal, None, None]
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    assert len(raw) == 18
+    assert raw[16] == [400, None, None]
+    assert raw[17] == [refusal, None, None]
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
+    assert rt.finished_status_codes == [400, None, None]
+    assert rt.finished_messages == [refusal, None, None]
+    # An abort the engine did not attribute with a status (a pause, a
+    # capacity abort): its words ride, the status column stays nil.
+    bare = BatchTokenIDOutSlim.from_full(
+        _make_batch_out(finished_reasons=[FINISH_ABORT("Unknown error").to_json()])
+    )
+    assert (bare.finished_status_codes, bare.finished_messages) == (
+        [None],
+        ["Unknown error"],
+    )
 
 
 def test_decode_request_frames_add_and_abort():
@@ -773,6 +840,29 @@ def test_send_socket_load_snapshot_setter_sends_no_frame():
     assert socket.sent == []
 
 
+def test_send_socket_frames_carry_the_abort_finishs_status_and_words():
+    """Over the real send adapter: the terminal frame of a request refused at
+    admission (the output processor's abort with a 400) carries the status
+    and the reason next to the bare ``abort`` type."""
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket, control=zmq_msgpack.ControlCalls())
+
+    sender.send_pyobj(
+        _make_batch_out(
+            finished_reasons=[
+                FINISH_ABORT("Invalid request: bad top_k", status_code=400).to_json()
+            ],
+            output_ids=[[]],
+            completion_tokens=[0],
+        )
+    )
+
+    output = _decode_last_slim_output(socket)
+    assert output.finished_reasons == ["abort"]
+    assert output.finished_status_codes == [400]
+    assert output.finished_messages == ["Invalid request: bad top_k"]
+
+
 def test_send_socket_next_output_uses_latest_load_snapshot():
     socket = _FakeOutputSocket()
     sender = zmq_msgpack.MsgpackSendSocket(socket, control=zmq_msgpack.ControlCalls())
@@ -950,10 +1040,13 @@ def test_ready_response_declares_the_emitted_output_structs():
         "engine_index",
     ]
     # The frontend reads the appended columns' names here before it forwards
-    # a top_logprobs_num above one.
-    assert layouts["BatchTokenIDOutSlim"][-2:] == [
+    # a top_logprobs_num above one, and before it trusts the finish-detail
+    # columns.
+    assert layouts["BatchTokenIDOutSlim"][-4:] == [
         "output_top_logprobs_val",
         "output_top_logprobs_idx",
+        "finished_status_codes",
+        "finished_messages",
     ]
     assert layouts["BatchTokenIDOutSlim"][:8] == [
         "rids",

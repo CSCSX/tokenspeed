@@ -727,6 +727,23 @@ def _finish_type(finished_reason) -> str:
     return str(finished_reason)
 
 
+def _finish_status_code(finished_reason) -> int | None:
+    """The HTTP-style status a finish reason carries (``FINISH_ABORT``'s
+    ``status_code``: 400 for a request refused at admission), else None."""
+    if isinstance(finished_reason, dict):
+        code = finished_reason.get("status_code")
+        return int(code) if code is not None else None
+    return None
+
+
+def _finish_message(finished_reason) -> str | None:
+    """The words a finish reason carries (an abort's ``message``), else None."""
+    if isinstance(finished_reason, dict):
+        message = finished_reason.get("message")
+        return str(message) if message else None
+    return None
+
+
 class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     """Per-request slice of ``BatchTokenIDOut`` for a frontend that
     detokenizes itself (the direct ZMQ scheduler drive).
@@ -774,6 +791,17 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # for none keeps the columns non-ragged (always length == len(rids)).
     output_top_logprobs_val: list[list[list[float]]] = []
     output_top_logprobs_idx: list[list[list[int]]] = []
+    # The finish reason's status and words, parallel to ``finished_reasons``:
+    # a request the engine ended with an abort it attributes (an admission
+    # refusal carries its 400 and the reason) has both, so the frontend can
+    # answer its client the engine's own refusal instead of an empty
+    # completion; None for a request not finished this step and for a finish
+    # that carries neither (stop, length, an abort without a status). The
+    # frontend reads the two names off the ready response's
+    # ``positional_layouts`` before it trusts the columns. Appended wire tail:
+    # an older peer's 16-element batch decodes with both empty.
+    finished_status_codes: list[int | None] = []
+    finished_messages: list[str | None] = []
 
     @classmethod
     def from_full(
@@ -832,6 +860,10 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
                 if out.output_top_logprobs_idx
                 else [[] for _ in out.rids]
             ),
+            finished_status_codes=[
+                _finish_status_code(fr) for fr in out.finished_reasons
+            ],
+            finished_messages=[_finish_message(fr) for fr in out.finished_reasons],
         )
 
 
