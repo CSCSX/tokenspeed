@@ -532,11 +532,13 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
     return emitted, path.cpu()
 
 
-def test_sampled_tree_emits_the_target_distribution() -> None:
+# K = 1: a sampled chain.
+@pytest.mark.parametrize("topk", [3, 1])
+def test_sampled_tree_emits_the_target_distribution(topk: int) -> None:
     """Children drawn from the draft, recursive rejection and the residual bonus
     together emit exactly the target: the first token's law is the root's
     target, the second's (after an accepted child) that child's."""
-    topk, vocab, nc = 3, 48, 32
+    vocab, nc = 48, 32
     generator = torch.Generator().manual_seed(0)
     target = torch.softmax(
         torch.randn((1 + topk + topk * topk, vocab), generator=generator) * 1.5, dim=-1

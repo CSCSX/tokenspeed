@@ -679,13 +679,14 @@ class DevicePolicy:
 
         state = [0] * _NUM_STATE
         state[_SAMPLED_SEEN] = -1
+        # The first sampled round plans the deepest stop.
+        state[_SAMPLED_NEXT] = self.tree_depth - 1
         if self.chain:
             # Chains keep no verify history.
             hist = torch.zeros((max_bs, 0), dtype=torch.int32)
             recent = torch.zeros((0,), dtype=torch.int32)
         else:
-            # Tier small, the deepest sampled plan.
-            state[_SAMPLED_NEXT] = self.tree_depth - 1
+            # Trees start at tier small (zero).
             hist = torch.full((max_bs, _PAST_VERIFY_ROUNDS), verify_num)
             recent = torch.arange(-_RECENT_VERIFY_ROUNDS, 0)
         self._state = torch.tensor(state, dtype=torch.int32, device=device)

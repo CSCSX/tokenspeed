@@ -730,7 +730,7 @@ run on the draft-tree path and share its requirements, with these limits:
 - `--speculative-num-steps` 2 to 32 (64 when measuring), with
   `(steps - 1) * topk` at most 128 and `1 + topk + (steps - 1) * topk^2` at
   most 1024.
-- `--enable-speculative-sampling` samples harness trees (not chains, and not
+- `--enable-speculative-sampling` samples harness trees and chains (not
   when measuring) and needs `--sampling-backend flashinfer`, which accepts
   them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
 

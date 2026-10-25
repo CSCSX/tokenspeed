@@ -86,7 +86,7 @@ def eagle_harness_policy_begin_round(
     """Start a round of ``live_rows[0]`` requests (int32; 0 runs no round)
     whose cached lengths are the first ``live_rows[0]`` entries of
     ``frontier`` (int64 ``[rows >= live_rows[0]]``, summed in the kernel) and
-    which draw their children when ``sampled`` (bool; trees only):
+    which draw their children when ``sampled`` (bool):
     increments ``seq`` (int64 ``[1]``), clears the round's scalars of
     ``state`` and the ``[4, depth + 1]`` int32 ``slots`` (width, cumu_start,
     work_size, go per depth), writes depth 0's slots, takes depth 0's

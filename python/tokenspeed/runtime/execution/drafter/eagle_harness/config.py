@@ -150,7 +150,8 @@ class EagleHarnessConfig:
     data_path: str
     compute_intensity: str
     is_moe_target: bool
-    # Temperature > 0 requests sample children from the draft q, accepted by rejection sampling.
+    # Temperature > 0 requests sample children (a chain's one child) from the draft q, accepted by
+    # rejection sampling.
     sampled_trees: bool
     # The TP-synced seed of the children's draws.
     seed: int
@@ -360,10 +361,6 @@ def validate_server_args(server_args: ServerArgs) -> None:
                 "EAGLE-Harness chains draft at most 15 steps and verify at most "
                 f"16 tokens: {server_args.speculative_num_steps=}, "
                 f"{server_args.speculative_num_draft_tokens=}"
-            )
-        if server_args.enable_speculative_sampling:
-            raise NotImplementedError(
-                "EAGLE-Harness samples draft trees (topk >= 2), not chains"
             )
     cap = max_batch_size(server_args.speculative_compute_intensity)
     if mode == 2:
