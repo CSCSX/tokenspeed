@@ -437,7 +437,7 @@ def test_slim_out_finish_reason_none_maps_to_empty():
     assert slim.finished_reasons == [""]
 
 
-def test_slim_out_carries_the_abort_finishs_status_and_words():
+def test_slim_out_carries_the_abort_finish_status_and_words():
     """A request the engine ended with an attributed abort (an admission
     refusal: its 400 and the reason) carries both on the slim frame, parallel
     to ``finished_reasons``; a request not finished this step and a finish
@@ -840,7 +840,7 @@ def test_send_socket_load_snapshot_setter_sends_no_frame():
     assert socket.sent == []
 
 
-def test_send_socket_frames_carry_the_abort_finishs_status_and_words():
+def test_send_socket_frames_carry_the_abort_finish_status_and_words():
     """Over the real send adapter: the terminal frame of a request refused at
     admission (the output processor's abort with a 400) carries the status
     and the reason next to the bare ``abort`` type."""
