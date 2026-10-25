@@ -1390,6 +1390,9 @@ def test_scheduler_role_drops_an_encode_request(caplog):
 
 
 class _VisionConfig:
+    """The vision config stand-in whose ``spatial_merge_size`` the MRoPE
+    position function reads."""
+
     spatial_merge_size = 2
 
 
@@ -1406,6 +1409,9 @@ class _MRoPEConfig:
 
 
 class _TextConfig:
+    """A non-MRoPE model config: the transport must leave the MRoPE position
+    slots empty."""
+
     architectures = ["LlamaForCausalLM"]
     model_type = "llama"
 
