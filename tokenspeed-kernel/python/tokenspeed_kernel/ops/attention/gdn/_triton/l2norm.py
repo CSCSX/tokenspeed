@@ -28,7 +28,7 @@
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.gdn._triton.utils import input_guard
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 
 @triton.jit
@@ -121,7 +121,7 @@ def l2norm_fwd(
             BD=BD,
             BT=16,
             num_warps=8,
-            num_stages=3,
+            num_stages=1 if current_platform().is_npu else 3,
             ENABLE_PDL=enable_pdl,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
@@ -133,7 +133,7 @@ def l2norm_fwd(
             D=D,
             BD=BD,
             num_warps=8,
-            num_stages=3,
+            num_stages=1 if current_platform().is_npu else 3,
             ENABLE_PDL=enable_pdl,
             **({"launch_pdl": True} if enable_pdl else {}),
         )

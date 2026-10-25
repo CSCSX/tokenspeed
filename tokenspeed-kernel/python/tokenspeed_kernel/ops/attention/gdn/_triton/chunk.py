@@ -22,6 +22,7 @@
 
 import torch
 from tokenspeed_kernel.ops.attention.gdn._triton.chunk_delta_h import (
+    CHUNK_SIZE,
     chunk_gated_delta_rule_fwd_h,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.chunk_o import chunk_fwd_o
@@ -51,10 +52,15 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     return_h: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        k=k,
+        beta=beta,
+        g_cumsum=g,
+        cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
+        output_dtype=torch.float32,
     )
     A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     w, u = recompute_w_u_fwd(
@@ -82,6 +88,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
     if SUPPRESS_LEVEL < 3 and not return_h:
         return g, o, A, final_state, None, None, None

@@ -38,7 +38,7 @@ expensive here).
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
+from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnCheckpointLayout,
@@ -85,7 +85,7 @@ _TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
     "gdn_chunk_prefill",
     name="triton_gdn_chunk_prefill",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -155,12 +155,57 @@ def triton_gdn_chunk_prefill(
 
 
 @triton.jit
+def _highest_set_bit_or_minus_one(above):
+    """Position of the highest set bit of ``above`` (int64), -1 when zero.
+
+    libdevice.clz is an unmapped stub on Triton-Ascend (returns None at
+    compile time); find the bit by binary descent instead.
+    """
+    x = above
+    r = tl.zeros_like(above)
+    hi = x >> 32
+    take = hi != 0
+    r = tl.where(take, r + 32, r)
+    x = tl.where(take, hi, x)
+    hi = x >> 16
+    take = hi != 0
+    r = tl.where(take, r + 16, r)
+    x = tl.where(take, hi, x)
+    hi = x >> 8
+    take = hi != 0
+    r = tl.where(take, r + 8, r)
+    x = tl.where(take, hi, x)
+    hi = x >> 4
+    take = hi != 0
+    r = tl.where(take, r + 4, r)
+    x = tl.where(take, hi, x)
+    hi = x >> 2
+    take = hi != 0
+    r = tl.where(take, r + 2, r)
+    x = tl.where(take, hi, x)
+    hi = x >> 1
+    take = hi != 0
+    r = tl.where(take, r + 1, r)
+    return tl.where(above != 0, r, -1)
+
+
+@triton.jit
 def _latest_ancestor(ancestors_row, step, valid):
     """Parent of ``step`` (scalar or vector) in a tree's ancestor-or-self bitmask row: the highest bit below its own, -1 for a root."""
     above = tl.load(ancestors_row + step, mask=valid, other=0) & (
         (tl.full([], 1, tl.int64) << step.to(tl.int64)) - 1
     )
-    return 63 - libdevice.clz(above)
+    return _highest_set_bit_or_minus_one(above)
+
+
+@triton.jit
+def _latest_ancestor_scalar(ancestors_row, step):
+    """Scalar ``_latest_ancestor`` without the mask: Triton-Ascend
+    miscompiles masked scalar loads into out-of-range vector moves."""
+    above = tl.load(ancestors_row + step) & (
+        (tl.full([], 1, tl.int64) << step.to(tl.int64)) - 1
+    )
+    return _highest_set_bit_or_minus_one(above)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -197,11 +242,26 @@ def _fused_gdn_decode_update_kernel(
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_TREE: tl.constexpr,
     T_BLOCK: tl.constexpr,
-    Q_STRIDES: tl.constexpr,
-    K_STRIDES: tl.constexpr,
-    V_STRIDES: tl.constexpr,
-    A_STRIDES: tl.constexpr,
-    B_STRIDES: tl.constexpr,
+    # Per-dimension strides instead of constexpr stride tuples: Triton-Ascend's
+    # frontend cannot subscript a constexpr tuple.
+    Q_STRIDE_B: tl.constexpr,
+    Q_STRIDE_T: tl.constexpr,
+    Q_STRIDE_H: tl.constexpr,
+    Q_STRIDE_D: tl.constexpr,
+    K_STRIDE_B: tl.constexpr,
+    K_STRIDE_T: tl.constexpr,
+    K_STRIDE_H: tl.constexpr,
+    K_STRIDE_D: tl.constexpr,
+    V_STRIDE_B: tl.constexpr,
+    V_STRIDE_T: tl.constexpr,
+    V_STRIDE_H: tl.constexpr,
+    V_STRIDE_D: tl.constexpr,
+    A_STRIDE_B: tl.constexpr,
+    A_STRIDE_T: tl.constexpr,
+    A_STRIDE_H: tl.constexpr,
+    B_STRIDE_B: tl.constexpr,
+    B_STRIDE_T: tl.constexpr,
+    B_STRIDE_H: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     """Dense-batch (no varlen) sigmoid-gating delta-rule decode/MTP update.
@@ -250,14 +310,14 @@ def _fused_gdn_decode_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + i_n * Q_STRIDES[0] + i_h * Q_STRIDES[2] + o_k * Q_STRIDES[3]
-    p_k = k + i_n * K_STRIDES[0] + i_h * K_STRIDES[2] + o_k * K_STRIDES[3]
-    p_v = v + i_n * V_STRIDES[0] + i_hv * V_STRIDES[2] + o_v * V_STRIDES[3]
-    p_b = b + i_n * B_STRIDES[0] + i_hv * B_STRIDES[2]
+    p_q = q + i_n * Q_STRIDE_B + i_h * Q_STRIDE_H + o_k * Q_STRIDE_D
+    p_k = k + i_n * K_STRIDE_B + i_h * K_STRIDE_H + o_k * K_STRIDE_D
+    p_v = v + i_n * V_STRIDE_B + i_hv * V_STRIDE_H + o_v * V_STRIDE_D
+    p_b = b + i_n * B_STRIDE_B + i_hv * B_STRIDE_H
     p_o = o + (i_n * T * HV + i_hv) * V + o_v
 
     p_A_log = A_log + i_hv
-    p_a = a + i_n * A_STRIDES[0] + i_hv * A_STRIDES[2]
+    p_a = a + i_n * A_STRIDE_B + i_hv * A_STRIDE_H
     p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -266,6 +326,9 @@ def _fused_gdn_decode_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     idx = tl.load(h0_indices + i_n).to(tl.int64)
+    # Masked lanes still feed Ascend's MTE movers; keep their pool addresses
+    # in bounds (the masks discard the data either way).
+    safe_idx = tl.maximum(idx, 0)
     if idx >= 0:
         # K-last [.., HV, V, K]: row v (stride K), col k (stride 1) -- the
         # opposite of this kernel's own [BK, BV] (K-row, V-col) tile layout,
@@ -299,19 +362,19 @@ def _fused_gdn_decode_update_kernel(
         b_b = n_b
         b_a = n_a
         has_next = step_idx + 1 < T
-        n_q = tl.load(p_q + Q_STRIDES[1], mask=mask_k & has_next, other=0).to(
+        n_q = tl.load(p_q + Q_STRIDE_T, mask=mask_k & has_next, other=0).to(
             tl.float32
         )
-        n_k = tl.load(p_k + K_STRIDES[1], mask=mask_k & has_next, other=0).to(
+        n_k = tl.load(p_k + K_STRIDE_T, mask=mask_k & has_next, other=0).to(
             tl.float32
         )
-        n_v = tl.load(p_v + V_STRIDES[1], mask=mask_v & has_next, other=0).to(
+        n_v = tl.load(p_v + V_STRIDE_T, mask=mask_v & has_next, other=0).to(
             tl.float32
         )
-        n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
-        n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        n_b = tl.load(p_b + B_STRIDE_T, mask=has_next, other=0).to(tl.float32)
+        n_a = tl.load(p_a + A_STRIDE_T, mask=has_next, other=0).to(tl.float32)
         if HAS_TREE:
-            parent = _latest_ancestor(tree_ancestors + i_n * T, step_idx, True)
+            parent = _latest_ancestor_scalar(tree_ancestors + i_n * T, step_idx)
             if parent != step_idx - 1:
                 # The parent's row was written by this program over the same tile.
                 tl.debug_barrier()
@@ -320,7 +383,7 @@ def _fused_gdn_decode_update_kernel(
                     if parent < 0:
                         p_parent = (
                             h0_source
-                            + idx * HV * V * K
+                            + safe_idx * HV * V * K
                             + i_hv * V * K
                             + o_v[None, :] * K
                             + o_k[:, None]
@@ -339,7 +402,7 @@ def _fused_gdn_decode_update_kernel(
                 elif parent < 0:
                     p_parent = (
                         h0_source
-                        + idx * HV * V * K
+                        + safe_idx * HV * V * K
                         + i_hv * V * K
                         + o_v[None, :] * K
                         + o_k[:, None]
@@ -354,7 +417,7 @@ def _fused_gdn_decode_update_kernel(
                     )
                     p_parent = (
                         ht_dest
-                        + row * HV * V * K
+                        + tl.maximum(row, 0) * HV * V * K
                         + i_hv * V * K
                         + o_v[None, :] * K
                         + o_k[:, None]
@@ -417,12 +480,12 @@ def _fused_gdn_decode_update_kernel(
                     mask=mask_h,
                 )
 
-        p_q += Q_STRIDES[1]
-        p_k += K_STRIDES[1]
-        p_v += V_STRIDES[1]
-        p_b += B_STRIDES[1]
+        p_q += Q_STRIDE_T
+        p_k += K_STRIDE_T
+        p_v += V_STRIDE_T
+        p_b += B_STRIDE_T
         p_o += HV * V
-        p_a += A_STRIDES[1]
+        p_a += A_STRIDE_T
 
     if HAS_OUTPUT_STATE_INDICES:
         out_idx = tl.load(output_state_indices + i_n).to(tl.int64)
@@ -529,11 +592,24 @@ def _launch_fused_gdn_decode_update(
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
         HAS_TREE=tree_ancestors is not None,
         T_BLOCK=1 if tree_ancestors is None else triton.next_power_of_2(T),
-        Q_STRIDES=q.stride(),
-        K_STRIDES=k.stride(),
-        V_STRIDES=v.stride(),
-        A_STRIDES=a.stride(),
-        B_STRIDES=b.stride(),
+        Q_STRIDE_B=q.stride(0),
+        Q_STRIDE_T=q.stride(1),
+        Q_STRIDE_H=q.stride(2),
+        Q_STRIDE_D=q.stride(3),
+        K_STRIDE_B=k.stride(0),
+        K_STRIDE_T=k.stride(1),
+        K_STRIDE_H=k.stride(2),
+        K_STRIDE_D=k.stride(3),
+        V_STRIDE_B=v.stride(0),
+        V_STRIDE_T=v.stride(1),
+        V_STRIDE_H=v.stride(2),
+        V_STRIDE_D=v.stride(3),
+        A_STRIDE_B=a.stride(0),
+        A_STRIDE_T=a.stride(1),
+        A_STRIDE_H=a.stride(2),
+        B_STRIDE_B=b.stride(0),
+        B_STRIDE_T=b.stride(1),
+        B_STRIDE_H=b.stride(2),
         num_warps=1,
         num_stages=3,
         ENABLE_PDL=enable_pdl,
@@ -547,7 +623,7 @@ def _launch_fused_gdn_decode_update(
     "gdn_decode_step",
     name="triton_gdn_decode_step",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -624,11 +700,26 @@ def _gdn_tree_verify_chunked_kernel(
     LOG2_T_BLOCK: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
-    Q_STRIDES: tl.constexpr,
-    K_STRIDES: tl.constexpr,
-    V_STRIDES: tl.constexpr,
-    A_STRIDES: tl.constexpr,
-    B_STRIDES: tl.constexpr,
+    # Per-dimension strides instead of constexpr stride tuples: Triton-Ascend's
+    # frontend cannot subscript a constexpr tuple.
+    Q_STRIDE_B: tl.constexpr,
+    Q_STRIDE_T: tl.constexpr,
+    Q_STRIDE_H: tl.constexpr,
+    Q_STRIDE_D: tl.constexpr,
+    K_STRIDE_B: tl.constexpr,
+    K_STRIDE_T: tl.constexpr,
+    K_STRIDE_H: tl.constexpr,
+    K_STRIDE_D: tl.constexpr,
+    V_STRIDE_B: tl.constexpr,
+    V_STRIDE_T: tl.constexpr,
+    V_STRIDE_H: tl.constexpr,
+    V_STRIDE_D: tl.constexpr,
+    A_STRIDE_B: tl.constexpr,
+    A_STRIDE_T: tl.constexpr,
+    A_STRIDE_H: tl.constexpr,
+    B_STRIDE_B: tl.constexpr,
+    B_STRIDE_T: tl.constexpr,
+    B_STRIDE_H: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     """ReplaySSM draft-tree GDN verify of up to ``T_BLOCK`` nodes at once, in the chunked form.
@@ -660,27 +751,29 @@ def _gdn_tree_verify_chunked_kernel(
     b_A = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
     b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
 
-    p_q = q + i_n * Q_STRIDES[0] + nodes[:, None] * Q_STRIDES[1] + i_h * Q_STRIDES[2]
-    p_k = k + i_n * K_STRIDES[0] + nodes[:, None] * K_STRIDES[1] + i_h * K_STRIDES[2]
+    p_q = q + i_n * Q_STRIDE_B + nodes[:, None] * Q_STRIDE_T + i_h * Q_STRIDE_H
+    p_k = k + i_n * K_STRIDE_B + nodes[:, None] * K_STRIDE_T + i_h * K_STRIDE_H
     idx = tl.load(h0_indices + i_n).to(tl.int64)
-    p_h0 = h0_source + idx * HV * V * K + i_hv * V * K + o_v[:, None] * K
+    # Masked lanes still feed Ascend's MTE movers; keep the pool row in bounds.
+    safe_idx = tl.maximum(idx, 0)
+    p_h0 = h0_source + safe_idx * HV * V * K + i_hv * V * K + o_v[:, None] * K
 
     b_v = tl.load(
         v
-        + i_n * V_STRIDES[0]
-        + nodes[:, None] * V_STRIDES[1]
-        + i_hv * V_STRIDES[2]
-        + o_v[None, :] * V_STRIDES[3],
+        + i_n * V_STRIDE_B
+        + nodes[:, None] * V_STRIDE_T
+        + i_hv * V_STRIDE_H
+        + o_v[None, :] * V_STRIDE_D,
         mask=valid[:, None] & mask_v[None, :],
         other=0,
     )
     b_a = tl.load(
-        a + i_n * A_STRIDES[0] + nodes * A_STRIDES[1] + i_hv * A_STRIDES[2],
+        a + i_n * A_STRIDE_B + nodes * A_STRIDE_T + i_hv * A_STRIDE_H,
         mask=valid,
         other=0,
     )
     b_b = tl.load(
-        b + i_n * B_STRIDES[0] + nodes * B_STRIDES[1] + i_hv * B_STRIDES[2],
+        b + i_n * B_STRIDE_B + nodes * B_STRIDE_T + i_hv * B_STRIDE_H,
         mask=valid,
         other=0,
     )
@@ -709,8 +802,8 @@ def _gdn_tree_verify_chunked_kernel(
         for kc in tl.static_range(0, K, BK):
             o_k = kc + tl.arange(0, BK)
             mask_qk = valid[:, None] & (o_k < K)[None, :]
-            x_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
-            x_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
+            x_q = tl.load(p_q + o_k[None, :] * Q_STRIDE_D, mask=mask_qk, other=0)
+            x_k = tl.load(p_k + o_k[None, :] * K_STRIDE_D, mask=mask_qk, other=0)
             sq_q += tl.sum(x_q.to(tl.float32) * x_q.to(tl.float32), 1)
             sq_k += tl.sum(x_k.to(tl.float32) * x_k.to(tl.float32), 1)
         r_q = scale / tl.sqrt(sq_q + 1e-6)
@@ -725,9 +818,9 @@ def _gdn_tree_verify_chunked_kernel(
     for kc in tl.range(0, K, BK, num_stages=3):
         o_k = kc + tl.arange(0, BK)
         mask_qk = valid[:, None] & (o_k < K)[None, :]
-        c_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
+        c_q = tl.load(p_q + o_k[None, :] * Q_STRIDE_D, mask=mask_qk, other=0)
         c_q = c_q.to(tl.float32) * r_q[:, None]
-        c_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
+        c_k = tl.load(p_k + o_k[None, :] * K_STRIDE_D, mask=mask_qk, other=0)
         if HAS_REPLAY:
             tl.store(
                 p_replay[:, None] + i_h * K + o_k[None, :], c_k, mask=mask_qk & writes_k
@@ -821,12 +914,17 @@ def _launch_gdn_tree_verify_chunked(
             "tensor of the dtype of q, k, v, a and b"
         )
     o = q.new_empty(B, T, HV, V)
-    # Once the (request, head) programs outnumber the SMs, fewer and wider V tiles are faster.
-    wide = B * HV > current_platform().sm_count
-    BV = min(triton.next_power_of_2(V), 128 if wide else 64)
-    # Half-width V tiles (>= 16 for tl.dot) fill the SMs at a few requests, up to two programs per SM.
-    if BV >= 32 and triton.cdiv(V, BV // 2) * B * HV <= 2 * current_platform().sm_count:
-        BV //= 2
+    if current_platform().is_npu:
+        # Keep BV fixed across batch sizes: the sm_count-scaled widening below
+        # is a CUDA heuristic and would recompile per batch on Ascend.
+        BV = min(triton.next_power_of_2(V), 32)
+    else:
+        # Once the (request, head) programs outnumber the SMs, fewer and wider V tiles are faster.
+        wide = B * HV > current_platform().sm_count
+        BV = min(triton.next_power_of_2(V), 128 if wide else 64)
+        # Half-width V tiles (>= 16 for tl.dot) fill the SMs at a few requests, up to two programs per SM.
+        if BV >= 32 and triton.cdiv(V, BV // 2) * B * HV <= 2 * current_platform().sm_count:
+            BV //= 2
     T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
     _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
@@ -857,11 +955,24 @@ def _launch_gdn_tree_verify_chunked(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         # Three TF32 products per FP32 one keep FP32 accuracy on tensor cores.
         DOT_PRECISION="tf32x3" if current_platform().is_nvidia else "ieee",
-        Q_STRIDES=q.stride(),
-        K_STRIDES=k.stride(),
-        V_STRIDES=v.stride(),
-        A_STRIDES=a.stride(),
-        B_STRIDES=b.stride(),
+        Q_STRIDE_B=q.stride(0),
+        Q_STRIDE_T=q.stride(1),
+        Q_STRIDE_H=q.stride(2),
+        Q_STRIDE_D=q.stride(3),
+        K_STRIDE_B=k.stride(0),
+        K_STRIDE_T=k.stride(1),
+        K_STRIDE_H=k.stride(2),
+        K_STRIDE_D=k.stride(3),
+        V_STRIDE_B=v.stride(0),
+        V_STRIDE_T=v.stride(1),
+        V_STRIDE_H=v.stride(2),
+        V_STRIDE_D=v.stride(3),
+        A_STRIDE_B=a.stride(0),
+        A_STRIDE_T=a.stride(1),
+        A_STRIDE_H=a.stride(2),
+        B_STRIDE_B=b.stride(0),
+        B_STRIDE_T=b.stride(1),
+        B_STRIDE_H=b.stride(2),
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
@@ -879,7 +990,7 @@ def _launch_gdn_tree_verify_chunked(
     "gdn_decode_mtp",
     name="triton_gdn_decode_mtp",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -938,6 +1049,14 @@ def triton_gdn_decode_mtp(
         )
     if replay_payload is not None:
         raise ValueError("only a chunked ReplaySSM tree verify fills replay_payload")
+    if tree_ancestors is not None and current_platform().is_npu:
+        # The step-wise tree variant of _fused_gdn_decode_update_kernel hits
+        # an UNREACHABLE in Triton-Ascend's BlockPtrAnalysis (AddPtrOp from a
+        # block argument) at ttir_to_linalg, which aborts the host process;
+        # fail cleanly instead.
+        raise NotImplementedError(
+            "step-wise GDN tree verify is not supported by Triton-Ascend"
+        )
     return _launch_fused_gdn_decode_update(
         q,
         k,
@@ -1222,7 +1341,7 @@ def _gdn_replay_commit_kernel(
     "gdn_replay_commit",
     name="triton_gdn_replay_commit",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),

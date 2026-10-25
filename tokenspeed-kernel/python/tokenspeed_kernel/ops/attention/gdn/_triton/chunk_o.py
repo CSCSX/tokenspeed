@@ -184,11 +184,16 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
+        # Ascend910's 192KB UB cannot hold the NVIDIA-tuned 128-wide K tile.
+        BK=64 if current_platform().is_npu else 128,
         # gfx950: one 128-wide V tile reads each chunk state once.
-        BV=128 if current_platform().is_cdna4 else 64,
+        BV=(
+            32
+            if current_platform().is_npu
+            else (128 if current_platform().is_cdna4 else 64)
+        ),
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if current_platform().is_npu else 2,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

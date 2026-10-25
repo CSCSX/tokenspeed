@@ -129,8 +129,8 @@ def dflash2_grouped_conv(
         raise ValueError(f"taps must be in [1, block_size={block_size}], got {taps}")
     if x.stride(1) != 1 or base.stride(1) != 1:
         raise ValueError("x and base rows must be contiguous")
-    if not (x.is_cuda and delta.is_cuda and base.is_cuda):
-        raise ValueError("dflash2_grouped_conv requires CUDA tensors")
+    if not all(t.is_cuda or t.device.type == "npu" for t in (x, delta, base)):
+        raise ValueError("dflash2_grouped_conv requires CUDA or NPU tensors")
 
     y = torch.empty_like(x)
     if num_rows == 0:

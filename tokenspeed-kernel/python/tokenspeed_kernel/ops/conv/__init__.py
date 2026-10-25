@@ -63,7 +63,7 @@ from tokenspeed_kernel.ops.conv.triton import (
     dflash2_grouped_conv,
     select_prefill_config,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -180,6 +180,32 @@ def inkling_ring_sconv(
     assert (
         block_table.dim() == 2 and block_table.shape[1] >= 2
     ), "the conv group's block table holds an input and a live slot per request"
+
+    if current_platform().is_npu:
+        # The Triton ring sconv kernels crash Triton-Ascend's vector cores
+        # nondeterministically (device-side out-of-range MTE faults that
+        # persist with fully clamped tile addresses), so Ascend runs the
+        # pure-torch implementation. The entry point is not registry
+        # dispatched, hence the platform branch here.
+        from tokenspeed_kernel.ops.conv.ascend import torch_npu_inkling_ring_sconv
+
+        return torch_npu_inkling_ring_sconv(
+            x,
+            weight,
+            conv_cache,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            block_table,
+            ckpt_a,
+            ckpt_b,
+            num_extends=num_extends,
+            publish_live=publish_live,
+            activation=activation,
+            use_residual=use_residual,
+        )
 
     y = torch.empty_like(x)
     if T == 0:

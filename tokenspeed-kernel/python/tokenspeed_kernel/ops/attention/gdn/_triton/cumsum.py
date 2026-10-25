@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.attention.gdn._triton.utils import (
     check_shared_mem,
     input_guard,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -234,8 +234,8 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
-        num_warps=8,
-        num_stages=3,
+        num_warps=4 if current_platform().is_npu else 8,
+        num_stages=1 if current_platform().is_npu else 3,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

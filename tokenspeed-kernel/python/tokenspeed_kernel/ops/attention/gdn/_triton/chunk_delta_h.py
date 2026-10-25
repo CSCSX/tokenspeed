@@ -32,9 +32,10 @@ from tokenspeed_kernel.ops.attention.gdn._triton.index import (
     prepare_chunk_offsets,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.op import exp, safe_exp
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
-CHUNK_SIZE = 64
+# Ascend910's 192KB UB cannot hold the 64-wide [BT, BT] fp32 tiles.
+CHUNK_SIZE = 32 if current_platform().is_npu else 64
 
 
 @triton.heuristics(
@@ -357,9 +358,10 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        # Ascend910's 192KB UB cannot hold two pipelined 32-wide value tiles.
         BV=32,
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if current_platform().is_npu else 2,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

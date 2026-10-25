@@ -32,8 +32,8 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 
 pytestmark = pytest.mark.skipif(
-    not (platform.is_nvidia or platform.is_amd),
-    reason="Triton layernorm tests require an NVIDIA or AMD GPU.",
+    not (platform.is_nvidia or platform.is_amd or platform.is_npu),
+    reason="Triton layernorm tests require an NVIDIA or AMD GPU, or an Ascend NPU.",
 )
 
 ROWS_PER_PROGRAM = GATED_RMSNORM_ROWS_PER_PROGRAM
@@ -115,6 +115,10 @@ def test_one_group_weight_on_whole_rows_matches_one_row_per_group(device):
     torch.testing.assert_close(rows.view(-1, dim), per_group, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    platform.is_npu,
+    reason="Triton-Ascend's BiShengHIR pipeline cannot cast to f8E4M3FN.",
+)
 def test_gated_rmsnorm_fp8_output_matches_quantized_bf16(device):
     """The FP8 output equals quantizing the activation-dtype output with the same scale."""
     torch.manual_seed(1)

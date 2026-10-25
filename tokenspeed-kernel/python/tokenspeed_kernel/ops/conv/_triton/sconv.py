@@ -185,13 +185,17 @@ def _inkling_ring_sconv_decode_kernel(
 
     acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
     t64 = t_off.to(tl.int64)
+    # Masked-off lanes still feed Ascend's MTE movers: clamp their row
+    # addresses into the valid range (discarded by the masks either way).
+    t_clip = tl.minimum(t64, T - 1)
 
     # Keep tap W-1 in-loop: a split unconditional load miscompiles tokenspeed_triton (num_warps>1).
     for iw in tl.static_range(W):
         shifted_t = t64 - (W - 1) + iw
+        shifted_c = tl.minimum(tl.maximum(shifted_t, 0), T - 1)
         in_x = (shifted_t >= bos) & t_mask
         x_val = tl.load(
-            x_ptr + shifted_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+            x_ptr + shifted_c[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
             mask=in_x[:, None] & d_mask[None, :],
             other=0,
         )
@@ -211,7 +215,7 @@ def _inkling_ring_sconv_decode_kernel(
         acc = acc * tl.sigmoid(acc)
 
     xv = tl.load(
-        x_ptr + t64[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+        x_ptr + t_clip[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
         mask=td_mask,
         other=0,
     )
@@ -219,7 +223,7 @@ def _inkling_ring_sconv_decode_kernel(
         acc += xv.to(tl.float32)
 
     tl.store(
-        y_ptr + t64[:, None] * stride_y_t + d_off[None, :] * stride_y_d,
+        y_ptr + t_clip[:, None] * stride_y_t + d_off[None, :] * stride_y_d,
         acc.to(y_ptr.dtype.element_ty),
         mask=td_mask,
     )
@@ -249,9 +253,10 @@ def _inkling_ring_sconv_decode_kernel(
             col_b = tl.maximum(d_off - a_width, 0)
             for w in tl.static_range(W - 1):
                 src_t = t64 - (W - 2) + w
+                src_c = tl.minimum(tl.maximum(src_t, 0), T - 1)
                 in_x2 = src_t >= bos
                 x_row = tl.load(
-                    x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+                    x_ptr + src_c[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
                     mask=(pub & in_x2)[:, None] & d_mask[None, :],
                     other=0,
                 )
@@ -382,7 +387,9 @@ def _inkling_ring_sconv_prefill_kernel(
 
     acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
     t64 = t_off.to(tl.int64)
-
+    # Masked-off lanes still feed Ascend's MTE movers: clamp their row
+    # addresses into the valid range (discarded by the masks either way).
+    t_clip = tl.minimum(t64, T - 1)
     # Only the tile holding a chunk's first W-1 tokens has pre-chunk taps;
     # every other tile takes the pure-x fast path (tile-uniform branch, so
     # the checkpoint machinery costs interior tiles nothing).
@@ -391,16 +398,20 @@ def _inkling_ring_sconv_prefill_kernel(
     if has_prechunk:
         for iw in tl.static_range(W):
             shifted_t = t64 - (W - 1) + iw
+            shifted_c = tl.minimum(tl.maximum(shifted_t, 0), T - 1)
             in_x = (shifted_t >= bos) & t_mask
             x_val = tl.load(
-                x_ptr + shifted_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+                x_ptr + shifted_c[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
                 mask=in_x[:, None] & d_mask[None, :],
                 other=0,
             )
             # Pre-chunk taps: checkpoint window row j. No `other` filler (an
             # int cannot cast to fp8 sources); masked-off lanes are discarded
-            # by the selects below.
-            j = (shifted_t - bos + (W - 1)).to(tl.int64)
+            # by the selects below. Clamp j so the no-`other` load's masked
+            # lanes stay in bounds (Triton-Ascend still moves their MTE data).
+            j = tl.minimum(
+                tl.maximum((shifted_t - bos + (W - 1)).to(tl.int64), 0), W - 2
+            )
             in_ck = (shifted_t < bos) & ckpt_ok
             a_val = tl.load(
                 ckpt_a_ptr
@@ -442,8 +453,9 @@ def _inkling_ring_sconv_prefill_kernel(
         # Interior tiles: every tap of every lane is an in-chunk x row.
         for iw in tl.static_range(W):
             shifted_t = t64 - (W - 1) + iw
+            shifted_c = tl.minimum(tl.maximum(shifted_t, 0), T - 1)
             x_val = tl.load(
-                x_ptr + shifted_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+                x_ptr + shifted_c[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
                 mask=td_mask,
                 other=0,
             )
@@ -454,7 +466,7 @@ def _inkling_ring_sconv_prefill_kernel(
         acc = acc * tl.sigmoid(acc)
 
     xv = tl.load(
-        x_ptr + t64[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+        x_ptr + t_clip[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
         mask=td_mask,
         other=0,
     )
@@ -462,7 +474,7 @@ def _inkling_ring_sconv_prefill_kernel(
         acc += xv.to(tl.float32)
 
     tl.store(
-        y_ptr + t64[:, None] * stride_y_t + d_off[None, :] * stride_y_d,
+        y_ptr + t_clip[:, None] * stride_y_t + d_off[None, :] * stride_y_d,
         acc.to(y_ptr.dtype.element_ty),
         mask=td_mask,
     )
@@ -491,13 +503,16 @@ def _inkling_ring_sconv_prefill_kernel(
             pub = is_end & (page > 0)
             for w in tl.static_range(W - 1):
                 src_t = t64 - (W - 2) + w
+                src_c = tl.minimum(tl.maximum(src_t, 0), T - 1)
                 in_x2 = src_t >= bos
                 x_row = tl.load(
-                    x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+                    x_ptr + src_c[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
                     mask=(pub & in_x2)[:, None] & d_mask[None, :],
                     other=0,
                 )
-                j2 = (src_t - bos + (W - 1)).to(tl.int64)
+                j2 = tl.minimum(
+                    tl.maximum((src_t - bos + (W - 1)).to(tl.int64), 0), W - 2
+                )
                 in_ck2 = (src_t < bos) & ckpt_ok
                 a_row = tl.load(
                     ckpt_a_ptr

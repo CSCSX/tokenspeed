@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from dataclasses import dataclass
@@ -1491,7 +1492,12 @@ def triton_gated_rmsnorm(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)
-    with torch.cuda.device(x.device.index):
+    # Triton-Ascend launches on the current NPU; only CUDA needs the guard.
+    if x.device.type == "cuda":
+        guard = torch.cuda.device(x.device.index)
+    else:
+        guard = contextlib.nullcontext()
+    with guard:
         gated_rmsnorm_kernel[grid](
             x,
             out,

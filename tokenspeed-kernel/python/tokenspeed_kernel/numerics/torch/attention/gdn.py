@@ -104,16 +104,26 @@ def torch_gdn_recurrence(
     start = initial_state.to(compute_dtype).transpose(-2, -1)  # [B, HV, K, V]
     out = torch.empty(B, T, HV, v.shape[-1], dtype=compute_dtype, device=q.device)
     states = torch.empty(B, T, *start.shape[1:], dtype=compute_dtype, device=q.device)
+    # aclnnBatchMatMul has no FP64 path on Ascend; contract explicitly there.
+    npu_fp64 = compute_dtype == torch.float64 and q.device.type == "npu"
     for bi in range(B):
         for t in range(T):
             parent = t - 1 if parents is None else parents[bi][t]
             h = start[bi] if parent < 0 else states[bi, parent]
             h = h * torch.exp(g[bi, t])[:, None, None]
-            delta = beta[bi, t][:, None] * (
-                v[bi, t] - torch.einsum("hk,hkv->hv", k[bi, t], h)
-            )
+            if npu_fp64:
+                delta = beta[bi, t][:, None] * (
+                    v[bi, t] - (k[bi, t][:, :, None] * h).sum(dim=1)
+                )
+            else:
+                delta = beta[bi, t][:, None] * (
+                    v[bi, t] - torch.einsum("hk,hkv->hv", k[bi, t], h)
+                )
             states[bi, t] = h + k[bi, t][:, :, None] * delta[:, None, :]
-            out[bi, t] = scale * torch.einsum("hk,hkv->hv", q[bi, t], states[bi, t])
+            if npu_fp64:
+                out[bi, t] = scale * (q[bi, t][:, :, None] * states[bi, t]).sum(dim=1)
+            else:
+                out[bi, t] = scale * torch.einsum("hk,hkv->hv", q[bi, t], states[bi, t])
     return out, states.transpose(-2, -1)
 
 

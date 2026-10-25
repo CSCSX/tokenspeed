@@ -249,4 +249,6 @@ def sample_specs():
 
 @pytest.fixture
 def device() -> str:
+    if not torch.cuda.is_available() and hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
     return "cuda"

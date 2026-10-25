@@ -163,6 +163,18 @@ def merge_16x16_to_32x32_inverse_kernel(
         boundary_check=(0, 1),
     )
 
+    # The inverse is block lower triangular: zero the untouched upper block
+    # (the 64x64 merge does the same for its six upper blocks).
+    fill_zeros = tl.zeros((16, 16), dtype=tl.float32)
+    p_Ai_12 = tl.make_block_ptr(
+        Ai, (T, 32), (H * 32, 1), (i_t * 32, 16), (16, 16), (1, 0)
+    )
+    tl.store(
+        p_Ai_12,
+        fill_zeros.to(p_Ai_12.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.jit(do_not_specialize=["T"])
@@ -447,7 +459,7 @@ def solve_tril(
         H=H,
         BT=BT,
         num_warps=1,
-        num_stages=4,
+        num_stages=1 if current_platform().is_npu else 4,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
@@ -475,7 +487,7 @@ def solve_tril(
         BT=BT,
         # gfx950: one wave per block is faster than four.
         num_warps=1 if current_platform().is_cdna4 else 4,
-        num_stages=3,
+        num_stages=1 if current_platform().is_npu else 3,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

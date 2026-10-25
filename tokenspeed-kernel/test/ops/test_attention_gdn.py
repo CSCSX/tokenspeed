@@ -459,10 +459,14 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
     assert isinstance(result, GdnChunkPrefillResult)
 
     if solution == "triton":
+        from tokenspeed_kernel.ops.attention.gdn._triton.chunk_delta_h import (
+            CHUNK_SIZE,
+        )
+
         assert result.h_layout is GdnCheckpointLayout.FLA
         assert result.h is not None
         assert result.h_cu_starts is None
-        assert result.h.shape == (1, 3, 32, 128, 128)
+        assert result.h.shape == (1, -(-130 // CHUNK_SIZE), 32, 128, 128)
     else:
         assert result.h_layout is GdnCheckpointLayout.FLASHINFER
         assert result.h is not None

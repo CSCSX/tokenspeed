@@ -161,10 +161,13 @@ def chunk_scaled_dot_kkt_fwd(
         Hg=Hg,
         K=K,
         BT=BT,
-        BK=64,
+        # Ascend910's 192KB UB cannot hold the NVIDIA-tuned tiles.
+        BK=32 if current_platform().is_npu else 64,
         # gfx950: four waves are faster than eight.
-        num_warps=4 if current_platform().is_cdna4 else 8,
-        num_stages=3,
+        num_warps=(4 if current_platform().is_cdna4 else 8)
+        if not current_platform().is_npu
+        else 4,
+        num_stages=1 if current_platform().is_npu else 3,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

@@ -32,9 +32,12 @@ from tokenspeed_kernel.ops.conv import (
     inkling_ring_sconv,
     seq_idx_from_cu_seqlens,
 )
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="sconv tests require a CUDA GPU."
+    not torch.cuda.is_available()
+    and not (hasattr(torch, "npu") and torch.npu.is_available()),
+    reason="sconv tests require a CUDA GPU or an Ascend NPU.",
 )
 
 W = 4
@@ -382,6 +385,10 @@ def test_sconv_prefill_then_lookback_window(device: str) -> None:
     torch.testing.assert_close(y_win, ref, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.skipif(
+    current_platform().is_npu,
+    reason="torch_npu does not support float8_e5m2 checkpoint storage.",
+)
 def test_prefill_checkpoint_taps_and_fp8(device: str) -> None:
     """Tap sources per request: a prefix with an input checkpoint reads the
     window; a hole slot or a cold request taps zeros; a PAD row is inert. A

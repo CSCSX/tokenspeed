@@ -28,7 +28,7 @@
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.gdn._triton.index import prepare_chunk_indices
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -143,8 +143,11 @@ def recompute_w_u_fwd(
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 64
+    # Ascend910's 192KB UB cannot hold the NVIDIA-tuned tiles.
+    if current_platform().is_npu:
+        BK, BV, num_warps, num_stages = 32, 32, 4, 1
+    else:
+        BK, BV, num_warps, num_stages = 64, 64, 4, 3
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -165,8 +168,8 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
-        num_warps=4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
