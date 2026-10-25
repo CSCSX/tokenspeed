@@ -60,6 +60,8 @@ from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor  # noqa: E402
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer  # noqa: E402
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs  # noqa: E402
+from tokenspeed.runtime.epd.mooncake import encode as epd_encode  # noqa: E402
+from tokenspeed.runtime.epd.mooncake import prefill as epd_prefill  # noqa: E402
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor  # noqa: E402
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 from tokenspeed.runtime.utils.network import get_free_port, join_host_port  # noqa: E402
@@ -326,10 +328,121 @@ def test_request_crosses_pd_control_plane_over_loopback(
             block_manifest=cache_pd.block_manifest(("history", (2,))),
         )
         _wait_for(
-            lambda: decode.kv_manager.check_status(7)
-            in (TransferPoll.Success, TransferPoll.Failed)
+            lambda: (
+                decode.kv_manager.check_status(7)
+                in (TransferPoll.Success, TransferPoll.Failed)
+            )
         )
         assert decode.kv_manager.check_status(7) == TransferPoll.Success
         assert written_sessions == [decode_session]
     finally:
         bootstrap.close()
+
+
+# --- The EPD (encode -> prefill) managers bind and dial through the same helpers ---
+
+
+class _NoThread:
+    """A thread that never starts: only the bind ahead of it is under test."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        pass
+
+
+def _bare_epd_manager(cls):
+    manager = object.__new__(cls)
+    manager.server_socket = zmq.Context().socket(zmq.PULL)
+    manager.rank_port = None
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("host", "ipv6"),
+    [("127.0.0.1", 0), pytest.param("::1", 1, marks=requires_ipv6_loopback)],
+)
+@pytest.mark.parametrize(
+    ("module", "cls", "method"),
+    [
+        (
+            epd_encode,
+            epd_encode.MooncakeEmbeddingManagerEncode,
+            "_start_bootstrap_thread",
+        ),
+        (
+            epd_prefill,
+            epd_prefill.MooncakeEmbeddingManagerPrefill,
+            "_start_status_thread",
+        ),
+    ],
+)
+def test_epd_control_socket_binds_the_local_address_bracketed(
+    monkeypatch, module, cls, method, host, ipv6
+):
+    """The encode bootstrap socket and the prefill status socket bind through
+    bind_server_socket: an IPv6 literal is bracketed, IPv6 is on for it, and
+    rank_port is the port the bind took."""
+    monkeypatch.setattr(module, "get_local_ip_by_remote", lambda: host)
+    monkeypatch.setattr(
+        module,
+        "threading",
+        types.SimpleNamespace(
+            Thread=_NoThread, local=threading.local, Lock=threading.Lock
+        ),
+    )
+    manager = _bare_epd_manager(cls)
+    try:
+        getattr(manager, method)()
+        assert isinstance(manager.rank_port, int)
+        assert manager.server_socket.getsockopt(zmq.IPV6) == ipv6
+        bound = manager.server_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        assert bound == f"tcp://{join_host_port(host, manager.rank_port)}"
+    finally:
+        manager.server_socket.close(linger=0)
+
+
+@pytest.mark.parametrize(
+    ("host", "ipv6"),
+    [("127.0.0.1", 0), pytest.param("::1", 1, marks=requires_ipv6_loopback)],
+)
+def test_epd_encode_status_push_dials_a_bracketed_endpoint(host, ipv6):
+    """_sync_status dials the prefill's status socket by join_host_port and
+    turns IPv6 on for a literal, as the PD side's _connect does."""
+    manager = object.__new__(epd_encode.MooncakeEmbeddingManagerEncode)
+    manager._status_tls = threading.local()
+    manager.embedding_args = types.SimpleNamespace(engine_rank=0)
+    info = types.SimpleNamespace(endpoint=host, dst_port=8998, room=7)
+    manager._sync_status(info, 1)
+    socks = manager._status_tls.socks
+    try:
+        ((endpoint, sock),) = socks.items()
+        assert endpoint == f"tcp://{join_host_port(host, 8998)}"
+        assert sock.getsockopt(zmq.IPV6) == ipv6
+    finally:
+        for sock in socks.values():
+            sock.close(linger=0)
+
+
+def test_epd_encode_registers_through_a_bracketed_bootstrap_url(monkeypatch):
+    """The bootstrap /route URL brackets an IPv6 bootstrap host."""
+    manager = object.__new__(epd_encode.MooncakeEmbeddingManagerEncode)
+    manager.args = types.SimpleNamespace(bootstrap_host="::1")
+    manager.bootstrap_port = 8998
+    manager.world_size = 1
+    manager.dp_size = 1
+    manager.rank_port = 40123
+    manager.embedding_args = types.SimpleNamespace(engine_rank=0)
+    monkeypatch.setattr(epd_encode, "get_local_ip_by_remote", lambda: "::1")
+    seen = []
+
+    def put(url, json, timeout):
+        seen.append((url, json))
+        return types.SimpleNamespace(ok=True)
+
+    monkeypatch.setattr(epd_encode.requests, "put", put)
+    manager._register_to_bootstrap()
+    assert [url for url, _ in seen] == ["http://[::1]:8998/route"]
+    assert seen[0][1]["rank_ip"] == "::1"
+    assert seen[0][1]["rank_port"] == 40123

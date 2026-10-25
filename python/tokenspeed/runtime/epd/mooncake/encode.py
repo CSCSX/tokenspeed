@@ -45,11 +45,12 @@ from tokenspeed.runtime.epd.entities import (
 from tokenspeed.runtime.epd.mooncake.conn import (
     MooncakeEmbeddingManagerBase,
 )
+from tokenspeed.runtime.pd.base.manager import enable_ipv6_for_endpoint
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote, join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -180,8 +181,10 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
         threading.Thread(target=self._park_reaper, daemon=True).start()
 
     def _start_bootstrap_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        # The shared bind brackets an IPv6 literal and takes the port from the
+        # bound endpoint (a port probed first can be gone, and an IPv4 probe
+        # does not see one held on IPv6).
+        self.bind_server_socket(get_local_ip_by_remote())
 
         def loop():
             while True:
@@ -224,7 +227,7 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
             "rank_port": self.rank_port,
             "engine_rank": self.embedding_args.engine_rank,
         }
-        url = f"http://{bootstrap_host}:{self.bootstrap_port}/route"
+        url = f"http://{join_host_port(bootstrap_host, self.bootstrap_port)}/route"
         # The bootstrap HTTP server starts concurrently with this call, so the
         # first PUTs can race it and hit connection-refused. A dropped
         # registration leaves /route's parallel-info null and the encode silently
@@ -417,10 +420,11 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
         socks = getattr(self._status_tls, "socks", None)
         if socks is None:
             socks = self._status_tls.socks = {}
-        endpoint = f"tcp://{info.endpoint}:{info.dst_port}"
+        endpoint = f"tcp://{join_host_port(info.endpoint, info.dst_port)}"
         sock = socks.get(endpoint)
         if sock is None:
             sock = zmq.Context.instance().socket(zmq.PUSH)
+            enable_ipv6_for_endpoint(sock, endpoint)
             sock.connect(endpoint)
             socks[endpoint] = sock
         sock.send_multipart(

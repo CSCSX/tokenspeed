@@ -38,7 +38,7 @@ from tokenspeed.runtime.epd.mooncake.conn import (
 )
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.utils import DisaggregationMode
-from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 
 class MooncakeEmbeddingManagerPrefill(MooncakeEmbeddingManagerBase):
@@ -56,8 +56,9 @@ class MooncakeEmbeddingManagerPrefill(MooncakeEmbeddingManagerBase):
         self._start_status_thread()
 
     def _start_status_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        # The shared bind brackets an IPv6 literal and takes the port from the
+        # bound endpoint.
+        self.bind_server_socket(get_local_ip_by_remote())
 
         def loop():
             while True:
