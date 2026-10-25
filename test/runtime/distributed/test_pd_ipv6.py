@@ -47,6 +47,14 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from test.runtime import cache_pd_test_utils as cache_pd  # noqa: E402
 
+from tokenspeed.runtime.epd.entities import (  # noqa: E402
+    EmbeddingArgs,
+    EmbeddingManagerArgs,
+    EmbeddingTransferInfo,
+)
+from tokenspeed.runtime.epd.mooncake import encode as epd_encode  # noqa: E402
+from tokenspeed.runtime.epd.mooncake import prefill as epd_prefill  # noqa: E402
+from tokenspeed.runtime.epd.mooncake import receiver as epd_receiver  # noqa: E402
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo  # noqa: E402
 from tokenspeed.runtime.pd.base.manager import (  # noqa: E402
     DisaggManagerBase,
@@ -60,8 +68,6 @@ from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor  # noqa: E402
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer  # noqa: E402
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs  # noqa: E402
-from tokenspeed.runtime.epd.mooncake import encode as epd_encode  # noqa: E402
-from tokenspeed.runtime.epd.mooncake import prefill as epd_prefill  # noqa: E402
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor  # noqa: E402
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 from tokenspeed.runtime.utils.network import get_free_port, join_host_port  # noqa: E402
@@ -353,10 +359,23 @@ class _NoThread:
 
 
 def _bare_epd_manager(cls):
+    """A manager with only the control socket the bind under test needs; the
+    caller terminates the returned context."""
+    context = zmq.Context()
     manager = object.__new__(cls)
-    manager.server_socket = zmq.Context().socket(zmq.PULL)
+    manager.server_socket = context.socket(zmq.PULL)
     manager.rank_port = None
-    return manager
+    return manager, context
+
+
+def _embedding_args(engine_rank: int = 0) -> EmbeddingArgs:
+    return EmbeddingArgs(
+        engine_rank=engine_rank,
+        gpu_id=0,
+        ib_device=None,
+        embedding_data_ptr=0,
+        embedding_data_len=0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -392,7 +411,7 @@ def test_epd_control_socket_binds_the_local_address_bracketed(
             Thread=_NoThread, local=threading.local, Lock=threading.Lock
         ),
     )
-    manager = _bare_epd_manager(cls)
+    manager, context = _bare_epd_manager(cls)
     try:
         getattr(manager, method)()
         assert isinstance(manager.rank_port, int)
@@ -401,6 +420,7 @@ def test_epd_control_socket_binds_the_local_address_bracketed(
         assert bound == f"tcp://{join_host_port(host, manager.rank_port)}"
     finally:
         manager.server_socket.close(linger=0)
+        context.term()
 
 
 @pytest.mark.parametrize(
@@ -412,8 +432,20 @@ def test_epd_encode_status_push_dials_a_bracketed_endpoint(host, ipv6):
     turns IPv6 on for a literal, as the PD side's _connect does."""
     manager = object.__new__(epd_encode.MooncakeEmbeddingManagerEncode)
     manager._status_tls = threading.local()
-    manager.embedding_args = types.SimpleNamespace(engine_rank=0)
-    info = types.SimpleNamespace(endpoint=host, dst_port=8998, room=7)
+    manager.embedding_args = _embedding_args()
+    info = EmbeddingTransferInfo(
+        room=7,
+        endpoint=host,
+        dst_port=8998,
+        mooncake_session_id=join_host_port(host, 16706),
+        dst_embedding_ptr=0,
+        dst_deepstack_ptr=0,
+        n_tokens=1,
+        hidden=1,
+        dtype="bfloat16",
+        has_deepstack=False,
+        required_dst_info_num=1,
+    )
     manager._sync_status(info, 1)
     socks = manager._status_tls.socks
     try:
@@ -428,12 +460,14 @@ def test_epd_encode_status_push_dials_a_bracketed_endpoint(host, ipv6):
 def test_epd_encode_registers_through_a_bracketed_bootstrap_url(monkeypatch):
     """The bootstrap /route URL brackets an IPv6 bootstrap host."""
     manager = object.__new__(epd_encode.MooncakeEmbeddingManagerEncode)
-    manager.args = types.SimpleNamespace(bootstrap_host="::1")
-    manager.bootstrap_port = 8998
-    manager.world_size = 1
+    manager.args = EmbeddingManagerArgs(
+        bootstrap_port=8998, tp_size=1, bootstrap_host="::1"
+    )
+    manager.bootstrap_port = manager.args.bootstrap_port
+    manager.world_size = manager.args.tp_size
     manager.dp_size = 1
     manager.rank_port = 40123
-    manager.embedding_args = types.SimpleNamespace(engine_rank=0)
+    manager.embedding_args = _embedding_args()
     monkeypatch.setattr(epd_encode, "get_local_ip_by_remote", lambda: "::1")
     seen = []
 
@@ -446,3 +480,21 @@ def test_epd_encode_registers_through_a_bracketed_bootstrap_url(monkeypatch):
     assert [url for url, _ in seen] == ["http://[::1]:8998/route"]
     assert seen[0][1]["rank_ip"] == "::1"
     assert seen[0][1]["rank_port"] == 40123
+
+
+def test_epd_route_get_takes_a_bracketed_bootstrap_address(monkeypatch):
+    """The prefill side hands the receiver the bootstrap address through
+    join_host_port, and the /route GET embeds it as given."""
+    seen = []
+
+    def get(url, timeout):
+        seen.append(url)
+        return types.SimpleNamespace(
+            ok=True, status_code=200, json=lambda: {"parallel_info": None}
+        )
+
+    monkeypatch.setattr(epd_receiver.requests, "get", get)
+    epd_receiver._route_get(
+        join_host_port("::1", 8998), engine_rank=0, target_dp_group=0
+    )
+    assert seen == ["http://[::1]:8998/route?engine_rank=0&target_dp_group=0"]

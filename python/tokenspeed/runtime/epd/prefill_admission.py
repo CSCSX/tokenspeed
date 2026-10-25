@@ -65,6 +65,7 @@ from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.network import join_host_port
 
 # (manager, bootstrap_addr, bootstrap_room) -> receiver. Defaults to the real
 # MooncakeEmbeddingReceiver; overridden in tests with a fake.
@@ -429,7 +430,7 @@ class EmbeddingReceiveJob:
 
         # The item's image spans all its concatenated subgrid tokens.
         span = _item_token_count(item)
-        addr = f"{handshake['bootstrap_host']}:{handshake['bootstrap_port']}"
+        addr = join_host_port(handshake["bootstrap_host"], handshake["bootstrap_port"])
         # The receiver __init__ performs the bootstrap handshake (HTTP /route fetch
         # + endpoint registration); on return its poll() is already Bootstrapped or
         # Failed. We do NOT pre_alloc here -- poll() does it once Bootstrapped.

@@ -41,7 +41,7 @@ from tokenspeed.runtime.epd.entities import (
 from tokenspeed.runtime.epd.mooncake.prefill import MooncakeEmbeddingManagerPrefill
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.network import get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote, join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -162,7 +162,7 @@ class MooncakeEmbeddingReceiver:
         )
         for info in self.encode_infos:
             sock, lock = self.mgr._connect(
-                f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                f"tcp://{join_host_port(info['rank_ip'], info['rank_port'])}"
             )
             with lock:
                 sock.send_multipart(reg.to_zmq())
@@ -204,7 +204,7 @@ class MooncakeEmbeddingReceiver:
                 span=span,
             )
             sock, lock = self.mgr._connect(
-                f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                f"tcp://{join_host_port(info['rank_ip'], info['rank_port'])}"
             )
             with lock:
                 sock.send_multipart(ti.to_zmq())
