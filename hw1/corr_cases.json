@@ -1,0 +1,9 @@
+[
+ {"name": "corr_len32",   "prompt": "corr_len32",   "max_new_tokens": 32},
+ {"name": "corr_len256",  "prompt": "corr_len256",  "max_new_tokens": 32},
+ {"name": "corr_len1024", "prompt": "corr_len1024", "max_new_tokens": 32},
+ {"name": "corr_len4096", "prompt": "corr_len4096", "max_new_tokens": 32},
+ {"name": "corr_multistep","prompt": "corr_multistep","max_new_tokens": 96},
+ {"name": "iso_A",        "prompt": "iso_A",        "max_new_tokens": 32},
+ {"name": "iso_B",        "prompt": "iso_B",        "max_new_tokens": 32}
+]

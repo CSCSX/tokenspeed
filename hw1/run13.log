@@ -1,0 +1,92 @@
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+[38;20m[2026-10-25 14:01:01,183 None] - INFO - Inferred world_size (1) from attn_tp_size (None) x attn_dp_size (None) x pp_size (1) (server_args.py:1067)[0m
+[38;20m[2026-10-25 14:01:01,183 None] - INFO - Parallelism configuration:
+Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Pipeline: pp=1
+  Attention: tp=1  kvp=1  qcp=1  dp=1  head_tp=1
+    Vision: tp=1  item_dp=1
+  LM head : tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1 (server_args.py:1203)[0m
+/home/u2501112016/venvs/aics-hw1/lib/python3.11/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[38;20m[2026-10-25 14:01:01,209 ] - INFO - Init torch distributed begin. Avail mem=61.1160 GB (distributed_initializer.py:147)[0m
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[38;20m[2026-10-25 14:01:01,218 ] - INFO - Init comm buff end. Avail mem=61.1160 GB (distributed_initializer.py:260)[0m
+[38;20m[2026-10-25 14:01:01,218 ] - INFO - Current Process distributed state:  global rank: 0  attn_tp_rank: 0  attn_dp_rank: 0 (distributed_initializer.py:265)[0m
+[38;20m[2026-10-25 14:01:02,508 ] - INFO - Load weight begin. avail mem=61.12 GB (weight_loader.py:77)[0m
+[2026-10-25 14:01:02] using attn output gate!
+[2026-10-25 14:01:02] multimodal encoder attention backend: triton_attn (override)
+[38;20m[2026-10-25 14:01:02,909 ] - INFO - Prefetching 1/1 checkpoint shards as local reader 0/1 into the OS page cache (window 40.0 GiB, up to 8 range-reader threads). (weight_utils.py:593)[0m
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[38;20m[2026-10-25 14:01:02,945 ] - INFO - Checkpoint prefetch finished after 0.04s. (weight_utils.py:652)[0m
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.21it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.21it/s]
+
+[38;20m[2026-10-25 14:01:03,221 ] - INFO - Load weight end. type=Qwen3_5ForConditionalGeneration, dtype=torch.bfloat16, avail mem=59.34 GB (weight_loader.py:122)[0m
+/home/u2501112016/tokenspeed/python/tokenspeed/runtime/layers/attention/mm_encoder_attention.py:145: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at build/CMakeFiles/torch_npu.dir/compiler_depend.ts:338.)
+  output = torch.empty_like(q)
+[2026-10-25 14:01:03] Multimodal encoder warmup complete: modality=image feature_shapes=[(2304, 1536)] elapsed=296.284 ms
+[2026-10-25 14:01:03] Multimodal encoder warmup complete: modality=video feature_shapes=[(4608, 1536)] elapsed=45.338 ms
+[38;20m[2026-10-25 14:01:03,565 ] - INFO - CUDA-graph memory reserve off, startup residue unreserved: --enforce-eager captures no graphs (device.py:1327)[0m
+[2026-10-25 14:01:03] Cache profile: parent_bytes=12582912, P=128, parents=4261, token_capacity=4363264, layers=24 (draft 0), groups={'full_attention': 8, 'linear_attention_0': 1, 'linear_attention_1': 1}
+[38;20m[2026-10-25 14:01:06,204 ] - INFO - Allocated cache arena: device_bytes=53628370944, host_bytes=0, logical_plan_bytes=53628370944, prefix_granularity=128, num_lcm_blocks=4261, device npu (arena.py:206)[0m
+[38;20m[2026-10-25 14:01:06,206 ] - INFO - Initialized cache view over 4363264 slots as torch.bfloat16, layers from 0, rank 0 (base.py:234)[0m
+[38;20m[2026-10-25 14:01:06,206 ] - INFO - KV Cache is allocated. K size: 24.97 GB, V size: 24.97 GB. (mha.py:98)[0m
+[2026-10-25 14:01:06] Created hybrid_linear_attn backend: 6 full attn layers, 18 linear attn layers, LCM state fields
+[2026-10-25 14:01:06] Batch-DP spec-verify: requested=False, infra_supports=False, enabled=False min_bs=None (drafter=False, backend_supports_dp=False, tp_size=1, tp_group=True)
+[38;20m[2026-10-25 14:01:06,257 ] - INFO - Prewarming Triton RSAG communication states (model_executor.py:964)[0m
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[38;20m[2026-10-25 14:01:06,715 ] - INFO - Finished prewarming Triton RSAG communication states (model_executor.py:966)[0m
+[38;20m[2026-10-25 14:01:06,716 ] - INFO - ModelExecutor initialized (model_executor.py:801)[0m
+[38;20m[2026-10-25 14:01:06,716 ] - INFO - Kernel startup warmup with 8192 prefill tokens (model_executor.py:1093)[0m
+[38;20m[2026-10-25 14:01:14,928 ] - INFO - Kernel startup warmup finished in 8.2s (model_executor.py:1161)[0m
+[38;20m[2026-10-25 14:01:14,930 ] - INFO - workspace frozen: 256.00 MB (workspace.py:146)[0m
+[38;20m[2026-10-25 14:01:14,936 ] - INFO - Device memory summary (rank 0, npu 0, GB):
++---------------------------------+------------+
+| Component                       |         GB |
++---------------------------------+------------+
+| Attention weights               |       0.05 |
+| MoE weights                     |       0.33 |
+| Dense/MLP weights               |       0.27 |
+| Other weights (embed/head/norm) |       1.00 |
+| KV cache                        |      49.95 |
+| Activations + device graphs     |       0.27 |
+| Torch allocated (total)         |      51.87 |
+| Torch reserved (allocator pool) |      53.12 |
+| Non-torch (context/collectives) |       0.39 |
+| Device used (driver view)       |      53.51 |
+| Device free                     |       7.77 |
+| Device total                    |      61.28 |
++---------------------------------+------------+ (scheduler_utils.py:845)[0m
+[38;20m[2026-10-25 14:01:16,968 ] - INFO - Allocated 107.23 GB compact Host L2 (8522 LCM blocks, 12582912 bytes/block) (executor.py:338)[0m
+[38;20m[2026-10-25 14:01:16,968 ] - INFO - Retraction snapshot pool: 0.60 GB (48 LCM blocks of 12582912 bytes; derived: 16 image tails x 3 LCM blocks beside Host L2), up to 16 retracted requests (0.00 MB slot-state arena); hash-complete pages go to Host L2, tails to the pool (executor.py:343)[0m
+[38;20m[2026-10-25 14:01:17,759 ] - INFO - [L2] writeback started: operations=1 blocks=3 pinned=True (executor.py:927)[0m
+[load] engine built in 16.4s
+[load] checkpoint tensors: 488
+[load] unmapped checkpoint tensors (missing keys): 0
+[load] eos token ids: [248044, 248046]
+[run] prompt: 'The capital of France is' -> 5 tokens
+[token   1] id=11751 ' Paris' (157.5 ms)
+[token   2] id=13 '.' (289.2 ms)
+[token   3] id=198 '\n' (46.2 ms)
+[token   4] id=760 'The' (45.8 ms)
+[token   5] id=6511 ' capital' (42.5 ms)
+[token   6] id=314 ' of' (41.3 ms)
+[token   7] id=9338 ' France' (40.9 ms)
+[token   8] id=369 ' is' (40.8 ms)
+[done] generated 8 tokens: ' Paris.\nThe capital of France is'
+[stat] TTFT: 157.6 ms
+[stat] decode: 7 tokens, avg 78.1 ms/token
+[stat] NPU HBM allocated: 51.87 GiB, peak: 52.54 GiB

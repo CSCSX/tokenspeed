@@ -1,0 +1,10 @@
+case             prompt ref_n  ts_n  match first_div  verdict
+corr_len32[r0]       32    32    32     13        13  DIVERGE | div@13: ref 1118 vs ts 3712, HF margin 0.0000 (top1=15.6875 top2=15.6875)  NEAR-TIE
+corr_len256[r0]     256    32    32     32        -1  EXACT
+corr_len1024[r0]   1024    32    32     32        -1  EXACT
+corr_len4096[r0]   4096    32    32     32        -1  EXACT
+corr_multistep[r0]     64    96    96     96        -1  EXACT
+iso_A[r0]             5    32    32     32        -1  EXACT
+iso_B[r0]            13    32    32      6         6  DIVERGE | div@6: ref 6414 vs ts 10583, HF margin 0.0000 (top1=13.75 top2=13.75)  NEAR-TIE
+
+5/7 runs exactly match the HF reference

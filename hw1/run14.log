@@ -1,0 +1,133 @@
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+[38;20m[2026-10-25 14:02:29,428 None] - INFO - Inferred world_size (1) from attn_tp_size (None) x attn_dp_size (None) x pp_size (1) (server_args.py:1067)[0m
+[38;20m[2026-10-25 14:02:29,428 None] - INFO - Parallelism configuration:
+Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Pipeline: pp=1
+  Attention: tp=1  kvp=1  qcp=1  dp=1  head_tp=1
+    Vision: tp=1  item_dp=1
+  LM head : tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1 (server_args.py:1203)[0m
+/home/u2501112016/venvs/aics-hw1/lib/python3.11/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[38;20m[2026-10-25 14:02:29,454 ] - INFO - Init torch distributed begin. Avail mem=61.1164 GB (distributed_initializer.py:147)[0m
+[38;20m[2026-10-25 14:02:29,463 ] - INFO - Init comm buff end. Avail mem=61.1164 GB (distributed_initializer.py:260)[0m
+[38;20m[2026-10-25 14:02:29,463 ] - INFO - Current Process distributed state:  global rank: 0  attn_tp_rank: 0  attn_dp_rank: 0 (distributed_initializer.py:265)[0m
+[38;20m[2026-10-25 14:02:30,787 ] - INFO - Load weight begin. avail mem=61.12 GB (weight_loader.py:77)[0m
+[2026-10-25 14:02:31] using attn output gate!
+[2026-10-25 14:02:31] multimodal encoder attention backend: triton_attn (override)
+[38;20m[2026-10-25 14:02:31,184 ] - INFO - Prefetching 1/1 checkpoint shards as local reader 0/1 into the OS page cache (window 40.0 GiB, up to 8 range-reader threads). (weight_utils.py:593)[0m
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[38;20m[2026-10-25 14:02:31,220 ] - INFO - Checkpoint prefetch finished after 0.04s. (weight_utils.py:652)[0m
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.16it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.15it/s]
+
+[38;20m[2026-10-25 14:02:31,499 ] - INFO - Load weight end. type=Qwen3_5ForConditionalGeneration, dtype=torch.bfloat16, avail mem=59.34 GB (weight_loader.py:122)[0m
+/home/u2501112016/tokenspeed/python/tokenspeed/runtime/layers/attention/mm_encoder_attention.py:145: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at build/CMakeFiles/torch_npu.dir/compiler_depend.ts:338.)
+  output = torch.empty_like(q)
+[2026-10-25 14:02:31] Multimodal encoder warmup complete: modality=image feature_shapes=[(2304, 1536)] elapsed=300.786 ms
+[2026-10-25 14:02:31] Multimodal encoder warmup complete: modality=video feature_shapes=[(4608, 1536)] elapsed=44.523 ms
+[38;20m[2026-10-25 14:02:31,847 ] - INFO - CUDA-graph memory reserve off, startup residue unreserved: --enforce-eager captures no graphs (device.py:1327)[0m
+[2026-10-25 14:02:31] Cache profile: parent_bytes=12582912, P=128, parents=4261, token_capacity=4363264, layers=24 (draft 0), groups={'full_attention': 8, 'linear_attention_0': 1, 'linear_attention_1': 1}
+[38;20m[2026-10-25 14:02:34,410 ] - INFO - Allocated cache arena: device_bytes=53628370944, host_bytes=0, logical_plan_bytes=53628370944, prefix_granularity=128, num_lcm_blocks=4261, device npu (arena.py:206)[0m
+[38;20m[2026-10-25 14:02:34,412 ] - INFO - Initialized cache view over 4363264 slots as torch.bfloat16, layers from 0, rank 0 (base.py:234)[0m
+[38;20m[2026-10-25 14:02:34,412 ] - INFO - KV Cache is allocated. K size: 24.97 GB, V size: 24.97 GB. (mha.py:98)[0m
+[2026-10-25 14:02:34] Created hybrid_linear_attn backend: 6 full attn layers, 18 linear attn layers, LCM state fields
+[2026-10-25 14:02:34] Batch-DP spec-verify: requested=False, infra_supports=False, enabled=False min_bs=None (drafter=False, backend_supports_dp=False, tp_size=1, tp_group=True)
+[38;20m[2026-10-25 14:02:34,460 ] - INFO - Prewarming Triton RSAG communication states (model_executor.py:964)[0m
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[38;20m[2026-10-25 14:02:34,909 ] - INFO - Finished prewarming Triton RSAG communication states (model_executor.py:966)[0m
+[38;20m[2026-10-25 14:02:34,910 ] - INFO - ModelExecutor initialized (model_executor.py:801)[0m
+[38;20m[2026-10-25 14:02:34,910 ] - INFO - Kernel startup warmup with 8192 prefill tokens (model_executor.py:1093)[0m
+[38;20m[2026-10-25 14:02:43,094 ] - INFO - Kernel startup warmup finished in 8.2s (model_executor.py:1161)[0m
+[38;20m[2026-10-25 14:02:43,097 ] - INFO - workspace frozen: 256.00 MB (workspace.py:146)[0m
+[38;20m[2026-10-25 14:02:43,107 ] - INFO - Device memory summary (rank 0, npu 0, GB):
++---------------------------------+------------+
+| Component                       |         GB |
++---------------------------------+------------+
+| Attention weights               |       0.05 |
+| MoE weights                     |       0.33 |
+| Dense/MLP weights               |       0.27 |
+| Other weights (embed/head/norm) |       1.00 |
+| KV cache                        |      49.95 |
+| Activations + device graphs     |       0.27 |
+| Torch allocated (total)         |      51.87 |
+| Torch reserved (allocator pool) |      53.12 |
+| Non-torch (context/collectives) |       0.39 |
+| Device used (driver view)       |      53.51 |
+| Device free                     |       7.77 |
+| Device total                    |      61.28 |
++---------------------------------+------------+ (scheduler_utils.py:845)[0m
+[38;20m[2026-10-25 14:02:44,964 ] - INFO - Allocated 107.23 GB compact Host L2 (8522 LCM blocks, 12582912 bytes/block) (executor.py:338)[0m
+[38;20m[2026-10-25 14:02:44,964 ] - INFO - Retraction snapshot pool: 0.60 GB (48 LCM blocks of 12582912 bytes; derived: 16 image tails x 3 LCM blocks beside Host L2), up to 16 retracted requests (0.00 MB slot-state arena); hash-complete pages go to Host L2, tails to the pool (executor.py:343)[0m
+[38;20m[2026-10-25 14:02:49,517 ] - INFO - [L2] writeback started: operations=1 blocks=3 pinned=True (executor.py:927)[0m
+[load] engine built in 16.2s
+[load] checkpoint tensors: 488
+[load] unmapped checkpoint tensors (missing keys): 0
+[load] eos token ids: [248044, 248046]
+[run] prompt: 'Give me a short introduction to Beijing.' -> 8 tokens
+[token   1] id=271 '\n\n' (3886.3 ms)
+[token   2] id=248068 '<think>' (306.2 ms)
+[token   3] id=271 '\n\n' (54.4 ms)
+[token   4] id=248069 '</think>' (48.3 ms)
+[token   5] id=271 '\n\n' (63.1 ms)
+[token   6] id=3320 'Be' (54.7 ms)
+[token   7] id=22909 'ijing' (52.2 ms)
+[token   8] id=369 ' is' (50.6 ms)
+[token   9] id=279 ' the' (49.7 ms)
+[token  10] id=6511 ' capital' (51.7 ms)
+[token  11] id=314 ' of' (50.4 ms)
+[token  12] id=5440 ' China' (46.3 ms)
+[token  13] id=11 ',' (51.5 ms)
+[token  14] id=264 ' a' (44.4 ms)
+[token  15] id=3177 ' city' (44.1 ms)
+[token  16] id=314 ' of' (50.0 ms)
+[token  17] id=220 ' ' (46.1 ms)
+[token  18] id=17 '2' (43.0 ms)
+[token  19] id=13 '.' (46.1 ms)
+[token  20] id=16 '1' (43.4 ms)
+[token  21] id=3410 ' million' (43.1 ms)
+[token  22] id=1208 ' people' (43.0 ms)
+[token  23] id=321 ' and' (43.0 ms)
+[token  24] id=264 ' a' (42.8 ms)
+[token  25] id=3478 ' major' (43.1 ms)
+[token  26] id=3521 ' global' (42.9 ms)
+[token  27] id=18156 ' hub' (42.9 ms)
+[token  28] id=364 ' for' (42.9 ms)
+[token  29] id=6286 ' international' (43.0 ms)
+[token  30] id=6355 ' trade' (42.9 ms)
+[token  31] id=11 ',' (43.2 ms)
+[token  32] id=16519 ' finance' (43.2 ms)
+[token  33] id=11 ',' (43.3 ms)
+[token  34] id=321 ' and' (43.3 ms)
+[token  35] id=5269 ' technology' (43.0 ms)
+[token  36] id=13 '.' (43.1 ms)
+[token  37] id=1049 ' It' (43.1 ms)
+[token  38] id=369 ' is' (43.0 ms)
+[token  39] id=3750 ' known' (43.1 ms)
+[token  40] id=364 ' for' (43.2 ms)
+[token  41] id=1141 ' its' (44.5 ms)
+[token  42] id=8807 ' rich' (43.0 ms)
+[token  43] id=3712 ' history' (43.0 ms)
+[token  44] id=11 ',' (45.9 ms)
+[token  45] id=13437 ' ancient' (43.1 ms)
+[token  46] id=54994 ' temples' (44.6 ms)
+[token  47] id=11 ',' (43.4 ms)
+[token  48] id=321 ' and' (43.2 ms)
+[done] generated 48 tokens: '\n\n<think>\n\n</think>\n\nBeijing is the capital of China, a city of 2.1 million people and a major global hub for international trade, finance, and technology. It is known for its rich history, ancient temples, and'
+[stat] TTFT: 3886.7 ms
+[stat] decode: first step 306.2 ms (includes one-time decode-path JIT compile)
+[stat] decode steady-state: 46 tokens, avg 45.7 ms/token
+[stat] NPU HBM allocated: 51.87 GiB, peak: 52.54 GiB

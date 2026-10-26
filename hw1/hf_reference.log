@@ -1,0 +1,37 @@
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 9581.23it/s]
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[transformers] The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Setting `pad_token_id` to `eos_token_id`:248044 for open-end generation.
+[ref] loaded qwen3_5_text on CPU, bf16
+[ref] corr_len32: prompt=32 gen=32 in 94.1s -> ' computation but also the nature of the data being processed.\n\nThe first generation of computers, the mechanical, was designed to perform arithmetic operations on numbers. It was'
+[ref] corr_len256: prompt=256 gen=32 in 105.6s -> 'frames, and modern silicon accelerators. Each generation changed not only the speed of arithmetic but the way people formulate problems, organize data, and reason about machines.'
+[ref] corr_len1024: prompt=1024 gen=32 in 129.9s -> 'frames, and modern silicon accelerators. Each generation changed not only the speed of arithmetic but the way people formulate problems, organize data, and reason about machines.'
+[ref] corr_len4096: prompt=4096 gen=32 in 231.9s -> 'frames, and modern silicon accelerators. Each generation changed not only the speed of arithmetic but the way people formulate problems, organize data, and reason about machines.'
+[ref] corr_multistep: prompt=64 gen=96 in 300.8s -> 'frames, and modern silicon accelerators. Each generation changed not only the speed of arithmetic but the way people formulate problems, organize data, and reason about machines.\n\nThe history of computing spans mechanical calculators, vacuum tube machines, transistorized mainframes, and modern silicon accelerators. Each generation changed not only the speed of arithmetic but the way people formulate problems, organize data, and reason about machines.\n\nThe history of computing spans mechanical calculators, vacuum tube machines, transistor'
+[ref] iso_A: prompt=5 gen=32 in 93.0s -> ' Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is'
+[ref] iso_B: prompt=13 gen=32 in 92.9s -> '\n\n<think>\n\n</think>\n\nGolden golds drift down,\nSilent water ripples,\nSoft silence holds.\n\n**Note:** The third line ("Soft'
+wrote /home/u2501112016/hw1/ref.json
+exit: 0

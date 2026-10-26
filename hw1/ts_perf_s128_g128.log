@@ -1,0 +1,81 @@
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+[38;20m[2026-10-25 15:23:21,907 None] - INFO - Inferred world_size (1) from attn_tp_size (None) x attn_dp_size (None) x pp_size (1) (server_args.py:1067)[0m
+[38;20m[2026-10-25 15:23:21,907 None] - INFO - Parallelism configuration:
+Mapping(rank=?, world_size=1)
+  Cluster : 1 node(s) x 1 proc(s)
+  Pipeline: pp=1
+  Attention: tp=1  kvp=1  qcp=1  dp=1  head_tp=1
+    Vision: tp=1  item_dp=1
+  LM head : tp=1
+  Dense   : tp=1  dp=1
+  MoE     : tp=1  ep=1  dp=1 (server_args.py:1203)[0m
+/home/u2501112016/venvs/aics-hw1/lib/python3.11/site-packages/transformers/modeling_rope_utils.py:1036: FutureWarning: `rope_config_validation` is deprecated and has been removed. Its functionality has been moved to RotaryEmbeddingConfigMixin.validate_rope method. PreTrainedConfig inherits this class, so please call self.validate_rope() instead. Also, make sure to use the new rope_parameters syntax. You can call self.standardize_rope_params() in the meantime.
+  warnings.warn(
+[38;20m[2026-10-25 15:23:21,936 ] - INFO - Init torch distributed begin. Avail mem=57.2121 GB (distributed_initializer.py:147)[0m
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[38;20m[2026-10-25 15:23:21,946 ] - INFO - Init comm buff end. Avail mem=57.2121 GB (distributed_initializer.py:260)[0m
+[38;20m[2026-10-25 15:23:21,947 ] - INFO - Current Process distributed state:  global rank: 0  attn_tp_rank: 0  attn_dp_rank: 0 (distributed_initializer.py:265)[0m
+[38;20m[2026-10-25 15:23:23,306 ] - INFO - Load weight begin. avail mem=57.21 GB (weight_loader.py:77)[0m
+[2026-10-25 15:23:23] using attn output gate!
+[2026-10-25 15:23:23] multimodal encoder attention backend: triton_attn (override)
+[38;20m[2026-10-25 15:23:23,724 ] - INFO - Prefetching 1/1 checkpoint shards as local reader 0/1 into the OS page cache (window 40.0 GiB, up to 8 range-reader threads). (weight_utils.py:593)[0m
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[38;20m[2026-10-25 15:23:23,827 ] - INFO - Checkpoint prefetch finished after 0.10s. (weight_utils.py:652)[0m
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.81it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.81it/s]
+
+[38;20m[2026-10-25 15:23:24,190 ] - INFO - Load weight end. type=Qwen3_5ForConditionalGeneration, dtype=torch.bfloat16, avail mem=55.43 GB (weight_loader.py:122)[0m
+/home/u2501112016/tokenspeed/python/tokenspeed/runtime/layers/attention/mm_encoder_attention.py:145: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at build/CMakeFiles/torch_npu.dir/compiler_depend.ts:338.)
+  output = torch.empty_like(q)
+[2026-10-25 15:23:24] Multimodal encoder warmup complete: modality=image feature_shapes=[(2304, 1536)] elapsed=358.555 ms
+[2026-10-25 15:23:24] Multimodal encoder warmup complete: modality=video feature_shapes=[(4608, 1536)] elapsed=47.282 ms
+[38;20m[2026-10-25 15:23:24,601 ] - INFO - CUDA-graph memory reserve off, startup residue unreserved: --enforce-eager captures no graphs (device.py:1327)[0m
+[2026-10-25 15:23:24] Cache profile: parent_bytes=12582912, P=128, parents=3978, token_capacity=4073472, layers=24 (draft 0), groups={'full_attention': 8, 'linear_attention_0': 1, 'linear_attention_1': 1}
+[38;20m[2026-10-25 15:23:26,949 ] - INFO - Allocated cache arena: device_bytes=50067406848, host_bytes=0, logical_plan_bytes=50067406848, prefix_granularity=128, num_lcm_blocks=3978, device npu (arena.py:206)[0m
+[38;20m[2026-10-25 15:23:26,952 ] - INFO - Initialized cache view over 4073472 slots as torch.bfloat16, layers from 0, rank 0 (base.py:234)[0m
+[38;20m[2026-10-25 15:23:26,952 ] - INFO - KV Cache is allocated. K size: 23.31 GB, V size: 23.31 GB. (mha.py:98)[0m
+[2026-10-25 15:23:26] Created hybrid_linear_attn backend: 6 full attn layers, 18 linear attn layers, LCM state fields
+[2026-10-25 15:23:26] Batch-DP spec-verify: requested=False, infra_supports=False, enabled=False min_bs=None (drafter=False, backend_supports_dp=False, tp_size=1, tp_group=True)
+[38;20m[2026-10-25 15:23:27,002 ] - INFO - Prewarming Triton RSAG communication states (model_executor.py:964)[0m
+/opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[38;20m[2026-10-25 15:23:27,487 ] - INFO - Finished prewarming Triton RSAG communication states (model_executor.py:966)[0m
+[38;20m[2026-10-25 15:23:27,488 ] - INFO - ModelExecutor initialized (model_executor.py:801)[0m
+[38;20m[2026-10-25 15:23:27,488 ] - INFO - Kernel startup warmup with 8192 prefill tokens (model_executor.py:1093)[0m
+[38;20m[2026-10-25 15:23:35,719 ] - INFO - Kernel startup warmup finished in 8.2s (model_executor.py:1161)[0m
+[38;20m[2026-10-25 15:23:35,722 ] - INFO - workspace frozen: 256.00 MB (workspace.py:146)[0m
+[38;20m[2026-10-25 15:23:35,736 ] - INFO - Device memory summary (rank 0, npu 0, GB):
++---------------------------------+------------+
+| Component                       |         GB |
++---------------------------------+------------+
+| Attention weights               |       0.05 |
+| MoE weights                     |       0.33 |
+| Dense/MLP weights               |       0.27 |
+| Other weights (embed/head/norm) |       1.00 |
+| KV cache                        |      46.63 |
+| Activations + device graphs     |       0.27 |
+| Torch allocated (total)         |      48.55 |
+| Torch reserved (allocator pool) |      49.83 |
+| Non-torch (context/collectives) |       4.28 |
+| Device used (driver view)       |      54.11 |
+| Device free                     |       7.16 |
+| Device total                    |      61.27 |
++---------------------------------+------------+ (scheduler_utils.py:845)[0m
+[38;20m[2026-10-25 15:23:35,880 ] - INFO - Retraction snapshot pool: 5.00 GB (397 LCM blocks of 12582912 bytes; derived: 0.1 of 3978 Device LCM blocks, no Host L2 tier), up to 16 retracted requests (0.00 MB slot-state arena); no Host L2 tier, whole images go to the pool (executor.py:343)[0m
+[load] engine built in 14.6s
+[load] eos ids: [248044, 248046]
+[case perf_s128_g128 rep0] prompt=128 gen=128 ttft=273.0ms decode_first=297.8ms decode_avg=53.44ms text=' arithmetic but the way people formulate problems, organize '
+[case perf_s128_g128 rep1] prompt=128 gen=128 ttft=185.8ms decode_first=51.1ms decode_avg=51.67ms text=' arithmetic but the way people formulate problems, organize '
+[case perf_s128_g128 rep2] prompt=128 gen=128 ttft=188.6ms decode_first=47.4ms decode_avg=51.51ms text=' arithmetic but the way people formulate problems, organize '
+[case perf_s128_g128 rep3] prompt=128 gen=128 ttft=215.1ms decode_first=82.2ms decode_avg=51.58ms text=' arithmetic but the way people formulate problems, organize '
+[done] HBM alloc=48.55GiB peak=49.22GiB -> /home/u2501112016/hw1/ts_perf_s128_g128.json
+exit: 0
